@@ -1,4 +1,4 @@
-"""Offline SM87 operator helpers; runtime kernels remain independent of Torch."""
+"""Offline SM120 operator helpers; runtime kernels remain independent of Torch."""
 
 import hashlib
 import os
@@ -12,6 +12,8 @@ from tools.build.files import file_hash, write_json as write_json
 import torch
 import tilelang
 
+from tools.build.target import COMPUTE_CAPABILITY, CUDA_TARGET
+
 ROOT = Path(__file__).resolve().parents[2]
 SEED = 20261002
 
@@ -21,7 +23,8 @@ def configure():
     torch.manual_seed(SEED)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    assert torch.cuda.get_device_capability() == (8, 7)
+    if torch.cuda.get_device_capability() != COMPUTE_CAPABILITY:
+        raise ValueError("Offline GPU tools require the RTX 5070 Ti SM120 target")
 
 
 def orin_jit(function=None, *, pass_configs=None):
@@ -30,7 +33,7 @@ def orin_jit(function=None, *, pass_configs=None):
     compiled = tilelang.jit(
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
+        target=CUDA_TARGET,
         pass_configs=pass_configs,
     )(function)
 

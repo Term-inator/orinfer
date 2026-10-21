@@ -19,31 +19,22 @@ def sample(phase):
     temp = {}
     for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
         temp[str(read(zone / "type"))] = read(zone / "temp")
-    rails = []
-    for hwmon in Path("/sys/bus/i2c/drivers/ina3221").glob("*/hwmon/hwmon*"):
-        for channel in range(1, 4):
-            label = read(hwmon / f"in{channel}_label")
-            v = read(hwmon / f"in{channel}_input")
-            a = read(hwmon / f"curr{channel}_input")
-            rails.append(
-                dict(
-                    label=label,
-                    voltage_mV=v,
-                    current_mA=a,
-                    power_mW=int(v) * int(a) / 1000
-                    if isinstance(v, str) and v.isdigit() and isinstance(a, str) and a.isdigit()
-                    else None,
-                )
-            )
+    gpu = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=uuid,memory.used,memory.free,utilization.gpu,temperature.gpu,"
+            "power.draw,power.limit,clocks.current.sm,clocks.current.memory",
+            "--format=csv",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     return dict(
         time_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
         phase=read(phase),
-        gpu_freq_hz={
-            k: read("/sys/class/devfreq/17000000.gpu/" + k)
-            for k in ("cur_freq", "min_freq", "max_freq")
-        },
+        nvidia_smi_csv=gpu.stdout,
         thermal_millicelsius=temp,
-        power_rails=rails,
         meminfo=read("/proc/meminfo"),
     )
 
@@ -57,9 +48,6 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     start = dict(
         time_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        power_mode=subprocess.run(
-            ["/usr/sbin/nvpmodel", "-q"], capture_output=True, text=True
-        ).stdout,
         background_containers=subprocess.run(
             ["docker", "ps", "--format", "{{.Names}} {{.Image}}"], capture_output=True, text=True
         ).stdout.splitlines(),

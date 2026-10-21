@@ -94,8 +94,8 @@ if [[ -n "${ORINFER_OPERATOR_NSYS:-}" ]]; then
     fi
     entrypoint="$(realpath -- "$(command -v nsys)")"
     nsys_directory="$(dirname -- "$(dirname -- "$entrypoint")")"
-    if [[ ! -x "$nsys_directory/host-linux-armv8/QdstrmImporter" ]]; then
-        echo 'Jetson Nsight Systems installation must include QdstrmImporter' >&2
+    if [[ ! -x "$nsys_directory/host-linux-x64/QdstrmImporter" ]]; then
+        echo 'x86_64 Nsight Systems installation must include QdstrmImporter' >&2
         exit 2
     fi
     extra_mounts+=(-v "$nsys_directory:$nsys_directory:ro")
@@ -116,16 +116,15 @@ rm -f "$output_dir/sampler.stop"
 "${PYTHON:-$repo_dir/.venv/bin/python}" tools/bench/sample_continuous.py --output "$output_dir/machine.jsonl" \
     --phase "$output_dir/phase.txt" --stop "$output_dir/sampler.stop" &
 sampler_pid=$!
-docker run --rm --name "$container_name" --runtime nvidia --network none \
+docker run --rm --name "$container_name" --gpus all --network none \
     --user "$(id -u):$(id -g)" "${group_args[@]}" \
     --entrypoint "$entrypoint" --shm-size 2g -v "$repo_dir:$repo_dir" -v "$output_dir:$output_dir" \
     "${extra_mounts[@]}" "${reference_env[@]}" -w "$repo_dir" -e OMP_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
-    -e PYTHONPATH="$repo_dir:$repo_dir/tools/operators${ORINFER_COMPILER_SITE_PACKAGES:+:$ORINFER_COMPILER_SITE_PACKAGES}" \
+    -e PYTHONPATH="$repo_dir:$repo_dir/tools/operators" \
     -e TORCH_EXTENSIONS_DIR="$output_dir/cache/torch" -e XDG_CACHE_HOME="$output_dir/cache" \
     -e PYTHONDONTWRITEBYTECODE=1 \
     -e ORINFER_OPERATOR_OUTPUT="$output_dir" -e TILELANG_CACHE_DIR="${ORINFER_TILELANG_CACHE_DIR:-$output_dir/cache}" \
-    -e LD_PRELOAD=/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1 \
-    "${ORINFER_OPERATOR_IMAGE:-orinfer-compiler:0.1.3}" "${command_args[@]}" \
+    "${ORINFER_OPERATOR_IMAGE:-orinfer-compiler:0.2.0-sm120}" "${command_args[@]}" \
     --output "$output_dir" "$@" 2>&1 | tee "$output_dir/run.log"
 if [[ -n "${ORINFER_OPERATOR_NSYS:-}" && ! -f "$output_dir/nsys.nsys-rep" ]]; then
     echo 'Nsight Systems did not export a report; any raw stream remains in the output directory' >&2

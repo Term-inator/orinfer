@@ -1,4 +1,4 @@
-"""SM87 exact E8P top-8 and beam refinement checks against exhaustive search."""
+"""Exact E8P top-8 and beam refinement checks against exhaustive search."""
 
 import argparse
 from pathlib import Path

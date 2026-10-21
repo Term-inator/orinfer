@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 import torch
 import tilelang
+from tools.build.target import CUDA_TARGET
 from kernels.model.greedy import greedy_merge
 from kernels.model.rows import explicit_rows
 from kernels.operators.op02_residual_norm import residual_norm
@@ -14,9 +15,7 @@ from tools.operators.common import configure, export_kernel, write_json
 def dynamic_greedy(output):
     """One cubin must honor actual rows, affine shapes, tails and graph inputs."""
     fn = explicit_rows(greedy_merge.__wrapped__(2049, rows=8, dynamic_rows=True))
-    kernel = tilelang.compile(
-        fn, out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"}
-    )
+    kernel = tilelang.compile(fn, out_idx=[], execution_backend="nvrtc", target=CUDA_TARGET)
     export_kernel(kernel, output)
     (host,) = parse_host((output / "host.txt").read_text())
     validate_parameter_count((output / "kernel.cu").read_text(), host)

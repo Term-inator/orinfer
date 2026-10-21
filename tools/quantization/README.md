@@ -1,6 +1,6 @@
 # 离线量化
 
-CPU 工具使用项目 uv 环境，GPU 编码使用固定编译镜像。编码、存储重排和执行包构建分别完成；量化产物通过独立质量验收后才能部署。
+CPU 工具使用项目 uv 环境，GPU 编码使用固定的 x86_64/SM120 编译镜像 `orinfer-compiler:0.2.0-sm120`。编码、存储重排和执行包构建分别完成；量化产物通过独立质量验收后才能部署。
 
 ## 当前表示
 
@@ -39,12 +39,13 @@ Flash Next 的固定来源转换、PLE、非专家权重准备和原始 BF16 tea
 
 源信息需包含固定的 repository/revision、配置和 safetensors 索引。远端权重可按字节范围读取；已下载分片通过 `--source-dir` 复用。准备工具核对来源、编码实现、seed 和已完成分块，仅复用来源、身份及完整性均匹配的产物。
 
-`qwen_e8p.py` 支持 Index-Translate-2B/9B/35B、Qwen3.5-4B、27B 和 Qwen3-ASR-1.7B，从官方 BF16 分片直接执行两级拟合和 beam8 搜索。输入目录包含原始 HF 文件以及记录固定 `repo`、40 位 `revision` 的 `source.json`；`--shard FILE` 可逐片编码。已完成块保存校验和，完整分片写入后才清理其临时块；调用方可释放已编码源分片。embedding、共享输出头和视觉大矩阵也量化为 E8P Q4；敏感输出投影和 MTP 矩阵保留 W8，patch、位置表、norm 等较小敏感参数保留原始数据。2B 的 tied 输出头读取同一份压缩 embedding；9B 按官方配置分别编码 embedding 和输出头，保持原始权重共享语义。
+`qwen_e8p.py` 支持 Index-Translate-2B/9B/35B、Qwen3.5-4B、27B 和 Qwen3-ASR-1.7B，从官方 BF16 分片直接执行两级拟合和 beam8 搜索。输入目录包含原始 HF 格式文件（可从 ModelScope 下载）以及记录固定 `repo`、40 位 `revision` 的 `source.json`；`--shard FILE` 可逐片编码。已完成块保存校验和，完整分片写入后才清理其临时块；调用方可释放已编码源分片。embedding、共享输出头和视觉大矩阵也量化为 E8P Q4；敏感输出投影和 MTP 矩阵保留 W8，patch、位置表、norm 等较小敏感参数保留原始数据。2B 的 tied 输出头读取同一份压缩 embedding；9B 按官方配置分别编码 embedding 和输出头，保持原始权重共享语义。
 
 `nemotron_embed.py` 复用同一两级编码器，支持 Nemotron-3.5-Embed-1B 的 Ministral3 文本和 Pixtral 视觉权重。attention 输出和最终 projector 保留 W8。其双向注意力、平均池化、图文输入与原生构建方法见[嵌入模型说明](../../docs/embeddings.md)。
 
 ```bash
-bash tools/quantization/run.sh qwen_e8p --source-dir /path/to/original \
+ORINFER_CHECKPOINT_DIR=/path/to/original \
+  bash tools/quantization/run.sh qwen_e8p --source-dir /path/to/original \
   --output artifacts/quantization/index-translate-2b-e8p-q4a8
 ```
 

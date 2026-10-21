@@ -15,21 +15,12 @@ def read(path):
 
 
 def sample():
-    power = subprocess.run(["/usr/sbin/nvpmodel", "-q"], capture_output=True, text=True)
+    gpu = subprocess.run(["nvidia-smi", "-q", "-x"], capture_output=True, text=True, check=True)
     return {
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "platform": platform.platform(),
-        "l4t": read("/etc/nv_tegra_release"),
         "meminfo": read("/proc/meminfo"),
-        "gpu_devfreq_hz": {
-            name: read("/sys/class/devfreq/17000000.gpu/" + name)
-            for name in ["cur_freq", "min_freq", "max_freq"]
-        },
-        "power_mode_query": {
-            "returncode": power.returncode,
-            "stdout": power.stdout,
-            "stderr": power.stderr,
-        },
+        "nvidia_smi_xml": gpu.stdout,
         "background_containers": subprocess.run(
             ["docker", "ps", "--format", "{{.Names}}"], check=True, capture_output=True, text=True
         ).stdout.splitlines(),

@@ -9,23 +9,13 @@ make compiler-image
 make check-offline
 ```
 
-本机代理使用回环地址时，构建可通过 host 网络读取现有代理环境变量：
+本机代理可通过 `make compiler-image DOCKER_BUILD_ARGS='--network host --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY'` 传入。
 
-```bash
-make compiler-image DOCKER_BUILD_ARGS='--network host --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY'
-```
+`compiler.Dockerfile` 使用固定 digest 的 Linux x86_64 CUDA 12.8.1 最小镜像，安装固定版本 NVCC/NVRTC 开发工具，固定版本 uv 在 `/opt/venv` 同步完整 Python 依赖。Torch 2.9.1、TileLang 0.1.15、CUDA Python 12.8.0 和 NVIDIA CUDA wheel 均记录在 `compiler-requirements.txt`，构建时检查平台、Torch CUDA 版本与依赖完整性。默认镜像为 `orinfer-compiler:0.2.0-sm120`，模型与缓存通过运行时挂载提供。
 
-离线工具最低要求 Python 3.12，CPU 检查与 GPU 编译使用同一版本系列。`compiler.Dockerfile` 从固定 digest 的公开 NVIDIA Jetson 镜像提供 CUDA 12.6 工具链，在 `/opt/python` 安装 CPython 3.12.15，并用 uv 0.13.4 为 `/opt/venv` 创建完整的独立环境。系统依赖由基底镜像 digest 固定，Python 包源显式使用 PyPI。
+公共离线 JIT、AOT 编译器和量化编码器使用 `tools/build/target.py` 声明的 SM120 目标，GPU 初始化检查 compute capability 12.0。量化仍使用原有两级 E8P Q4A8、beam8、signed-block128 和 W8/浮点例外策略。当前阶段准备 RTX 5070 Ti 的量化产物；在线 Rust 引擎、执行包目标校验、模型容量及完整请求仍需分别迁移与验收。
 
-`compiler-requirements.txt` 固定全部 Python 依赖和构建工具，包含 TileLang 0.1.15、Transformers 5.20.2、Tokenizers 0.23.3、Hub 2.2.0、Pillow 13.0.0 和 NumPy 2.5.4。Torch 2.14.1+orinfer1/torchvision 0.29.1+orinfer1 使用我们从源码编译的 CPython 3.12/SM87/CUDA 12.6 构建，Triton 使用 3.8.0。构建验证 Python、Torch CUDA 版本和 SM87 编译目标，模型和编译缓存通过运行时挂载提供。TVM FFI、Z3、Setuptools 和 mpmath 保持各自消费者要求的版本范围。默认镜像名为 `orinfer-compiler:0.1.3`，可用 `ORINFER_OPERATOR_IMAGE` 覆盖。
-
-Torch 与 torchvision 的源码、构建配置和验收入口在 [iMMIQ/pytorch 的 Jetson 分支](https://github.com/iMMIQ/pytorch/tree/jetson-r36.4-cu126-py312-v2.14/jetson) 维护。构建固定上游提交、NVIDIA CUDA 开发镜像、Python 依赖及 Clang/GCC 工具链，显式启用 OpenBLAS/LAPACK，限定 SM87 和 Orin 支持的 CPU 指令，并从源码生成完整原生库。wheel 验收覆盖 CPU 三角求解/SVD、CUDA 矩阵乘法、torchvision CUDA NMS 和改变输入的 Graph 回放。
-
-`jetson_wheels.json` 固定我们发布的 release、源码身份、wheel 长度和 SHA256。`jetson_wheels.py` 下载完整 wheel，校验长度和哈希后原子写入构建临时目录，再由 uv 安装。更新时先在 fork 构建与验收，再更新本仓库中的固定资产身份；项目另执行离线数学参考、真实整数算子和前端夹具验收。上游许可证与第三方声明随 wheel 保留。
-
-GPU 编译入口：
-
-NVRTC 后端使用 CUDA Python 12.6.2.post1；部分离线原生算子参考使用 Triton 3.8.0。两者与 TileLang 一同固定在编译镜像中，在线部署只加载已编译的原生执行包。所有入口直接调用 `/opt/venv/bin/python`，不再将其他 Python 版本的 site-packages 加入搜索路径。
+GPU 编译入口使用 `--gpus all` 和镜像内的 `/opt/venv/bin/python`，通过 NVIDIA Container Toolkit 加载本机驱动。部分离线原生算子参考保留 Triton 3.5.1。在线部署只加载已编译的原生执行包。
 
 ```bash
 ORINFER_CHECKPOINT_DIR=/path/to/converted \

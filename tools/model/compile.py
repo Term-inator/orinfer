@@ -2,6 +2,8 @@
 
 import inspect
 
+from tools.build.target import CUDA_TARGET
+
 
 def instantiate(function, *args, **kwargs):
     return inspect.unwrap(getattr(function, "func", function))(*args, **kwargs)
@@ -14,7 +16,7 @@ def compile_function(function, **options):
         function,
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
+        target=CUDA_TARGET,
         **options,
     )
 
