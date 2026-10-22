@@ -11,6 +11,40 @@ from tools.build.jetson_wheels import download_asset
 
 
 class WheelDownloadTests(unittest.TestCase):
+    def test_timeout_removes_partial_download_before_retry(self):
+        class TimedOutResponse(io.BytesIO):
+            status = 200
+
+            def read(self, size):
+                if self.tell():
+                    raise TimeoutError("interrupted download")
+                return super().read(min(size, 4))
+
+        payload = b"complete wheel payload"
+        asset = dict(
+            filename="torch.whl",
+            size=len(payload),
+            url="https://github.com/iMMIQ/pytorch/releases/download/test/torch.whl",
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
+        response = io.BytesIO(payload)
+        response.status = 200
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            target = output / "torch.whl"
+            target.write_bytes(b"previous wheel")
+            with (
+                patch(
+                    "urllib.request.urlopen", side_effect=[TimedOutResponse(payload), response]
+                ) as fetch,
+                patch("time.sleep") as sleep,
+            ):
+                self.assertEqual(download_asset(asset, output), target)
+            self.assertEqual(fetch.call_count, 2)
+            sleep.assert_called_once_with(1)
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(list(output.iterdir()), [target])
+
     def test_verified_wheel_is_published_and_cache_works_offline(self):
         payload = b"verified wheel payload"
         asset = dict(

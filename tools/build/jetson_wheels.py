@@ -2,14 +2,43 @@
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 
 
 def download_asset(asset, output):
+    for attempt in range(3):
+        try:
+            return _download_asset(asset, output)
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            http.client.IncompleteRead,
+        ) as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code not in {
+                408,
+                429,
+                500,
+                502,
+                503,
+                504,
+            }:
+                raise
+            if attempt == 2:
+                raise
+            print(f"Retrying {asset['filename']} after a network error: {e}", file=sys.stderr)
+            time.sleep(2**attempt)
+
+
+def _download_asset(asset, output):
     filename = asset["filename"]
     if Path(filename).name != filename or not filename.endswith(".whl"):
         raise ValueError("Expected a wheel basename")
