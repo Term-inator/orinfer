@@ -91,7 +91,7 @@ def selection(b, banks):
                     for bank in banks
                 ],
             )
-            tuner = MoeTuner(b.output / "moe-tuning", b.aot.identity)
+            tuner = MoeTuner(b.output / "moe-tuning", b.aot.identity, capacity=b.capacity)
             b.moe_selection = tuner.routed(
                 b.h,
                 b.f,
@@ -442,7 +442,7 @@ def build(b, section, prefix, *, rows=None, draft=False):
     from tools.build.gpu import gpu_lock
 
     if not hasattr(b, "moe_router_tuner"):
-        b.moe_router_tuner = MoeTuner(b.output / "moe-tuning", b.aot.identity)
+        b.moe_router_tuner = MoeTuner(b.output / "moe-tuning", b.aot.identity, capacity=b.capacity)
     with gpu_lock(b.lock):
         router_selection = b.moe_router_tuner.router(h, e)
         topk_selection = b.moe_router_tuner.topk(e, top)

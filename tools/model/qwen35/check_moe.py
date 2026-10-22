@@ -9,7 +9,7 @@ from kernels.model.e8p_q4 import projection
 from kernels.model.int8_projection import int8_projection
 from tools.model.compile import primitive
 from tools.model.row_tuning import launch
-from tools.operators.common import configure, write_json
+from tools.operators.common import configure, write_json, KernelResourceError
 from tools.quantization.e8p import basis
 from tools.quantization.vq import e8p_decode, e8p_selector_table
 
@@ -23,6 +23,8 @@ def q4_pipeline_checks(rng):
     book = torch.from_numpy(e8p_selector_table(grid)).cuda()
     reports = []
     for counts, n, k, tile in [
+        ([1, 0], 1024, 2048, 16),
+        ([1, 0], 2048, 512, 16),
         ([1, 0], 129, 128, 16),
         ([7, 8], 160, 640, 16),
         ([8, 9], 160, 256, 16),
@@ -63,26 +65,32 @@ def q4_pipeline_checks(rng):
             for _ in range(2 if tile >= 64 else 4)
         ]
         outputs = [value[:-1] for value in storage]
-        integer = [
-            primitive(
-                moe.integer_experts,
-                capacity,
-                n,
-                k,
-                experts,
-                1,
-                block_m=tile,
-                block_n=32 if tile == 128 else 64,
-                stages=stages,
-                dynamic_rows=True,
-                minimum_blocks=3 if tile == 256 and stages == 1 else 1,
-                tail_m=64 if tile == 256 else 0,
-                compiler_options=(
-                    {"tl.enable_aggressive_shared_memory_merge": True} if tile == 256 else {}
-                ),
-            )
-            for stages in (1, 2)
-        ]
+        rejected = []
+
+        def compile_integer(stages):
+            try:
+                return primitive(
+                    moe.integer_experts,
+                    capacity,
+                    n,
+                    k,
+                    experts,
+                    1,
+                    block_m=tile,
+                    block_n=32 if tile == 128 else 64,
+                    stages=stages,
+                    dynamic_rows=True,
+                    minimum_blocks=3 if tile == 256 and stages == 1 else 1,
+                    tail_m=64 if tile == 256 else 0,
+                    compiler_options=(
+                        {"tl.enable_aggressive_shared_memory_merge": True} if tile == 256 else {}
+                    ),
+                )
+            except KernelResourceError as error:
+                rejected.append(dict(stages=stages, reason=str(error)))
+                return None
+
+        integer = [compile_integer(stages) for stages in (1, 2)]
         pack = primitive(split_prefill_a8, capacity, k, dynamic_rows=True)
         direct = [
             primitive(
@@ -106,9 +114,16 @@ def q4_pipeline_checks(rng):
             for sparse in ((False, True) if tile < 64 else ())
         ]
 
+        if not any(integer) and not direct:
+            reports.append(
+                dict(counts=counts, n=n, k=k, tile=tile, eligible=False, rejected=rejected)
+            )
+            continue
+
         def run():
             for kernel, out in zip(integer, outputs):
-                launch(kernel, a, w, book, ws, scale, *routing, out, rows)
+                if kernel is not None:
+                    launch(kernel, a, w, book, ws, scale, *routing, out, rows)
             launch(pack, a, low, high, sums, rows)
             for kernel, out in zip(direct, outputs[2:]):
                 launch(kernel, low, high, sums, w, book, ws, scale, *routing, out, rows)
@@ -126,7 +141,9 @@ def q4_pipeline_checks(rng):
                 first, last = int(offsets[e]), int(offsets[e]) + count
                 dot = av[first:last] @ weights[e].T
                 expected[first:last] = (dot.astype(np.float32) * wv[e]) * sv[first:last, None]
-            for out, backing in zip(outputs, storage):
+            for i, (out, backing) in enumerate(zip(outputs, storage)):
+                if i < 2 and integer[i] is None:
+                    continue
                 np.testing.assert_array_equal(out.cpu().numpy(), expected)
                 assert bool(torch.all(backing[-1] == 91))
 
@@ -143,7 +160,16 @@ def q4_pipeline_checks(rng):
             graph.replay()
             check()
         reports.append(
-            dict(counts=counts, n=n, k=k, tile=tile, exact=True, changed_input_replay=True)
+            dict(
+                counts=counts,
+                n=n,
+                k=k,
+                tile=tile,
+                exact=True,
+                changed_input_replay=True,
+                eligible=True,
+                rejected=rejected,
+            )
         )
     return reports
 
@@ -430,6 +456,56 @@ def routing_checks(rng):
     return reports
 
 
+def combine_checks(rng):
+    """Real Qwen mixture geometry, row/column tails and changed-input replay."""
+    reports = []
+    capacity, top = 128, 8
+    for hidden in (2048, 2051):
+        kernel = primitive(
+            moe.moe_combine, capacity, hidden, capacity * top, top, dynamic_rows=True
+        )
+        for rows in (1, 17, capacity):
+            expert = torch.from_numpy(
+                rng.normal(0, 0.2, (rows * top, hidden)).astype(np.float16)
+            ).cuda()
+            slots = torch.arange(rows * top, device="cuda", dtype=torch.int32).reshape(rows, top)
+            slots[0, 0], slots[0, 1] = -1, rows * top
+            prob = torch.from_numpy(rng.uniform(0, 0.2, (rows, top)).astype(np.float32)).cuda()
+            shared = torch.from_numpy(rng.normal(0, 0.2, (rows, hidden)).astype(np.float16)).cuda()
+            gate = torch.from_numpy(rng.normal(0, 1, rows).astype(np.float16)).cuda()
+            storage = torch.full((rows + 1, hidden), 91, device="cuda", dtype=torch.float16)
+            output = storage[:-1]
+            values = (expert, slots, prob, shared, gate, output)
+
+            def check():
+                source = expert.cpu().numpy().astype(np.float32)
+                indices, weights = slots.cpu().numpy(), prob.cpu().numpy()
+                expected = np.zeros((rows, hidden), np.float32)
+                for rank in range(top):
+                    valid = (indices[:, rank] >= 0) & (indices[:, rank] < rows * top)
+                    expected[valid] += source[indices[valid, rank]] * weights[valid, rank, None]
+                sigmoid = 1 / (1 + np.exp(-gate.cpu().numpy().astype(np.float32)))
+                expected += sigmoid[:, None] * shared.cpu().numpy().astype(np.float32)
+                np.testing.assert_allclose(
+                    output.cpu().numpy(), expected.astype(np.float16), rtol=0.002, atol=0.0005
+                )
+                assert torch.all(storage[-1] == 91)
+
+            launch(kernel, *values, rows)
+            check()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch(kernel, *values, rows)
+            expert.neg_()
+            gate.neg_()
+            graph.replay()
+            check()
+            reports.append(
+                dict(rows=rows, hidden=hidden, changed_input_replay=True, output_tail=True)
+            )
+    return reports
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
@@ -544,6 +620,7 @@ def main():
             routing=routing,
             projection_tails=tails,
             partition=partition_checks(rng),
+            combine=combine_checks(rng),
             complete=True,
         ),
     )

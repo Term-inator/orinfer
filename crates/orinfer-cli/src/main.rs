@@ -16,7 +16,7 @@ impl std::str::FromStr for MtpDrafts {
 }
 
 #[derive(Parser)]
-#[command(name = "orinfer", version, about = "LLM inference on Jetson AGX Orin")]
+#[command(name = "orinfer", version, about = "Native quantized LLM inference")]
 struct Cli {
     #[arg(long, global = true, default_value_os_t = orinfer_api::manager::default_data_dir())]
     data_dir: PathBuf,

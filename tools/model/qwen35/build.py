@@ -34,7 +34,7 @@ HEAD_ROWS = 512
 def configuration(config, context):
     if config.get("model_type") not in ("qwen3_5", "qwen3_5_moe", "qwen3_asr"):
         raise ValueError("Expected Qwen3_5 checkpoint")
-    t = config["text_config"]
+    t = dict(config["text_config"])
     expected = dict(
         hidden_size=5120,
         intermediate_size=17408,
@@ -68,6 +68,7 @@ def configuration(config, context):
             attn_output_gate=False,
         )
     elif config["model_type"] == "qwen3_5_moe":
+        t.setdefault("mlp_only_layers", [])
         expected.update(
             hidden_size=2048,
             intermediate_size=512,
@@ -1228,6 +1229,12 @@ class Builder:
                 if "/rows/" in k["name"]
                 or "/skip/" in k["name"]
                 or k["name"].startswith("qwen_rows/packet/")
+                or any(
+                    a.get("kind") == "buffer"
+                    and a.get("name", "").startswith("model.language_model.layers.")
+                    and ".mlp.experts." in a["name"]
+                    for a in k["args"]
+                )
             ],
         )
         from tools.model.sampling import append as append_sampling

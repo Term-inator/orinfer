@@ -389,6 +389,13 @@ class BuildTests(unittest.TestCase):
             layer_types=t["layer_types"][:40],
         )
         self.assertEqual(configuration(candidate, 262144)["num_experts"], 256)
+        del t["mlp_only_layers"]
+        from tools.model.package import config_signature
+
+        original_signature = config_signature(candidate)
+        self.assertEqual(configuration(candidate, 4096)["mlp_only_layers"], [])
+        self.assertNotIn("mlp_only_layers", candidate["text_config"])
+        self.assertEqual(config_signature(candidate), original_signature)
         for key, value in (
             ("num_experts_per_tok", 10),
             ("shared_expert_intermediate_size", 640),

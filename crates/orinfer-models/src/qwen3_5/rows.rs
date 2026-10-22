@@ -1076,6 +1076,16 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         })
         .collect();
     crate::prefill::register(m, "prefill", stages, vec!["Hidden".into(), "R0".into()])?;
+    let expert_banks = if t.num_experts > 0 {
+        super::experts::banks(
+            m,
+            &request.kernel_contracts,
+            t.num_hidden_layers,
+            t.num_experts,
+        )?
+    } else {
+        Vec::new()
+    };
     let metadata = request.metadata;
     Ok((
         Box::new(QwenRows {
@@ -1094,7 +1104,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         CreatedPlan {
             metadata,
             decode_programs: BTreeSet::from(["decode".into()]),
-            expert_banks: vec![],
+            expert_banks,
         },
     ))
 }

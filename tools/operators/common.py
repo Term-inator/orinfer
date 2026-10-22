@@ -50,6 +50,7 @@ def orin_jit(function=None, *, pass_configs=None):
         kernel.torch_function = launch
         return kernel
 
+    build.pass_configs = dict(pass_configs or {})
     return build
 
 

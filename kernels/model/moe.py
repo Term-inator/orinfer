@@ -494,7 +494,9 @@ def router_topk(
     return main
 
 
-@orin_jit
+# CUDA 12.8 NVRTC crashes on the vectorized FP16 mixture epilogue. Scalar
+# lowering preserves the FP32 rank reduction and final FP16 rounding.
+@orin_jit(pass_configs={"tirx.disable_vectorize": True})
 def moe_combine(
     M: int,
     H: int,

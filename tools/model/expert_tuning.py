@@ -150,9 +150,14 @@ class MoeTuner(RowTuner):
 
         def build(config):
             if config["algorithm"] == "block":
-                return primitive(moe.router_topk, 4096, experts, top_k, dynamic_rows=True)
+                return primitive(moe.router_topk, self.capacity, experts, top_k, dynamic_rows=True)
             return primitive(
-                moe.router_topk_warp, 4096, experts, top_k, dynamic_rows=True, warps=config["warps"]
+                moe.router_topk_warp,
+                self.capacity,
+                experts,
+                top_k,
+                dynamic_rows=True,
+                warps=config["warps"],
             )
 
         baseline = build(configs[0])
@@ -189,7 +194,12 @@ class MoeTuner(RowTuner):
             yield fixture
 
         result = self.select(
-            spec, configs, build, inputs, measure_rows=samples(4096), relative_tolerance=0.03
+            spec,
+            configs,
+            build,
+            inputs,
+            measure_rows=samples(self.capacity),
+            relative_tolerance=0.03,
         )
         self.records[key] = result
         return result
@@ -210,7 +220,9 @@ class MoeTuner(RowTuner):
         ]
 
         def build(config):
-            return primitive(router_projection, 4096, hidden, experts, dynamic_rows=True, **config)
+            return primitive(
+                router_projection, self.capacity, hidden, experts, dynamic_rows=True, **config
+            )
 
         reference = build(configs[0])
 
@@ -241,11 +253,17 @@ class MoeTuner(RowTuner):
             yield fixture
 
         result = self.select(
-            spec, configs, build, inputs, measure_rows=[1, 17, 128, 512, 2048, 4096]
+            spec,
+            configs,
+            build,
+            inputs,
+            measure_rows=sorted(
+                {min(n, self.capacity) for n in (1, 17, 128, 512, 2048, self.capacity)}
+            ),
         )
         costs = {
             str(i): sum(row["times"][str(i)] for row in result["measurements"])
-            for i in range(len(configs))
+            for i in range(len(result["configs"]))
         }
         result = prefill_fallback(result, min(costs, key=costs.get))
         self.records[key] = result
@@ -282,7 +300,7 @@ class MoeTuner(RowTuner):
         for rows, samples in routing_samples.items():
             if (
                 type(rows) is not int
-                or not 1 <= rows <= 4096
+                or not 1 <= rows <= self.capacity
                 or not samples
                 or any(
                     len(counts) != experts
@@ -305,7 +323,12 @@ class MoeTuner(RowTuner):
             result = dict(
                 offsets=primitive(moe.expert_offsets, experts, config["block_m"]),
                 tiles=primitive(
-                    moe.expert_tiles, 4096, experts, top_k, config["block_m"], dynamic_rows=True
+                    moe.expert_tiles,
+                    self.capacity,
+                    experts,
+                    top_k,
+                    config["block_m"],
+                    dynamic_rows=True,
                 ),
             )
             if config.get("cold_rows"):
@@ -314,7 +337,7 @@ class MoeTuner(RowTuner):
                 result["offsets"] = primitive(expert_partition.offsets, *args)
                 result["tiles"] = primitive(
                     expert_partition.tiles,
-                    4096,
+                    self.capacity,
                     experts,
                     top_k,
                     config["block_m"],
@@ -325,7 +348,7 @@ class MoeTuner(RowTuner):
                 result["cold_packs"] = [
                     primitive(
                         split_routed_prefill_a8,
-                        4096 * top_k,
+                        self.capacity * top_k,
                         k,
                         experts,
                         cold["block_m"],
@@ -336,7 +359,7 @@ class MoeTuner(RowTuner):
                 result["cold_products"] = [
                     primitive(
                         expert_projection,
-                        4096,
+                        self.capacity,
                         n,
                         k,
                         experts,
@@ -349,14 +372,14 @@ class MoeTuner(RowTuner):
                     for n, k in dimensions
                 ]
             if config.get("folded"):
-                slots = 4096 * top_k
+                slots = self.capacity * top_k
                 result["packs"] = [
                     primitive(split_prefill_a8, slots, k, dynamic_rows=True) for _, k in dimensions
                 ]
             result["products"] = [
                 primitive(
                     expert_projection,
-                    4096,
+                    self.capacity,
                     n,
                     k,
                     experts,
@@ -403,7 +426,7 @@ class MoeTuner(RowTuner):
 
                 def runner(kernels, config, outputs):
                     tile = config["block_m"]
-                    capacity = (4096 * top_k + tile - 1) // tile + experts
+                    capacity = (self.capacity * top_k + tile - 1) // tile + experts
                     offsets = torch.empty(experts, device="cuda", dtype=torch.int32)
                     tile_offsets = torch.empty_like(offsets)
                     tile_count = torch.empty(1, device="cuda", dtype=torch.int32)
@@ -430,7 +453,7 @@ class MoeTuner(RowTuner):
                     cold = None
                     if config.get("cold_rows"):
                         capacity = tile_capacity(
-                            4096, experts, top_k, cold_expert_config()["block_m"]
+                            self.capacity, experts, top_k, cold_expert_config()["block_m"]
                         )
                         cold = dict(
                             offsets=torch.empty_like(offsets),
@@ -570,7 +593,11 @@ class MoeTuner(RowTuner):
                 rows, ("measured",) if rows in routing_samples else ("independent",)
             ),
             measure_rows=sorted(
-                {1, 2, 3, 4, 8, 17, 32, 64, 128, 512, 2048, 4096} | routing_samples.keys()
+                {
+                    min(n, self.capacity)
+                    for n in (1, 2, 3, 4, 8, 17, 32, 64, 128, 512, 2048, self.capacity)
+                }
+                | routing_samples.keys()
             ),
             # Captured routes determine cost at supplied extents; otherwise
             # use independent gating. Duplicated-route extremes still
@@ -581,7 +608,11 @@ class MoeTuner(RowTuner):
         from tools.model.row_selection import prefill_fallback
 
         costs = {
-            str(i): sum(row["times"][str(i)] for row in result["measurements"] if row["rows"] > 128)
-            for i in range(len(configs))
+            str(i): sum(
+                row["times"][str(i)]
+                for row in result["measurements"]
+                if row["rows"] > min(128, self.capacity // 2)
+            )
+            for i in range(len(result["configs"]))
         }
         return prefill_fallback(result, min(costs, key=costs.get))
