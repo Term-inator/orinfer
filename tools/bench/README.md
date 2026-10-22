@@ -10,6 +10,12 @@
 
 `sample_machine.py` 和 `sample_continuous.py` 以只读方式记录机器温度、频率、内存和功耗，保持全局设置。GPU 运行入口共享 `artifacts/gpu-experiment.lock`。
 
+`bash tools/operators/run.sh tools/operators/sampling.py NEW_OUTPUT --batch-only` 对照同源单请求采样，覆盖不同 seed/参数、非对齐词表、1–128 行、owner 换序、空行、无效行隔离和改变输入后的 Graph replay。`--sanitizer` 缩小诊断集合，配合 `ORINFER_OPERATOR_SANITIZER=memcheck` 检查设备访存。
+
+完整请求验收 `validate_batched_gpu_sampling_requests` 使用下方 `ORINFER_BATCH_FIXTURE`，需要包含批量采样程序的新模型包；`batches` 默认 1/3/8。它比较逐请求／批量 GPU 采样的完整 token 和因果状态，覆盖混合 greedy、不同参数、grammar 解除、反向 owner 以及取消后的 arena 复用。`validate_lazy_workspace_requests` 需要同一夹具内的纯文本和图像／音频 case，检查先文本、首次媒体、再文本时的结果、状态与虚拟地址。按本轮构建返回的实际测试可执行文件运行并核对测试数；吞吐比较使用 release 完整请求。
+
+`runtime::requests::profile::profile_continuous_decode` 的夹具可设置 `sampling_batch=false`，在同一执行包上诊断逐请求 GPU 采样；默认使用包声明的批量路径。`hot_only=true` 记录固定 batch 的主干 GPU 时间及 CPU 分段，批量采样另记录控制回读、地址表、输入上传、提交和输出回读边界。分段用于定位，完整请求吞吐需另行验收。
+
 `validate_plan.py` 校验 benchmark 与快速评测配置，输出 CPU 配置检查结果。
 
 `code_generation.py` 用相同 Chat 请求测量 thinking、MTP 和 prefix cache 的组合，输入采用下方 `concurrency.py` 的 cases 格式：

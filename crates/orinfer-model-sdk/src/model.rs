@@ -110,6 +110,71 @@ pub struct Sampling {
     pub control: String,
     pub parameters: String,
     pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchedSampling>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchedSampling {
+    pub program: String,
+    pub capacity: usize,
+    pub pointers: String,
+    pub scratch: String,
+    pub output: String,
+    pub stride: usize,
+    pub offsets: BTreeMap<String, usize>,
+}
+
+impl BatchedSampling {
+    /// Private scratch layout shared by all six independent-row sampler bodies.
+    /// Align each typed view; lane membership changes pointers, never arithmetic.
+    pub fn layout(vocab: usize, context: usize) -> Result<(BTreeMap<String, usize>, usize)> {
+        let blocks = vocab.div_ceil(1024);
+        let shapes = BTreeMap::from([
+            ("Counts", (vocab, 4)),
+            ("Bias", (vocab, 8)),
+            ("History", (context, 4)),
+            ("BiasIds", (vocab, 4)),
+            ("BiasValues", (vocab, 8)),
+            ("Control", (4, 4)),
+            ("Parameters", (6, 8)),
+            ("Mask", (vocab.div_ceil(32), 4)),
+            ("Scores", (vocab, 8)),
+            ("Keys", (vocab, 8)),
+            ("Maximum", (blocks, 8)),
+            ("Invalid", (blocks, 4)),
+            ("Mass", (vocab, 8)),
+            ("State", (7, 8)),
+            (
+                "Hist",
+                (
+                    blocks
+                        .checked_mul(256)
+                        .ok_or("Sampling histogram overflow")?,
+                    8,
+                ),
+            ),
+        ]);
+        let mut offsets = BTreeMap::new();
+        let mut stride = 0usize;
+        for (name, (elements, width)) in shapes {
+            offsets.insert(name.into(), stride);
+            let bytes = elements
+                .checked_mul(width)
+                .ok_or("Sampling scratch overflow")?;
+            stride = stride
+                .checked_add(
+                    bytes
+                        .checked_add(255)
+                        .ok_or("Sampling alignment overflow")?
+                        / 256
+                        * 256,
+                )
+                .ok_or("Sampling stride overflow")?;
+        }
+        Ok((offsets, stride))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -454,6 +519,38 @@ impl Manifest {
                 let b = lookup(name)?;
                 if b.dtype != dtype || b.shape != [elements] || b.access != Access::ReadWrite {
                     return Err(format!("Invalid GPU sampling buffer {name}"));
+                }
+            }
+            if let Some(batch) = &sampling.batch {
+                let logits = lookup(&self.logits)?;
+                if logits.dtype != Dtype::F32 || logits.shape != [self.vocab] {
+                    return Err("Batched sampling requires FP32 vocabulary logits".into());
+                }
+                let (offsets, stride) = BatchedSampling::layout(self.vocab, self.max_context)?;
+                if batch.capacity != 128
+                    || batch.offsets != offsets
+                    || batch.stride != stride
+                    || self.row_execution.as_ref().is_none_or(|rows| {
+                        !rows.programs.contains(&batch.program)
+                            || rows.program_capacity(&batch.program) != batch.capacity
+                    })
+                    || self.programs.get(&batch.program).is_none_or(Vec::is_empty)
+                {
+                    return Err("Invalid batched sampling program/layout".into());
+                }
+                for (name, dtype, shape) in [
+                    (&batch.pointers, Dtype::U64, [batch.capacity, 2]),
+                    (&batch.scratch, Dtype::U8, [batch.capacity, stride]),
+                    (&batch.output, Dtype::I32, [batch.capacity, 2]),
+                ] {
+                    let b = lookup(name)?;
+                    if b.dtype != dtype
+                        || b.shape != shape
+                        || b.access != Access::ReadWrite
+                        || b.data.is_some()
+                    {
+                        return Err(format!("Invalid batched sampling buffer {name}"));
+                    }
                 }
             }
         }

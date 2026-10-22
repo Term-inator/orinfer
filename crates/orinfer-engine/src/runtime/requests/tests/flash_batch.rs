@@ -578,7 +578,11 @@ fn validate_flash_decode_batches() {
                         )
                         .unwrap(),
                     model
-                        .pending_workspace(model.validate_generation(&item).unwrap())
+                        .pending_workspace(
+                            model.validate_generation(&item).unwrap(),
+                            item.sampling.temperature > 0.,
+                            &["decode", "prefill", "head"]
+                        )
                         .unwrap()
                 );
                 break;

@@ -205,6 +205,18 @@ fn validate_scopes(model: &Manifest, scopes: &BTreeMap<String, BufferScope>) -> 
                 return Err(format!("{name}: sampling scratch must be workspace"));
             }
         }
+        if let Some(batch) = &sampling.batch {
+            if scopes.get(&model.logits) != Some(&BufferScope::Sequence) {
+                return Err("Batched sampling requires request-owned logits".into());
+            }
+            for name in [&batch.scratch, &batch.pointers, &batch.output] {
+                if scopes.get(name) != Some(&BufferScope::Workspace)
+                    || model.reset_buffers.contains(name)
+                {
+                    return Err(format!("{name}: batched sampling must be workspace"));
+                }
+            }
+        }
     }
     if let Some(kv) = &model.kv_cache {
         for name in kv.prefill_workspace.keys() {

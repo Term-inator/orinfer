@@ -1,5 +1,6 @@
 //! GPU sampling shares the ordinary request's history, seed and grammar law.
 use super::*;
+
 impl ModelRuntime {
     pub(super) fn gpu_sample(
         &self,
@@ -11,45 +12,97 @@ impl ModelRuntime {
         let Some(spec) = &self.manifest.sampling else {
             return Ok(None);
         };
-        // Probability reporting and speculative p/q laws retain the reference
-        // path until their compact GPU reporting/verification ABI is available.
+        // Probability reporting and speculative p/q laws retain their current
+        // reference path. The batched wrapper uses exactly these same inputs.
         if options.temperature == 0.0 || options.top_logprobs.is_some() {
             return Ok(None);
         }
-        options.validate()?;
-        if history.len() > self.manifest.max_context {
-            return Err("Sampling history exceeds context".into());
+        for (name, bytes) in inputs(
+            history,
+            options,
+            step,
+            mask,
+            self.manifest.vocab,
+            self.manifest.max_context,
+        )? {
+            let destination = match name {
+                "History" => &spec.history,
+                "BiasIds" => &spec.bias_ids,
+                "BiasValues" => &spec.bias_values,
+                "Mask" => &spec.mask,
+                "Control" => &spec.control,
+                "Parameters" => &spec.parameters,
+                _ => unreachable!(),
+            };
+            self.upload_bytes(destination, &bytes)?;
         }
-        let use_history = options.repetition_penalty != 1.
-            || options.presence_penalty != 0.
-            || options.frequency_penalty != 0.;
-        if use_history {
-            self.upload_ids(&spec.history, history)?;
-        }
-        let bias: Vec<_> = options
-            .logit_bias
+        self.execution
+            .submit_program(&spec.program, ExecutionPhase::Decode)?;
+        let output = self.read_controls(&spec.output, 2)?;
+        validate_output(&output, self.manifest.vocab).map(Some)
+    }
+}
+
+pub(super) fn validate_output(values: &[u32], vocab: usize) -> Result<u32> {
+    if values.len() != 2 || values[1] != 0 || values[0] as usize >= vocab {
+        return Err("GPU sampling has invalid logits or empty probability support".into());
+    }
+    Ok(values[0])
+}
+
+pub(super) fn inputs(
+    history: &[u32],
+    options: &crate::sampling::Options,
+    step: usize,
+    mask: Option<&[u32]>,
+    vocab: usize,
+    context: usize,
+) -> Result<Vec<(&'static str, Vec<u8>)>> {
+    options.validate()?;
+    if history.len() > context {
+        return Err("Sampling history exceeds context".into());
+    }
+    let mut result = Vec::new();
+    let use_history = options.repetition_penalty != 1.
+        || options.presence_penalty != 0.
+        || options.frequency_penalty != 0.;
+    let ids = |values: &[u32]| {
+        values
             .iter()
-            .filter(|(id, _)| **id < self.manifest.vocab as u32)
-            .collect();
-        let ids: Vec<_> = bias.iter().map(|(id, _)| **id).collect();
-        let values: Vec<_> = bias.iter().flat_map(|(_, v)| v.to_le_bytes()).collect();
-        self.upload_ids(&spec.bias_ids, &ids)?;
-        self.upload_bytes(&spec.bias_values, &values)?;
-        if let Some(mask) = mask {
-            // Tokenizers may omit padded output-head IDs. Missing mask words
-            // prohibit those IDs, matching the CPU law's bounds-checked lookup.
-            self.upload_ids(&spec.mask, &padded_mask(mask, self.manifest.vocab))?;
-        }
-        self.upload_ids(
-            &spec.control,
-            &[
-                if use_history { history.len() as u32 } else { 0 },
-                bias.len() as u32,
-                u32::from(mask.is_some()),
-                options.top_k.min(self.manifest.vocab) as u32,
-            ],
-        )?;
-        let parameters: Vec<_> = [
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    if use_history {
+        result.push(("History", ids(history)));
+    }
+    let bias: Vec<_> = options
+        .logit_bias
+        .iter()
+        .filter(|(id, _)| **id < vocab as u32)
+        .collect();
+    result.push((
+        "BiasIds",
+        ids(&bias.iter().map(|(id, _)| **id).collect::<Vec<_>>()),
+    ));
+    result.push((
+        "BiasValues",
+        bias.iter().flat_map(|(_, v)| v.to_le_bytes()).collect(),
+    ));
+    if let Some(mask) = mask {
+        result.push(("Mask", ids(&padded_mask(mask, vocab))));
+    }
+    result.push((
+        "Control",
+        ids(&[
+            if use_history { history.len() as u32 } else { 0 },
+            bias.len() as u32,
+            u32::from(mask.is_some()),
+            options.top_k.min(vocab) as u32,
+        ]),
+    ));
+    result.push((
+        "Parameters",
+        [
             options.temperature,
             options.top_p,
             options.presence_penalty,
@@ -59,19 +112,12 @@ impl ModelRuntime {
         ]
         .into_iter()
         .flat_map(f64::to_le_bytes)
-        .collect();
-        self.upload_bytes(&spec.parameters, &parameters)?;
-        self.execution
-            .submit_program(&spec.program, ExecutionPhase::Decode)?;
-        let output = self.read_controls(&spec.output, 2)?;
-        if output[1] != 0 || output[0] as usize >= self.manifest.vocab {
-            return Err("GPU sampling has invalid logits or empty probability support".into());
-        }
-        Ok(Some(output[0]))
-    }
+        .collect(),
+    ));
+    Ok(result)
 }
 
-fn padded_mask(mask: &[u32], vocab: usize) -> Vec<u32> {
+pub(super) fn padded_mask(mask: &[u32], vocab: usize) -> Vec<u32> {
     let mut result = vec![0; vocab.div_ceil(32)];
     for (destination, source) in result.iter_mut().zip(mask) {
         *destination = *source;

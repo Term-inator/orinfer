@@ -108,6 +108,7 @@ pub(super) struct DirectKernel {
     pub(super) spec: Kernel,
     pub(super) function: Option<sys::CUfunction>,
     pub(super) values: Vec<Value>,
+    workspaces_ready: bool,
 }
 pub(super) type RowProgramCache = std::collections::VecDeque<(
     String,
@@ -141,6 +142,8 @@ pub(crate) struct Executor {
     pub(crate) peak_prefill_workspace_bytes: std::cell::Cell<usize>,
     pub(super) prefill_workspace: std::collections::BTreeSet<String>,
     pub(crate) allocations: Allocations,
+    workspace_dependencies: BTreeMap<String, Vec<String>>,
+    text_workspaces: Vec<String>,
     pub(crate) parallel_regions: RefCell<Vec<[String; 4]>>,
     pub(super) row_kernel_slots: BTreeMap<String, String>,
     #[cfg(test)]
@@ -201,6 +204,18 @@ pub(crate) struct LoadStats {
     pub(crate) buffer_bytes: usize,
     pub(crate) buffer_capacity_bytes: usize,
 }
+
+fn deferred_workspace(
+    buffer: &crate::artifact::Buffer<crate::weights::TensorIdentity>,
+    scope: crate::loader::BufferScope,
+) -> Result<bool> {
+    // Small controls stay in ordinary allocations; VMM granularity would cost
+    // more physical memory than their payload. Large scratch keeps stable VA.
+    Ok(scope == crate::loader::BufferScope::Workspace
+        && buffer.data.is_none()
+        && buffer.bytes()? >= 64 * 1024)
+}
+
 impl Executor {
     pub(crate) fn load(
         prepared: &crate::loader::PreparedModel,
@@ -309,7 +324,17 @@ impl Executor {
         let capacity_bytes = capacity_bytes
             .checked_add(weight_layout.padding_bytes)
             .ok_or("Model allocation sum overflow")?;
-        let buffer_bytes = capacity_bytes - lazy_bytes - unused_weights - paged_bytes;
+        let deferred_workspace_bytes = manifest.buffers.iter().try_fold(0usize, |sum, b| {
+            let existing = lazy.is_some_and(|kv| kv.prefill_workspace.contains_key(&b.name));
+            sum.checked_add(if !existing && deferred_workspace(b, scopes[&b.name])? {
+                b.bytes()?
+            } else {
+                0
+            })
+            .ok_or_else(|| "Workspace sum overflow".to_string())
+        })?;
+        let buffer_bytes =
+            capacity_bytes - lazy_bytes - unused_weights - paged_bytes - deferred_workspace_bytes;
         let init_started = Instant::now();
         let mut s = Session::new(Driver::load()?);
         let mut pointers = BTreeMap::new();
@@ -390,6 +415,7 @@ impl Executor {
             final_sync_s: 0.,
             cuda_allocations: 0,
             weight_arena_padding_bytes: weight_layout.padding_bytes,
+            deferred_workspace_bytes,
         };
         let allocation_started = Instant::now();
         let mut weight_base = 0;
@@ -433,6 +459,7 @@ impl Executor {
                         .or_else(|| kv.prefill_workspace.get(&b.name))
                 })
                 .copied();
+            let deferred = stride.is_none() && deferred_workspace(b, scopes[&b.name])?;
             let allocation_started = Instant::now();
             if let Some(&offset) = weight_layout.offsets.get(&b.name) {
                 address = weight_base
@@ -448,6 +475,12 @@ impl Executor {
                 let reservation = super::virtual_memory::Reservation::reserve(&s, bytes, stride)?;
                 address = reservation.address;
                 s.virtual_buffers
+                    .borrow_mut()
+                    .insert(b.name.clone(), reservation);
+            } else if deferred {
+                let reservation = super::virtual_memory::Reservation::reserve(&s, bytes, 1)?;
+                address = reservation.address;
+                s.workspace_buffers
                     .borrow_mut()
                     .insert(b.name.clone(), reservation);
             } else {
@@ -504,7 +537,7 @@ impl Executor {
                     });
                     weight_io_hash_s += t.elapsed().as_secs_f64();
                 }
-            } else if stride.is_none() {
+            } else if stride.is_none() && !deferred {
                 // SAFETY: Whole allocation is owned and not in use yet.
                 unsafe {
                     check(
@@ -552,6 +585,7 @@ impl Executor {
                     spec: k.clone(),
                     function,
                     values,
+                    workspaces_ready: false,
                 },
             );
         }
@@ -577,6 +611,64 @@ impl Executor {
             row_kernels: manifest.dynamic_batch_kernels.clone(),
             row_cache: RefCell::default(),
         });
+        let kernel_map: BTreeMap<_, _> = manifest
+            .kernels
+            .iter()
+            .map(|k| (k.name.as_str(), k))
+            .collect();
+        let mut workspace_dependencies: BTreeMap<String, Vec<String>> = manifest
+            .programs
+            .iter()
+            .map(|(name, ops)| {
+                let mut buffers = std::collections::BTreeSet::new();
+                for op in ops {
+                    match op {
+                        crate::model::Operation::Kernel { name } => {
+                            for arg in &kernel_map[name.as_str()].args {
+                                if let Argument::Buffer { name }
+                                | Argument::BufferSlice { name, .. } = arg
+                                {
+                                    buffers.insert(name.clone());
+                                }
+                            }
+                        }
+                        crate::model::Operation::Copy {
+                            source,
+                            destination,
+                            ..
+                        } => {
+                            buffers.extend([source.clone(), destination.clone()]);
+                        }
+                        crate::model::Operation::Zero { destination, .. } => {
+                            buffers.insert(destination.clone());
+                        }
+                    }
+                }
+                buffers.retain(|n| s.workspace_buffers.borrow().contains_key(n));
+                (name.clone(), buffers.into_iter().collect())
+            })
+            .collect();
+        // Admission runs on every iteration; freeze shared dependency unions
+        // once instead of scanning hundreds of native aliases per token.
+        let text_workspaces: std::collections::BTreeSet<_> = manifest
+            .programs
+            .keys()
+            .filter(|name| {
+                !manifest
+                    .vision
+                    .as_ref()
+                    .is_some_and(|v| v.plans.iter().any(|p| p.program == **name))
+                    && !(manifest.audio.is_some()
+                        && matches!(name.as_str(), "audio_stem" | "audio_encoder"))
+                    && !manifest.sampling.as_ref().is_some_and(|s| {
+                        s.program == **name || s.batch.as_ref().is_some_and(|b| b.program == **name)
+                    })
+            })
+            .flat_map(|p| workspace_dependencies[p].iter().cloned())
+            .collect();
+        for names in workspace_dependencies.values_mut() {
+            names.retain(|n| !text_workspaces.contains(n));
+        }
         let load_to_ready_s = started.elapsed().as_secs_f64();
         let captured_programs: Vec<String> = graphs.keys().cloned().collect();
         eprintln!(
@@ -642,6 +734,8 @@ impl Executor {
                 .map(|kv| kv.growth.clone())
                 .unwrap_or_default(),
             allocations,
+            workspace_dependencies,
+            text_workspaces: text_workspaces.into_iter().collect(),
             peak_kv_bytes: std::cell::Cell::new(0),
             peak_prefill_workspace_bytes: std::cell::Cell::new(0),
             prefill_workspace: manifest
@@ -767,6 +861,7 @@ impl Executor {
         if bytes > *self.sizes.get(name).ok_or("Unknown download buffer")? {
             return Err("Download exceeds buffer".into());
         }
+        self.ensure_workspace(name, bytes)?;
         if self
             .session
             .virtual_buffers
@@ -816,6 +911,7 @@ impl Executor {
         {
             return Err("Copy exceeds buffer".into());
         }
+        self.ensure_workspace(source, source_offset + bytes)?;
         self.ensure_writable_range(destination, offset, bytes)?;
         // SAFETY: The validated ranges refer to live allocations owned by this
         // executor and the transfer is ordered with graph work on the same stream.
@@ -869,6 +965,9 @@ impl Executor {
         self.ensure_kv(name)?;
         if let Some(operations) = self.direct.as_ref().and_then(|d| d.programs.get(name)) {
             for operation in operations {
+                if let crate::model::Operation::Copy { source, bytes, .. } = operation {
+                    self.ensure_workspace(source, *bytes)?;
+                }
                 match operation {
                     crate::model::Operation::Copy {
                         destination, bytes, ..
@@ -995,6 +1094,17 @@ impl Executor {
         let kernel = bindings
             .get_mut(name)
             .ok_or_else(|| format!("Unknown kernel {name}"))?;
+        if !kernel.workspaces_ready {
+            for argument in &kernel.spec.args {
+                if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } = argument {
+                    self.ensure_workspace(name, self.sizes[name])?;
+                }
+            }
+            // Shared mappings are retained for this executor's lifetime.
+            // Track readiness separately from module preload: a preloaded
+            // function can still reference an untouched workspace reservation.
+            kernel.workspaces_ready = true;
+        }
         if kernel.function.is_none() {
             let at = Instant::now();
             kernel.function = Some(
@@ -1028,8 +1138,28 @@ impl Executor {
         operations: &[crate::execution::Invocation],
     ) -> Result<()> {
         for invocation in operations {
+            for view in invocation.views.values() {
+                self.ensure_workspace(&view.buffer, self.sizes[&view.buffer])?;
+            }
             if let crate::model::Operation::Kernel { name } = &invocation.operation {
                 self.ensure_kernel(name)?;
+            } else {
+                let names: Vec<&str> = match &invocation.operation {
+                    crate::model::Operation::Copy {
+                        source,
+                        destination,
+                        ..
+                    } => vec![source, destination],
+                    crate::model::Operation::Zero { destination, .. } => vec![destination],
+                    _ => vec![],
+                };
+                for name in names {
+                    let name = invocation
+                        .views
+                        .get(name)
+                        .map_or(name, |v| v.buffer.as_str());
+                    self.ensure_workspace(name, self.sizes[name])?;
+                }
             }
         }
         Ok(())
@@ -1140,6 +1270,10 @@ impl Executor {
         offset: usize,
         bytes: usize,
     ) -> Result<()> {
+        let end = offset
+            .checked_add(bytes)
+            .ok_or("Workspace range overflow")?;
+        self.ensure_workspace(name, end)?;
         let mut buffers = self.session.virtual_buffers.borrow_mut();
         if let Some(buffer) = buffers.get_mut(name)
             && buffer.writable_bytes(offset, bytes)? != 0
@@ -1148,6 +1282,60 @@ impl Executor {
             buffer.make_writable(&self.session, offset, bytes)?;
         }
         Ok(())
+    }
+
+    /// Map only before submission/capture. VA is immutable and earlier slabs
+    /// are retained, so growing another row cannot invalidate existing graphs.
+    pub(crate) fn ensure_workspace(&self, name: &str, bytes: usize) -> Result<()> {
+        if bytes > self.sizes.get(name).copied().unwrap_or(0) {
+            return Err("Workspace mapping exceeds buffer".into());
+        }
+        let mut buffers = self.session.workspace_buffers.borrow_mut();
+        if let Some(buffer) = buffers.get_mut(name)
+            && bytes > buffer.mapped
+        {
+            let at = Instant::now();
+            let before = buffer.physical_bytes();
+            self.sync()?;
+            buffer.grow_bytes(&self.session, bytes)?;
+            let mut stats = self.batch_statistics.get();
+            stats.workspace_mappings += 1;
+            stats.workspace_mapped_bytes += buffer.physical_bytes() - before;
+            stats.workspace_mapping_s += at.elapsed().as_secs_f64();
+            self.batch_statistics.set(stats);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pending_workspace_bytes(&self, programs: &[&str]) -> Result<usize> {
+        let names: std::collections::BTreeSet<_> = programs
+            .iter()
+            .flat_map(|p| self.workspace_dependencies.get(*p).into_iter().flatten())
+            .collect();
+        names.into_iter().try_fold(0usize, |sum, name| {
+            sum.checked_add(self.pending_workspace_range(name, self.sizes[name])?)
+                .ok_or_else(|| "Pending workspace sum overflow".into())
+        })
+    }
+
+    pub(crate) fn pending_workspace_range(&self, name: &str, bytes: usize) -> Result<usize> {
+        if bytes > self.sizes.get(name).copied().unwrap_or(0) {
+            return Err("Pending workspace exceeds buffer".into());
+        }
+        self.session
+            .workspace_buffers
+            .borrow()
+            .get(name)
+            .map_or(Ok(0), |buffer| {
+                Ok(buffer.required_extent(bytes)?.saturating_sub(buffer.mapped))
+            })
+    }
+
+    pub(crate) fn pending_text_workspace_bytes(&self) -> Result<usize> {
+        self.text_workspaces.iter().try_fold(0usize, |sum, name| {
+            sum.checked_add(self.pending_workspace_range(name, self.sizes[name])?)
+                .ok_or_else(|| "Pending text workspace sum overflow".into())
+        })
     }
     pub(crate) fn upload_ids(&self, name: &str, ids: &[u32]) -> Result<()> {
         let bytes = ids
@@ -1169,6 +1357,7 @@ impl Executor {
             if self.sizes.get(name).is_none_or(|&size| size < 4) {
                 return Err("Control exceeds allocation".into());
             }
+            self.ensure_workspace(name, 4)?;
             region.0 = self.pointers[name];
         }
         let mut values = [0i32; N];
@@ -1182,21 +1371,29 @@ impl Executor {
         Ok(values)
     }
     pub(crate) fn upload_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.upload_bytes_at(name, 0, bytes)
+    }
+    pub(crate) fn upload_bytes_at(&self, name: &str, offset: usize, bytes: &[u8]) -> Result<()> {
         let size = self.sizes.get(name).ok_or("Missing input buffer")?;
-        if bytes.len() > *size {
+        if offset
+            .checked_add(bytes.len())
+            .is_none_or(|end| end > *size)
+        {
             return Err("Input upload exceeds buffer".into());
         }
-        self.ensure_writable_range(name, 0, bytes.len())?;
-        self.session
-            .transfers
-            .borrow_mut()
-            .upload(self.session.stream, self.pointers[name], bytes)
+        self.ensure_writable_range(name, offset, bytes.len())?;
+        self.session.transfers.borrow_mut().upload(
+            self.session.stream,
+            self.pointers[name] + offset as u64,
+            bytes,
+        )
     }
     pub(crate) fn read_controls(&self, name: &str, count: usize) -> Result<Vec<u32>> {
         let bytes = count.checked_mul(4).ok_or("Control vector size overflow")?;
         if bytes > self.sizes[name] {
             return Err("Control vector exceeds allocation".into());
         }
+        self.ensure_workspace(name, bytes)?;
         let mut values = vec![0u32; count];
         if bytes <= super::transfers::READBACK_BYTES {
             // SAFETY: The initialized u32 destination covers the checked byte

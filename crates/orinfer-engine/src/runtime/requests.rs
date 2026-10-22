@@ -7,6 +7,7 @@ mod prefill;
 #[cfg(test)]
 mod profile;
 mod prompt_lookup;
+mod sampling;
 pub(super) mod speculation;
 #[cfg(test)]
 mod tests;
@@ -140,6 +141,9 @@ enum Work {
 pub(super) struct Reservation {
     kv_bytes: usize,
     context: usize,
+    sampling: bool,
+    vision: bool,
+    audio: bool,
 }
 
 impl ModelRuntime {
@@ -411,7 +415,17 @@ impl ModelRuntime {
         let limits = self.request_limits(input)?;
         let mut fixed = self.execution.additional_state_bytes(&limits)?;
         let mut prospective = self.execution.additional_kv_bytes(context, &limits)?;
-        let workspace = self.pending_workspace(context)?;
+        let sampling = input.sampling.temperature > 0. && input.sampling.top_logprobs.is_none();
+        let mut programs = vec!["decode", "prefill", "head"];
+        if !input.images.is_empty()
+            && let Some(vision) = &self.manifest.vision
+        {
+            programs.extend(vision.plans.iter().map(|p| p.program.as_str()));
+        }
+        if !input.audios.is_empty() {
+            programs.extend(["audio_stem", "audio_encoder"]);
+        }
+        let workspace = self.pending_workspace(context, sampling, &programs)?;
         let future = self
             .reserved_requests
             .values()
@@ -458,7 +472,7 @@ impl ModelRuntime {
             };
             self.execution.release_snapshot(snapshot)?;
         }
-        self.trim_request_cache(options, fixed + prospective, context)?;
+        self.trim_request_cache(options, fixed + prospective, context, sampling)?;
         self.idle_admission_since = None;
         Ok(true)
     }
@@ -502,22 +516,71 @@ impl ModelRuntime {
             .free_bytes()?
             .min(scheduler::usable_host_bytes()?))
     }
-    fn pending_workspace(&self, context: usize) -> Result<usize> {
-        self.execution.pending_prefill_workspace_bytes(
-            context.max(
-                self.reserved_requests
-                    .values()
-                    .map(|r| r.context)
-                    .max()
-                    .unwrap_or(0),
-            ),
-        )
+    fn pending_workspace(
+        &self,
+        context: usize,
+        additional_sampler: bool,
+        programs: &[&str],
+    ) -> Result<usize> {
+        // Media encoding can wait behind text packets. Retain its shared
+        // workspace budget across later admissions until first materialization.
+        let mut programs = programs.to_vec();
+        if self.reserved_requests.values().any(|r| r.vision)
+            && let Some(vision) = &self.manifest.vision
+        {
+            programs.extend(vision.plans.iter().map(|p| p.program.as_str()));
+        }
+        if self.reserved_requests.values().any(|r| r.audio) {
+            programs.extend(["audio_stem", "audio_encoder"]);
+        }
+        let mut bytes = self
+            .execution
+            .pending_prefill_workspace_bytes(
+                context.max(
+                    self.reserved_requests
+                        .values()
+                        .map(|r| r.context)
+                        .max()
+                        .unwrap_or(0),
+                ),
+            )?
+            .checked_add(self.execution.pending_text_workspace_bytes()?)
+            .and_then(|n| n.checked_add(self.execution.pending_workspace_bytes(&programs).ok()?))
+            .ok_or("Pending shared workspace overflow")?;
+        let samplers = self
+            .reserved_requests
+            .values()
+            .filter(|r| r.sampling)
+            .count()
+            + usize::from(additional_sampler);
+        if samplers > 0
+            && let Some(sampling) = &self.manifest.sampling
+        {
+            bytes = bytes
+                .checked_add(
+                    self.execution
+                        .pending_workspace_bytes(&[&sampling.program])?,
+                )
+                .ok_or("Pending sampler workspace overflow")?;
+            if samplers > 1
+                && let Some(batch) = &sampling.batch
+            {
+                bytes = bytes
+                    .checked_add(self.execution.pending_workspace_range(
+                        &batch.scratch,
+                        samplers.min(batch.capacity) * batch.stride,
+                    )?)
+                    .ok_or("Pending sampler rows overflow")?;
+            }
+        }
+        Ok(bytes)
     }
     fn trim_request_cache(
         &mut self,
         options: &scheduler::Options,
         additional: usize,
         context: usize,
+        additional_sampler: bool,
     ) -> Result<()> {
         let future = self
             .reserved_requests
@@ -525,7 +588,11 @@ impl ModelRuntime {
             .map(|r| r.kv_bytes)
             .sum::<usize>()
             .saturating_sub(self.execution.active_kv_bytes())
-            .checked_add(self.pending_workspace(context)?)
+            .checked_add(self.pending_workspace(
+                context,
+                additional_sampler,
+                &["decode", "prefill", "head"],
+            )?)
             .ok_or("Future workspace budget overflow")?;
         let free = self.admission_free_bytes()?;
         let available = free
@@ -621,6 +688,10 @@ impl ModelRuntime {
                 Reservation {
                     kv_bytes: self.execution.reserved_kv_bytes(context)?,
                     context,
+                    sampling: input.sampling.temperature > 0.
+                        && input.sampling.top_logprobs.is_none(),
+                    vision: !input.images.is_empty(),
+                    audio: !input.audios.is_empty(),
                 },
             );
             self.scheduler_statistics.peak_active = self
@@ -928,7 +999,7 @@ impl ModelRuntime {
             })
             .unwrap_or((1, "decode".into(), None));
         let at = Instant::now();
-        let load_before = self.execution.batch_statistics.get().kernel_load_s;
+        let load_before = self.execution.batch_statistics.get().initialization_s();
         self.upload_ids(
             if head.is_none() {
                 &self.manifest.token
@@ -948,7 +1019,7 @@ impl ModelRuntime {
             self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
         }
         let regular_s = at.elapsed().as_secs_f64()
-            - (self.execution.batch_statistics.get().kernel_load_s - load_before);
+            - (self.execution.batch_statistics.get().initialization_s() - load_before);
         if (req.offset + chunk == req.input.len()
             || req.checkpoints.contains(&(req.offset + chunk)))
             && let Some(head) = head
@@ -1231,7 +1302,7 @@ impl ModelRuntime {
         // Encoder work follows the selected text packet. Encoding every admitted
         // recording here would delay existing decoders and the first prompt
         // behind media that cannot fit in this iteration's token budget.
-        self.trim_request_cache(options, 0, 0)?;
+        self.trim_request_cache(options, 0, 0, false)?;
         self.scheduler_statistics.iterations += 1;
         let at = Instant::now();
         let mut output = vec![];
@@ -1355,7 +1426,8 @@ impl ModelRuntime {
                     model.advance_prefill_step(req, chunk, bounded, budget_s)
                 })?;
                 let after = self.execution.batch_statistics.get();
-                let cold_s = after.kernel_load_s - before.kernel_load_s + after.sequence_capture_s
+                let cold_s = after.initialization_s() - before.initialization_s()
+                    + after.sequence_capture_s
                     - before.sequence_capture_s;
                 if !self
                     .manifest
@@ -1413,7 +1485,8 @@ impl ModelRuntime {
         }
         if let Some(feedback) = feedback {
             let stats = self.execution.batch_statistics.get();
-            let cold = stats.kernel_load_s - feedback_stats.kernel_load_s + stats.capture_s
+            let cold = stats.initialization_s() - feedback_stats.initialization_s()
+                + stats.capture_s
                 - feedback_stats.capture_s
                 + stats.sequence_capture_s
                 - feedback_stats.sequence_capture_s;
@@ -1776,7 +1849,7 @@ impl ModelRuntime {
             let at = Instant::now();
             let key = Self::iteration_key(requests, selected);
             let capture_before = self.execution.batch_statistics.get().sequence_capture_s;
-            let load_before = self.execution.batch_statistics.get().kernel_load_s;
+            let load_before = self.execution.batch_statistics.get().initialization_s();
             let i = selected[0].0;
             let tokens = self.with_request(requests[i], |model, req| {
                 if req.prefilling && model.manifest.prefill_plan(1).is_some() {
@@ -1838,7 +1911,7 @@ impl ModelRuntime {
                 .or_default() += 1;
             let capture_s =
                 self.execution.batch_statistics.get().sequence_capture_s - capture_before;
-            let load_s = self.execution.batch_statistics.get().kernel_load_s - load_before;
+            let load_s = self.execution.batch_statistics.get().initialization_s() - load_before;
             self.iteration_costs
                 .entry(key)
                 .or_default()
@@ -1858,7 +1931,7 @@ impl ModelRuntime {
         #[cfg(test)]
         profile::mark("policy");
         let inputs_at = Instant::now();
-        let load_before = self.execution.batch_statistics.get().kernel_load_s;
+        let load_before = self.execution.batch_statistics.get().initialization_s();
         let segments = self.prepare_batch_inputs(requests, selected)?;
         #[cfg(test)]
         profile::mark("inputs");
@@ -1890,7 +1963,6 @@ impl ModelRuntime {
         )?;
         #[cfg(test)]
         profile::mark("execute");
-        let load_s = self.execution.batch_statistics.get().kernel_load_s - load_before;
         let commit_at = Instant::now();
         *self
             .scheduler_statistics
@@ -1913,6 +1985,7 @@ impl ModelRuntime {
         let commit_s = commit_at.elapsed().as_secs_f64();
         self.scheduler_statistics.batch_commit_s += commit_s;
         let seconds = inputs_at.elapsed().as_secs_f64();
+        let load_s = self.execution.batch_statistics.get().initialization_s() - load_before;
         let capture_s = self.execution.batch_statistics.get().capture_s - capture_before;
         self.iteration_costs
             .entry(key)
@@ -2051,6 +2124,7 @@ impl ModelRuntime {
         selected: &[(usize, usize)],
         output: &mut Vec<StepOutput>,
     ) -> Result<()> {
+        let sampled = self.gpu_sample_batch(requests, selected)?;
         let fast: Vec<_> = selected
             .iter()
             .filter_map(|&(i, _)| {
@@ -2077,6 +2151,23 @@ impl ModelRuntime {
         )?;
         let mut controls = fast.iter().zip(controls).peekable();
         for &(i, chunk) in selected {
+            if requests[i].failure().is_some() {
+                continue;
+            }
+            if let Some(&token) = sampled.get(&i) {
+                let req = &mut requests[i];
+                self.execution
+                    .upload_sequence_ids(req.slot, &self.manifest.token, &[token])?;
+                req.history.push(token);
+                req.generated += 1;
+                req.mtp.committed_tokens = req.generated;
+                self.scheduler_statistics.decode_tokens += 1;
+                output.push(StepOutput {
+                    request: i,
+                    tokens: vec![token],
+                });
+                continue;
+            }
             if controls.peek().is_some_and(|((index, _), _)| *index == i) {
                 let (_, [position, status, token]) = controls.next().unwrap();
                 let req = &mut requests[i];

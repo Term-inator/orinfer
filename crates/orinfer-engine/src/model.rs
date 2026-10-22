@@ -43,6 +43,7 @@ pub struct LoadStages {
     pub final_sync_s: f64,
     pub cuda_allocations: usize,
     pub weight_arena_padding_bytes: usize,
+    pub deferred_workspace_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]

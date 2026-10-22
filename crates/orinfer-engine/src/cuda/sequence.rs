@@ -103,6 +103,57 @@ pub(super) struct IdleSelection {
 }
 
 impl Executor {
+    /// Bind each source arena and a disjoint transient scratch row. No request
+    /// address is supplied by a caller outside this retained executor.
+    pub(crate) fn upload_scratch_rows(
+        &self,
+        table: &str,
+        scratch: &str,
+        stride: usize,
+        source: &str,
+        source_bytes: usize,
+        slots: &[usize],
+    ) -> Result<()> {
+        let bytes = stride
+            .checked_mul(slots.len())
+            .ok_or("Scratch rows overflow")?;
+        if slots.is_empty()
+            || slots.len() > 128
+            || stride == 0
+            || !self.pointers.is_private(source)
+            || slots
+                .len()
+                .checked_mul(16)
+                .is_none_or(|n| n > self.sizes.get(table).copied().unwrap_or(0))
+        {
+            return Err("Invalid scratch row table".into());
+        }
+        self.ensure_workspace(scratch, bytes)?;
+        let mut addresses = Vec::with_capacity(slots.len() * 16);
+        for (row, &slot) in slots.iter().enumerate() {
+            let arena = self
+                .sequences
+                .get(slot)
+                .filter(|s| s.leased && !s.quarantined)
+                .ok_or("Scratch rows require a live arena")?;
+            if arena.sizes.get(source).is_none_or(|&n| n < source_bytes) {
+                return Err("Scratch row source exceeds arena".into());
+            }
+            addresses.extend_from_slice(
+                &arena
+                    .addresses
+                    .get(source)
+                    .ok_or("Missing scratch row source")?
+                    .to_le_bytes(),
+            );
+            let address = self.pointers[scratch]
+                .checked_add((row * stride) as u64)
+                .ok_or("Scratch row address overflow")?;
+            addresses.extend_from_slice(&address.to_le_bytes());
+        }
+        self.upload_bytes(table, &addresses)
+    }
+
     /// Bind actual rows to an AOT template. Unseen lengths only specialize
     /// CPU launch parameters; they do not introduce modules or online compilation.
     pub(crate) fn submit_program_rows(

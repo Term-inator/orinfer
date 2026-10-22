@@ -136,6 +136,7 @@ pub(crate) struct Session {
     pub(crate) stream: sys::CUstream,
     pub(crate) buffers: Vec<u64>,
     pub(crate) virtual_buffers: std::cell::RefCell<virtual_memory::Reservations>,
+    pub(crate) workspace_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) expert_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) prefix_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) modules: std::cell::RefCell<Vec<sys::CUmodule>>,
@@ -158,6 +159,7 @@ impl Session {
             stream: ptr::null_mut(),
             buffers: vec![],
             virtual_buffers: Default::default(),
+            workspace_buffers: Default::default(),
             expert_buffers: Default::default(),
             prefix_buffers: Default::default(),
             modules: Default::default(),
@@ -224,6 +226,7 @@ impl Session {
             for (_, mut buffer) in std::mem::take(self.virtual_buffers.get_mut())
                 .into_iter()
                 .chain(std::mem::take(self.expert_buffers.get_mut()))
+                .chain(std::mem::take(self.workspace_buffers.get_mut()))
                 .chain(std::mem::take(self.prefix_buffers.get_mut()))
             {
                 if let Err(e) = buffer.release_slabs(&self.driver) {

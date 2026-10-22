@@ -6,6 +6,147 @@ from pathlib import Path
 import torch
 from tools.operators.common import benchmark, configure, export_kernel, environment
 from kernels.model import sampling as s
+from tools.model.sampling import geometry, batch_layout, FUNCTIONS
+
+
+class BatchedPipeline:
+    """Exercise the production independent_rows wrapper against scalar kernels."""
+
+    def __init__(self, pipes):
+        from tools.model.compile import instantiate, compile_function
+        from kernels.model.independent_rows import independent_rows
+
+        self.pipes = pipes
+        vocab, context = pipes[0].vocab, pipes[0].context
+        self.shapes = geometry(vocab, context)
+        self.offsets, self.stride = batch_layout(self.shapes)
+        self.scratch = torch.empty((len(pipes), self.stride), dtype=torch.uint8, device="cuda")
+        self.pointers = torch.zeros((128, 2), dtype=torch.uint64, device="cuda")
+        self.output = torch.full((128, 2), -91, dtype=torch.int32, device="cuda")
+        self.kernels = {}
+        for name, names in FUNCTIONS.items():
+            fn = instantiate(getattr(s, name), vocab, *([context] if name == "history" else []))
+            roles = {n: ("private", "Logits" if n == "Logits" else "Scratch") for n in names}
+            if "Output" in names:
+                roles["Output"] = ("row", "Output")
+            fn, arguments = independent_rows(
+                fn,
+                128,
+                roles,
+                {"Logits": 0, "Scratch": 1},
+                dynamic=True,
+                offsets={n: self.offsets[n] for n in names if n in self.offsets},
+            )
+            self.kernels[name] = compile_function(fn), arguments
+
+    def inputs(self, owners):
+        import math
+        import re
+
+        table = torch.zeros((128, 2), dtype=torch.uint64)
+        for row, owner in enumerate(owners):
+            if owner is None:
+                continue
+            pipe = self.pipes[owner]
+            table[row, 0] = pipe.logits.data_ptr()
+            table[row, 1] = self.scratch[row].data_ptr()
+            for name in ("History", "BiasIds", "BiasValues", "Control", "Parameters", "Mask"):
+                attr = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+                source = getattr(pipe, attr)
+                dtype, shape = self.shapes[name]
+                target = self.scratch[
+                    row,
+                    self.offsets[name] : self.offsets[name]
+                    + math.prod(shape) * source.element_size(),
+                ]
+                target.copy_(source.reshape(-1).view(torch.uint8))
+        self.pointers.copy_(table)
+
+    def run(self, rows):
+        stream = torch.cuda.current_stream().cuda_stream
+
+        def launch(name, **scalars):
+            kernel, arguments = self.kernels[name]
+            values = {None: self.pointers, "Output": self.output, "__rows__": rows, **scalars}
+            kernel.adapter.func(*(values[name] for name in arguments), stream=stream)
+
+        for name in ("initialize", "history", "scores", "masses"):
+            launch(name)
+        for mode in range(3):
+            for digit in range(12):
+                launch("radix_histogram", digit=digit, mode=mode)
+                launch("radix_choose", digit=digit, mode=mode)
+
+
+def check_batched(sanitizer=False):
+    reports = []
+    for vocab, maximum in ((1057, 17), (248320, 3)) if sanitizer else ((1057, 128), (248320, 8)):
+        pipes = [Pipeline(vocab, context=32) for _ in range(maximum)]
+        batch = BatchedPipeline(pipes)
+
+        def prepare(owner, pipe):
+            logits = torch.randn(vocab, generator=torch.Generator().manual_seed(20261002 + owner))
+            pipe.inputs(
+                logits,
+                (0, 1, 7, 40)[owner % 4],
+                (1.0, 0.9, 0.8)[owner % 3],
+                (owner + 0.37) / maximum,
+                penalties=(0.2, 0.13, 1.1),
+                history=[0, 0, 2, vocab - 1],
+                bias={3: 0.7, vocab - 1: -0.2},
+                mask=[i % 3 != owner % 3 for i in range(vocab)],
+            )
+
+        for owner, pipe in enumerate(pipes):
+            prepare(owner, pipe)
+            pipe.run()
+        expected = [p.output.cpu().tolist() for p in pipes]
+        cases = []
+        for rows in (n for n in (1, 3, 8, 17, 128) if n <= maximum):
+            owners = list(reversed(range(rows)))
+            batch.inputs(owners)
+            batch.run(rows)
+            assert batch.output[:rows].cpu().tolist() == [expected[i] for i in owners]
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                batch.run(rows)
+            # Change membership and every live row's logits/parameters. Reuse
+            # the same captured addresses, including an inactive interior row.
+            owners.reverse()
+            for owner in owners:
+                pipes[owner].inputs(torch.arange(vocab, dtype=torch.float32), 1)
+            if rows > 1:
+                owners[rows // 2] = None
+            batch.output.fill_(-91)
+            batch.inputs(owners)
+            graph.replay()
+            actual = batch.output[:rows].cpu().tolist()
+            assert actual == [[vocab - 1, 0] if i is not None else [-91, -91] for i in owners]
+            bad_row = next(i for i, owner in enumerate(owners) if owner is not None)
+            for invalid in ("mask", "nan"):
+                logits = torch.zeros(vocab)
+                if invalid == "nan":
+                    logits[-1] = float("nan")
+                pipes[owners[bad_row]].inputs(
+                    logits, mask=[False] * vocab if invalid == "mask" else None
+                )
+                batch.inputs(owners)
+                graph.replay()
+                actual = batch.output[:rows].cpu().tolist()
+                assert actual == [
+                    [0, 1]
+                    if i == bad_row
+                    else ([vocab - 1, 0] if owner is not None else [-91, -91])
+                    for i, owner in enumerate(owners)
+                ]
+            cases.append(
+                dict(rows=rows, exact=True, changed_membership_replay=True, errors_isolated=True)
+            )
+            # Restore the heterogeneous distributions for the next row count.
+            for owner, pipe in enumerate(pipes):
+                prepare(owner, pipe)
+        reports.append(dict(vocab=vocab, cases=cases))
+    return reports
 
 
 class Pipeline:
@@ -151,10 +292,17 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--sanitizer", action="store_true", help="Skip instrumented timing repetitions")
+    p.add_argument("--batch-only", action="store_true")
     a = p.parse_args()
     configure()
     # Establish the primary context before NVRTC/cuda-python adapter discovery.
     torch.empty((), device="cuda")
+    if a.batch_only:
+        reports = check_batched(a.sanitizer)
+        (a.output / "results.json").write_text(
+            json.dumps(dict(environment=environment(), batched=reports), indent=2)
+        )
+        return
     reports = []
     for vocab in (35, 1057, 248320):
         pipe = Pipeline(vocab)

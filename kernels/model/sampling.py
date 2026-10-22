@@ -114,6 +114,7 @@ def scores(vocab: int):
 @orin_jit
 def masses(vocab: int):
     blocks = (vocab + TILE - 1) // TILE
+    reduction_width = 1 << (blocks - 1).bit_length()
     scale = 1 << min(52, 63 - (vocab - 1).bit_length())
 
     @T.prim_func
@@ -127,29 +128,37 @@ def masses(vocab: int):
         Output: T.Tensor((2,), T.int32),
     ):
         with T.Kernel(blocks, threads=256) as b:
-            maximum = T.alloc_var(T.float64, -T.infinity(T.float64))
-            invalid = T.alloc_var(T.int32, 0)
-            for k in T.serial(blocks):
-                maximum = T.max(maximum, Maximum[k])
-                invalid = T.max(invalid, Invalid[k])
-            invalid = T.max(
-                invalid, T.cast(not T.call_pure_extern("bool", "isfinite", maximum), T.int32)
+            maxima = T.alloc_fragment((reduction_width,), T.float64)
+            invalids = T.alloc_fragment((reduction_width,), T.int32)
+            maximum = T.alloc_fragment((1,), T.float64)
+            invalid = T.alloc_fragment((1,), T.int32)
+            for k in T.Parallel(reduction_width):
+                maxima[k] = -T.infinity(T.float64)
+                invalids[k] = 0
+                if k < blocks:
+                    maxima[k] = Maximum[k]
+                    invalids[k] = Invalid[k]
+            T.reduce_max(maxima, maximum, dim=0)
+            T.reduce_max(invalids, invalid, dim=0)
+            invalid[0] = T.max(
+                invalid[0],
+                T.cast(not T.call_pure_extern("bool", "isfinite", maximum[0]), T.int32),
             )
             for i in T.Parallel(TILE):
                 j = b * TILE + i
                 if j < vocab:
                     Mass[j] = 0
-                    if Keys[j] != 0 and invalid == 0:
+                    if Keys[j] != 0 and invalid[0] == 0:
                         Mass[j] = T.cast(
                             T.call_pure_extern(
-                                "float64", "exp", (Scores[j] - maximum) / Parameters[0]
+                                "float64", "exp", (Scores[j] - maximum[0]) / Parameters[0]
                             )
                             * T.float64(scale),
                             T.uint64,
                         )
             if b == 0 and T.get_thread_binding() == 0:
                 Output[0] = 0
-                Output[1] = invalid
+                Output[1] = invalid[0]
 
     return main
 

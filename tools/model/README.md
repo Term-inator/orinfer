@@ -64,6 +64,10 @@ bash tools/operators/run.sh tools/model/sampling.py artifacts/sampling-build \
 
 该入口重建 Rust 绑定库并原子发布当前 schema-1 模型，沿用完整程序与 ABI 检查。新包仍需完整请求、状态隔离及 prefix/MTP 验收。greedy 沿用原有路径；需要 top_logprobs 或 MTP p/q 分布的调用保留 CPU 路径。
 
+采样包同时发布同源单请求程序和 1–128 行地址表程序。普通 decode 中至少两个符合条件的随机请求按 owner 批量执行，分别绑定 logits、seed、惩罚、bias 和 grammar mask，集中回读选中 token；单个随机请求复用单请求程序，greedy、logprobs 和 MTP 保持各自的输出语义。临时采样 scratch 按实际行数映射，行数和 owner 改变时复用相同动态 kernel。
+
+Rust 执行器为大块共享工作区保留 CUDA 虚拟地址，在首次上传或执行依赖程序前映射并清零物理内存，保留映射供 Graph replay 使用。文本启动可延后视觉、音频和采样 scratch 的物理分配；请求准入预留尚未映射的计算工作区与采样行。`LOAD STAGES.deferred_workspace_bytes` 记录启动时延后的逻辑字节，scheduler 的 `batch_execution` 记录映射次数、物理字节、耗时及实际采样 packet／行数。该运行时优化可加载已有匹配执行包；批量采样需重建采样包并配合当前引擎使用。
+
 Qwen3_5 的 `gdn_execution` 明确声明 prefill 的 sequential/chunked 策略，以及 decode 的 dense/deferred 策略和日志容量；构建、验证、恢复与提交消费同一契约。原生适配器依据显式契约校验策略及其全部状态和工作区。Attention 的 INT8 读取与临时 FP16 KV 暂存候选按完整流水线实测选择，以小行数、非对齐尾部和大 prefill 的实测结果决定选择区间。
 
 `auxiliary_tuning.py` 可为已有原生包测量并发布 MoE top-k、QSA 选择和 FP16 PLE norm/gate 融合，参数为 `--model`、`--model-output` 和 `--output`；`--families router` 只处理共享 MoE 路由。Flash Next 正式 `build.py` 包含该步骤，Qwen3_5 构建器复用同一 MoE 调优器。几何来自 checkpoint 签名及物理 buffer 视图，支持展开或扁平 workspace；数值、尾部和 Graph 检查通过后才参与选择。QSA 与 PLE 汇总多长度测量选择一个配置，Rust 适配器验证完整生产者链后应用融合并生成执行顺序。

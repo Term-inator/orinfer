@@ -1226,6 +1226,11 @@ fn profile_continuous_decode() {
     .unwrap();
     // Isolate target decode. This is not a quality assessment or API benchmark.
     model.manifest.mtp = None;
+    if fixture["sampling_batch"].as_bool() == Some(false)
+        && let Some(sampling) = &mut model.manifest.sampling
+    {
+        sampling.batch = None;
+    }
     let options = scheduler::Options::default();
     let iterations = fixture["iterations"].as_u64().unwrap_or(64) as usize;
     assert!((1..=128).contains(&iterations));

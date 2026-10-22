@@ -349,6 +349,11 @@ pub fn admission_should_yield(
 /// Host timings; replay includes stream synchronization, not GPU event timing.
 #[derive(Default, Clone, Copy, Debug, Serialize)]
 pub struct BatchExecutionStatistics {
+    pub sampling_packets: usize,
+    pub sampling_rows: usize,
+    pub workspace_mappings: usize,
+    pub workspace_mapped_bytes: usize,
+    pub workspace_mapping_s: f64,
     pub dynamic_graph_captures: usize,
     pub dynamic_direct_iterations: usize,
     pub graph_capture_deferrals: usize,
@@ -366,6 +371,13 @@ pub struct BatchExecutionStatistics {
     pub kernel_load_s: f64,
     pub sequence_captures: usize,
     pub sequence_capture_s: f64,
+}
+
+impl BatchExecutionStatistics {
+    /// One-time materialization must not inflate the hot scheduling estimate.
+    pub(crate) fn initialization_s(self) -> f64 {
+        self.kernel_load_s + self.workspace_mapping_s
+    }
 }
 
 #[derive(Default, Clone, Debug, Serialize)]

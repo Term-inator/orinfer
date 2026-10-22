@@ -8,6 +8,7 @@ mod sampling;
 mod single_decode;
 mod single_row;
 mod vision_rows;
+mod workspace;
 use super::*;
 use serde::Deserialize;
 use serde_json::json;

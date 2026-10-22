@@ -110,7 +110,8 @@ impl ModelRuntime {
                 self.launch_rows(&frame.plan.stages[stage], chunk, ExecutionPhase::Prefill)?;
                 frame.next += 1;
                 frame.regular_s += began.elapsed().as_secs_f64()
-                    - (self.execution.batch_statistics.get().kernel_load_s - before.kernel_load_s);
+                    - (self.execution.batch_statistics.get().initialization_s()
+                        - before.initialization_s());
                 if frame.next == frame.plan.stages.len() {
                     if let Some(spec) = &self.manifest.mtp {
                         self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
@@ -144,7 +145,8 @@ impl ModelRuntime {
                 self.scheduler_statistics.bounded_prefill_iterations += 1;
             }
             let after = self.execution.batch_statistics.get();
-            let cold = after.kernel_load_s - before.kernel_load_s + after.sequence_capture_s
+            let cold = after.initialization_s() - before.initialization_s()
+                + after.sequence_capture_s
                 - before.sequence_capture_s;
             self.prefill_costs.observe_stage(
                 chunk,
