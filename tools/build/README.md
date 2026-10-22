@@ -9,6 +9,12 @@ make compiler-image
 make check-offline
 ```
 
+本机代理使用回环地址时，构建可通过 host 网络读取现有代理环境变量：
+
+```bash
+make compiler-image DOCKER_BUILD_ARGS='--network host --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY'
+```
+
 离线工具最低要求 Python 3.12，CPU 检查与 GPU 编译使用同一版本系列。`compiler.Dockerfile` 从固定 digest 的公开 NVIDIA Jetson 镜像提供 CUDA 12.6 工具链，在 `/opt/python` 安装 CPython 3.12.15，并用 uv 0.13.4 为 `/opt/venv` 创建完整的独立环境。系统依赖由基底镜像 digest 固定，Python 包源显式使用 PyPI。
 
 `compiler-requirements.txt` 固定全部 Python 依赖和构建工具，包含 TileLang 0.1.15、Transformers 5.20.2、Tokenizers 0.23.3、Hub 2.2.0、Pillow 13.0.0 和 NumPy 2.5.4。Torch 2.14.1+orinfer1/torchvision 0.29.1+orinfer1 使用我们从源码编译的 CPython 3.12/SM87/CUDA 12.6 构建，Triton 使用 3.8.0。构建验证 Python、Torch CUDA 版本和 SM87 编译目标，模型和编译缓存通过运行时挂载提供。TVM FFI、Z3、Setuptools 和 mpmath 保持各自消费者要求的版本范围。默认镜像名为 `orinfer-compiler:0.1.3`，可用 `ORINFER_OPERATOR_IMAGE` 覆盖。

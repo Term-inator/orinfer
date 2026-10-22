@@ -43,7 +43,7 @@ info:
 	cargo run --offline -p orinfer-cli -- info
 
 compiler-image:
-	docker build -t orinfer-compiler:0.1.3 -f tools/build/compiler.Dockerfile .
+	docker build $(DOCKER_BUILD_ARGS) -t orinfer-compiler:0.1.3 -f tools/build/compiler.Dockerfile .
 
 check-offline:
 	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR):$(CURDIR)/tools/operators" --entrypoint /opt/venv/bin/python orinfer-compiler:0.1.3 -m tools.build.check_imports
