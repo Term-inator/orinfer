@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "repository": "iMMIQ/pytorch",
+  "source": "https://github.com/iMMIQ/pytorch",
+  "source_commit": "9ea85c0f39e1c3303fec5f2e2cdb93f719262921",
+  "upstream_commit": "5c4886908584029761b579af026dcfb627c84070",
+  "torchvision_upstream_commit": "1f1a920d685d46dfbe187934b785b7ecb7a182f2",
+  "release": "jetson-v2.14.1-orinfer1-cu126-cp312-sm87",
+  "target": {
+    "arch": "aarch64",
+    "sm": 87,
+    "cuda": "12.6",
+    "python": "3.12.15"
+  },
+  "assets": [
+    {
+      "filename": "torch-2.14.1+orinfer1-cp312-cp312-linux_aarch64.whl",
+      "url": "https://github.com/iMMIQ/pytorch/releases/download/jetson-v2.14.1-orinfer1-cu126-cp312-sm87/torch-2.14.1%2Borinfer1-cp312-cp312-linux_aarch64.whl",
+      "size": 140004118,
+      "sha256": "4b022383b25612bf37b95b0c32122cc7ca1656b61a61275355b4c02f9b538e38"
+    },
+    {
+      "filename": "torchvision-0.29.1+orinfer1-cp312-cp312-linux_aarch64.whl",
+      "url": "https://github.com/iMMIQ/pytorch/releases/download/jetson-v2.14.1-orinfer1-cu126-cp312-sm87/torchvision-0.29.1%2Borinfer1-cp312-cp312-linux_aarch64.whl",
+      "size": 1215975,
+      "sha256": "6590eb80cfd825b5c23a09274ad1c5678eebfd8f5efc758fe19b30e7e0ac2989"
+    }
+  ]
+}

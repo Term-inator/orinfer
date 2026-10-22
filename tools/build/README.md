@@ -9,11 +9,17 @@ make compiler-image
 make check-offline
 ```
 
-`compiler.Dockerfile` 使用公开 NVIDIA Jetson CUDA 12.6/PyTorch 2.9.1 镜像的固定 digest，使用固定版本 uv 管理镜像内的 `/opt/venv`，安装 TileLang 0.1.15、Transformers 5.20.1、Tokenizers 0.23.3 和 Hub 2.2.0，模型和编译缓存通过运行时挂载提供。`compiler-requirements.txt` 固定完整 Python 依赖和构建工具，由 uv 同步并移除基底遗留的无关服务依赖。Jetson 原生 Torch 2.9.1/torchvision 0.24.1 保持不变，构建后检查 Torch 仍链接 CUDA12.6；系统依赖由基底镜像 digest 固定。GPU 编译环境保留 Python3.10 和 NumPy2.2.6；TVM FFI、Z3 遵守 TileLang 约束。默认镜像名为 `orinfer-compiler:0.1.2`，可用 `ORINFER_OPERATOR_IMAGE` 覆盖。
+离线工具最低要求 Python 3.12，CPU 检查与 GPU 编译使用同一版本系列。`compiler.Dockerfile` 从固定 digest 的公开 NVIDIA Jetson 镜像提供 CUDA 12.6 工具链，在 `/opt/python` 安装 CPython 3.12.15，并用 uv 0.13.4 为 `/opt/venv` 创建完整的独立环境。系统依赖由基底镜像 digest 固定，Python 包源显式使用 PyPI。
+
+`compiler-requirements.txt` 固定全部 Python 依赖和构建工具，包含 TileLang 0.1.15、Transformers 5.20.2、Tokenizers 0.23.3、Hub 2.2.0、Pillow 13.0.0 和 NumPy 2.5.4。Torch 2.14.1+orinfer1/torchvision 0.29.1+orinfer1 使用我们从源码编译的 CPython 3.12/SM87/CUDA 12.6 构建，Triton 使用 3.8.0。构建验证 Python、Torch CUDA 版本和 SM87 编译目标，模型和编译缓存通过运行时挂载提供。TVM FFI、Z3、Setuptools 和 mpmath 保持各自消费者要求的版本范围。默认镜像名为 `orinfer-compiler:0.1.3`，可用 `ORINFER_OPERATOR_IMAGE` 覆盖。
+
+Torch 与 torchvision 的源码、构建配置和验收入口在 [iMMIQ/pytorch 的 Jetson 分支](https://github.com/iMMIQ/pytorch/tree/jetson-r36.4-cu126-py312-v2.14/jetson) 维护。构建固定上游提交、NVIDIA CUDA 开发镜像、Python 依赖及 Clang/GCC 工具链，显式启用 OpenBLAS/LAPACK，限定 SM87 和 Orin 支持的 CPU 指令，并从源码生成完整原生库。wheel 验收覆盖 CPU 三角求解/SVD、CUDA 矩阵乘法、torchvision CUDA NMS 和改变输入的 Graph 回放。
+
+`jetson_wheels.json` 固定我们发布的 release、源码身份、wheel 长度和 SHA256。`jetson_wheels.py` 下载完整 wheel，校验长度和哈希后原子写入构建临时目录，再由 uv 安装。更新时先在 fork 构建与验收，再更新本仓库中的固定资产身份；项目另执行离线数学参考、真实整数算子和前端夹具验收。上游许可证与第三方声明随 wheel 保留。
 
 GPU 编译入口：
 
-NVRTC 后端使用 CUDA Python 12.6.2.post1；部分离线原生算子参考保留 Triton 3.5.1。两者与 TileLang 一同固定在编译镜像中，在线部署只加载已编译的原生执行包。
+NVRTC 后端使用 CUDA Python 12.6.2.post1；部分离线原生算子参考使用 Triton 3.8.0。两者与 TileLang 一同固定在编译镜像中，在线部署只加载已编译的原生执行包。所有入口直接调用 `/opt/venv/bin/python`，不再将其他 Python 版本的 site-packages 加入搜索路径。
 
 ```bash
 ORINFER_CHECKPOINT_DIR=/path/to/converted \
@@ -34,7 +40,7 @@ bash tools/operators/run.sh tools/build/smoke.py artifacts/build/compiler-smoke
 
 ## 自动检查
 
-`make check` 包含 Rust/Ruff 格式、Python 静态检查、编译、clippy、Rust/CPU Python 测试和验收配置校验；GitHub Actions 在 x86_64 和 aarch64 runner 执行同一入口；原生 C ABI 加载测试在 aarch64 执行，读取 `rust-toolchain.toml`。`make fmt` 统一格式，`make lint` 执行格式和静态检查；Rust 编译将死代码视为错误，clippy 以零警告为通过条件。使用 `uv` 隔离 CPU 依赖：`make python-env` 创建 Python3.12 的 `.venv` 并同步固定版本；检查默认使用 `.venv/bin/python`，CPU 依赖隔离在虚拟环境中，可通过 `PYTHON` 覆盖解释器；CI 和编译镜像固定 uv0.13.1，Rust 版本由 `rust-toolchain.toml` 固定。Python 源码仍兼容 GPU 编译环境的 3.10 语法。
+`make check` 包含 Rust/Ruff 格式、Python 静态检查、编译、clippy、Rust/CPU Python 测试和验收配置校验；GitHub Actions 在 x86_64 和 aarch64 runner 执行同一入口；原生 C ABI 加载测试在 aarch64 执行，读取 `rust-toolchain.toml`。`make fmt` 统一格式，`make lint` 执行格式和静态检查；Rust 编译将死代码视为错误，clippy 以零警告为通过条件。使用 `uv` 隔离 CPU 依赖：`make python-env` 创建 Python3.12 的 `.venv` 并同步固定版本；检查默认使用 `.venv/bin/python`，CPU 依赖隔离在虚拟环境中，可通过 `PYTHON` 覆盖解释器；CI 和编译镜像固定 uv0.13.4，Rust 版本由 `rust-toolchain.toml` 固定。
 
 `make check-offline` 在编译镜像中检查全部离线模块引用，并在 CPU 上执行需要 Torch 的参考数学及动态行数 ABI 测试。
 

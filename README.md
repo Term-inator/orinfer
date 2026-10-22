@@ -78,7 +78,7 @@ Concurrency and context capacity follow the execution package and available memo
 
 ## Development and documentation
 
-Rust handles online loading, scheduling, model execution and serving. Python is used for offline quantization, compilation and validation.
+Rust handles online loading, scheduling, model execution and serving. Python 3.12 or later is used for offline quantization, compilation and validation.
 
 ```bash
 git clone https://github.com/iMMIQ/orinfer.git

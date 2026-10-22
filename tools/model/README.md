@@ -22,7 +22,7 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-buil
   --model /path/to/native-flash-model --model-output artifacts/models/flash-ready
 ```
 
-编译环境固定为 `orinfer-compiler:0.1.2`，配方和挂载方式见[编译说明](../build/README.md)。外部输入通过 `ORINFER_CHECKPOINT_DIR` 只读挂载。所有 GPU 工作共用 `artifacts/gpu-experiment.lock`；构建输出使用新目录，已发布产物保持不可变。
+编译环境固定为 `orinfer-compiler:0.1.3`，使用 Python 3.12 和 CUDA 12.6，配方和挂载方式见[编译说明](../build/README.md)。外部输入通过 `ORINFER_CHECKPOINT_DIR` 只读挂载。所有 GPU 工作共用 `artifacts/gpu-experiment.lock`；构建输出使用新目录，已发布产物保持不可变。
 
 ## 产物与公共组件
 

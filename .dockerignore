@@ -3,3 +3,5 @@
 !tools/build/
 !tools/build/compiler.Dockerfile
 !tools/build/compiler-requirements.txt
+!tools/build/jetson_wheels.py
+!tools/build/jetson_wheels.json
