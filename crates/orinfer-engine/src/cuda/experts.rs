@@ -7,7 +7,10 @@ use crate::{
 };
 use orinfer_model_sdk::abi::ExpertBank;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 
 type Key = (usize, usize);
 #[derive(Default)]
@@ -47,6 +50,15 @@ pub struct Statistics {
     pub hits: u64,
     pub evictions: u64,
     pub loaded_bytes: u64,
+    pub ensure_calls: u64,
+    /// Completed prior GPU work plus the route histogram download.
+    pub route_wait_s: f64,
+    /// Cache bookkeeping and physical page mapping/unmapping, excluding upload.
+    pub transition_s: f64,
+    pub upload_s: f64,
+    pub read_wait_s: f64,
+    pub dma_wait_s: f64,
+    pub upload_chunks: usize,
     /// Physical VMM pages include allocation-granule overhead and shared neighbors.
     pub mapped_bytes: usize,
     pub peak_mapped_bytes: usize,
@@ -153,11 +165,18 @@ impl Plan {
     }
 }
 
+#[derive(Default)]
+struct Page {
+    owners: usize,
+    /// Large tensors are populated by expert range, not by physical page.
+    initialized: BTreeSet<usize>,
+}
+
 pub(super) struct Pager {
     banks: Vec<ExpertBank>,
     sources: BTreeMap<String, TensorSource>,
     consumers: BTreeMap<String, (usize, usize)>,
-    refs: BTreeMap<(String, usize), usize>,
+    refs: BTreeMap<(String, usize), Page>,
     prob: Queue,
     hot: Queue,
     transient: BTreeSet<Key>,
@@ -211,7 +230,7 @@ impl Pager {
                 .refs
                 .get_mut(&page)
                 .ok_or("Lost expert page ownership")?;
-            if *n == 1 {
+            if n.owners == 1 {
                 s.expert_buffers
                     .borrow_mut()
                     .get_mut(&page.0)
@@ -219,7 +238,7 @@ impl Pager {
                     .unmap_page(s, page.1)?;
                 self.refs.remove(&page);
             } else {
-                *n -= 1;
+                n.owners -= 1;
             }
         }
         Ok(())
@@ -234,6 +253,8 @@ impl Pager {
         let Some(Value::Pointer(address)) = values.get(argument) else {
             return Err("Unbound expert histogram".into());
         };
+        let route_at = Instant::now();
+        self.statistics.ensure_calls += 1;
         let mut counts = vec![0i32; self.banks[bank].experts];
         // SAFETY: Producer and all previous consumers finish before page eviction;
         // the model-declared histogram has this exact validated byte extent.
@@ -244,6 +265,8 @@ impl Pager {
                 "expert counts",
             )?;
         }
+        self.statistics.route_wait_s += route_at.elapsed().as_secs_f64();
+        let transition_at = Instant::now();
         if counts.iter().any(|&n| n < 0) {
             return Err("Negative expert route count".into());
         }
@@ -287,24 +310,56 @@ impl Pager {
                 self.hot.remove(victim);
                 self.statistics.evictions += 1;
             }
-            for page in self.pages(s, key)? {
-                if !self.refs.contains_key(&page) {
+            let pages = self.pages(s, key)?;
+            for page in &pages {
+                if !self.refs.contains_key(page) {
                     let mut reservations = s.expert_buffers.borrow_mut();
                     let r = reservations.get_mut(&page.0).unwrap();
                     r.map_page(s, page.1)?;
                     let source = &self.sources[&page.0];
-                    let bytes = r.granularity.min(source.bytes - page.1);
-                    uploads.push(weight_upload::Upload {
-                        source: TensorSource {
-                            path: source.path.clone(),
-                            offset: source.offset + page.1,
-                            bytes,
-                        },
-                        destination: r.address + page.1 as u64,
-                    });
-                    self.statistics.loaded_bytes += bytes as u64;
+                    // Small banks (such as row scales) fit one physical page.
+                    // Populate them once, rather than issue many tiny reads.
+                    if source.bytes <= r.granularity {
+                        uploads.push(weight_upload::Upload {
+                            source: source.clone(),
+                            destination: r.address,
+                        });
+                        self.statistics.loaded_bytes += source.bytes as u64;
+                    }
                 }
-                *self.refs.entry(page).or_default() += 1;
+                self.refs.entry(page.clone()).or_default().owners += 1;
+            }
+            for name in &self.banks[bank].buffers {
+                let reservations = s.expert_buffers.borrow();
+                let r = &reservations[name];
+                let source = &self.sources[name];
+                if source.bytes <= r.granularity {
+                    continue;
+                }
+                let covered: Vec<_> = pages.iter().filter(|p| &p.0 == name).collect();
+                if covered
+                    .iter()
+                    .all(|p| self.refs[*p].initialized.contains(&key.1))
+                {
+                    continue;
+                }
+                let stride = source.bytes / self.banks[bank].experts;
+                let offset = key.1 * stride;
+                uploads.push(weight_upload::Upload {
+                    source: TensorSource {
+                        path: source.path.clone(),
+                        offset: source.offset + offset,
+                        bytes: stride,
+                    },
+                    destination: r.address + offset as u64,
+                });
+                self.statistics.loaded_bytes += stride as u64;
+                // A failed upload quarantines the pager. These markers are only
+                // consumed after the complete upload succeeds. Unmapping a page
+                // discards its markers, even if a neighboring page stays mapped.
+                for page in covered {
+                    self.refs.get_mut(page).unwrap().initialized.insert(key.1);
+                }
             }
             if self.prob.keys.len() + self.hot.keys.len() < capacity {
                 self.prob.insert(key, self.clock);
@@ -312,7 +367,13 @@ impl Pager {
                 self.transient.insert(key);
             }
         }
-        weight_upload::upload(s, uploads, self.workers)?;
+        self.statistics.transition_s += transition_at.elapsed().as_secs_f64();
+        let upload_at = Instant::now();
+        let uploaded = weight_upload::upload(s, uploads, self.workers)?;
+        self.statistics.upload_s += upload_at.elapsed().as_secs_f64();
+        self.statistics.read_wait_s += uploaded.read_wait_s;
+        self.statistics.dma_wait_s += uploaded.dma_wait_s;
+        self.statistics.upload_chunks += uploaded.chunks;
         self.statistics.resident_experts = self.prob.keys.len() + self.hot.keys.len();
         self.statistics.transient_experts = self.transient.len();
         self.statistics.peak_transient_experts = self
@@ -363,5 +424,162 @@ mod tests {
         assert_eq!(q.victim(&q.keys.keys().copied().collect()), None);
         assert!(q.remove((0, 2)));
         assert!(!q.remove((0, 2)));
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::super::{Driver, virtual_memory::Reservation};
+    use super::*;
+    use std::ptr;
+
+    #[test]
+    #[ignore = "requires the serialized SM120 GPU"]
+    fn sparse_ranges_preserve_neighbors_tails_and_eviction() {
+        let mut s = Session::new(Driver::load().unwrap());
+        // SAFETY: This test owns its retained context, stream and allocations.
+        // Session records every handle and drains outstanding work on cleanup.
+        unsafe {
+            check(sys::cuInit(0), "test init").unwrap();
+            check(sys::cuDeviceGet(&mut s.device, 0), "test device").unwrap();
+            check(sys::cuCtxGetCurrent(&mut s.previous), "test previous").unwrap();
+            let mut context = ptr::null_mut();
+            check(
+                sys::cuDevicePrimaryCtxRetain(&mut context, s.device),
+                "test context",
+            )
+            .unwrap();
+            s.retained = true;
+            check(sys::cuCtxSetCurrent(context), "test current").unwrap();
+            check(sys::cuStreamCreate(&mut s.stream, 1), "test stream").unwrap();
+        }
+        let probe = Reservation::reserve(&s, 1, 1).unwrap();
+        let granularity = probe.granularity;
+        s.expert_buffers.borrow_mut().insert("probe".into(), probe);
+        let stride = granularity / 2 + 173;
+        let weight_bytes = stride * 5;
+        let scale_bytes = 85;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let data: Vec<_> = (0..173 + weight_bytes + 97 + scale_bytes)
+            .map(|i| ((i * 37 + i / 251) % 256) as u8)
+            .collect();
+        std::fs::write(file.path(), &data).unwrap();
+        let mut sources = BTreeMap::new();
+        for (name, offset, bytes) in [
+            ("weights", 173, weight_bytes),
+            ("scales", 173 + weight_bytes + 97, scale_bytes),
+        ] {
+            sources.insert(
+                name.into(),
+                TensorSource {
+                    path: file.path().into(),
+                    offset,
+                    bytes,
+                },
+            );
+            let reservation = Reservation::reserve(&s, bytes, 1).unwrap();
+            s.expert_buffers
+                .borrow_mut()
+                .insert(name.into(), reservation);
+        }
+        let mut counts_address = 0;
+        // SAFETY: The session owns this complete five-element histogram.
+        unsafe {
+            check(sys::cuMemAlloc_v2(&mut counts_address, 20), "test counts").unwrap();
+        }
+        s.buffers.push(counts_address);
+        let identity = serde_json::json!({"file":"unused","sha256":"0".repeat(64)});
+        let kernel: Kernel = serde_json::from_value(serde_json::json!({
+            "name":"test", "symbol":"unused", "module":identity, "source":identity,
+            "host_abi":identity, "grid":[1,1,1], "block":[1,1,1],
+            "shared_memory_bytes":0,"cooperative":false,"args":[]
+        }))
+        .unwrap();
+        let mut pager = Pager::new(
+            Plan {
+                banks: vec![ExpertBank {
+                    experts: 5,
+                    buffers: vec!["weights".into(), "scales".into()],
+                    consumers: BTreeMap::from([("test".into(), 0)]),
+                }],
+                names: BTreeSet::from(["weights".into(), "scales".into()]),
+                capacity: 2,
+            },
+            sources,
+            4,
+        );
+        for (round, wanted) in [
+            vec![0],
+            vec![1],
+            vec![1],
+            vec![2],
+            vec![0],
+            vec![4],
+            vec![0, 1, 4],
+            vec![3],
+            vec![0],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut counts = [0i32; 5];
+            for &expert in &wanted {
+                counts[expert] = 1;
+            }
+            // SAFETY: Complete host/device histogram extents; synchronous copy.
+            unsafe {
+                check(
+                    sys::cuMemcpyHtoD_v2(counts_address, counts.as_ptr().cast(), 20),
+                    "test route",
+                )
+                .unwrap();
+            }
+            let loaded_before = pager.statistics.loaded_bytes;
+            pager
+                .ensure(&s, &kernel, &[Value::Pointer(counts_address)])
+                .unwrap();
+            if round == 0 {
+                assert_eq!(
+                    pager.statistics.loaded_bytes,
+                    (stride + scale_bytes) as u64,
+                    "The first expert must not read unused neighboring weights"
+                );
+            }
+            if round == 4 {
+                assert_eq!(
+                    pager.statistics.loaded_bytes, loaded_before,
+                    "Initialized bytes survive logical eviction while a neighbor owns the page"
+                );
+            }
+            for expert in wanted {
+                let reservations = s.expert_buffers.borrow();
+                for (name, width) in [("weights", stride), ("scales", 17)] {
+                    let mut result = vec![0u8; width];
+                    // SAFETY: ensure mapped and initialized this selected range;
+                    // compare full ranges, including shared-page and EOF tails.
+                    unsafe {
+                        check(
+                            sys::cuMemcpyDtoH_v2(
+                                result.as_mut_ptr().cast(),
+                                reservations[name].address + (expert * width) as u64,
+                                width,
+                            ),
+                            "test readback",
+                        )
+                        .unwrap();
+                    }
+                    let offset = pager.sources[name].offset + expert * width;
+                    assert_eq!(
+                        result,
+                        data[offset..offset + width],
+                        "round {round}, expert {expert}, {name}"
+                    );
+                }
+            }
+        }
+        assert!(pager.statistics.evictions > 0);
+        assert!(pager.statistics.peak_transient_experts > 0);
+        s.cleanup().unwrap();
+        s.cleanup().unwrap();
     }
 }
