@@ -1,4 +1,4 @@
-"""Sparse QSA with shared INT8 KV tiles for twelve GQA heads on SM87.
+"""Sparse QSA with shared INT8 KV tiles for twelve GQA heads on SM120.
 
 FP16 tensor-core QK/PV with FP32 accumulators and softmax. Dequantization is
 local to each selected tile; no expanded KV cache persists between launches.

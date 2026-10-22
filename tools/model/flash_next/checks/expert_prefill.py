@@ -1,5 +1,6 @@
 """Check dynamic E8P tails against the independent row-major exact recipe."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import argparse
 from pathlib import Path
 
@@ -22,11 +23,17 @@ def compile_dynamic(primitive):
         explicit_rows(primitive),
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
+        target=CUDA_TARGET,
         pass_configs={
-            "tl.disable_thread_storage_sync": True,
-            "tl.disable_shared_memory_reuse": True,
-            "tl.if_stmt_binding_inline_replayable_binds": False,
+            **COMPILER_PASSES,
+            **(
+                {
+                    "tl.disable_thread_storage_sync": True,
+                    "tl.disable_shared_memory_reuse": True,
+                    "tl.if_stmt_binding_inline_replayable_binds": False,
+                }
+                or {}
+            ),
         },
     )
 

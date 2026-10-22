@@ -1,5 +1,6 @@
 """Select a complete request-state strategy over measured decode cohorts."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import inspect
 import math
 
@@ -41,8 +42,8 @@ def select(tuner, dense):
             fn,
             out_idx=[],
             execution_backend="nvrtc",
-            target={"kind": "cuda", "arch": "sm_87"},
-            pass_configs=passes,
+            target=CUDA_TARGET,
+            pass_configs={**COMPILER_PASSES, **(passes or {})},
         )
         return kernel, inputs, columns
 
@@ -187,7 +188,7 @@ def chunked(tuner):
     ]
     reference = primitive(
         _gdn_sequence,
-        4096,
+        tuner.capacity,
         in_place=True,
         value_tile=16,
         threads=32,
@@ -201,10 +202,20 @@ def chunked(tuner):
     def build(config):
         return (
             primitive(
-                gdn_chunk.prepare, 4096, HK=tuner.hk, HV=tuner.hv, C=config["C"], dynamic_rows=True
+                gdn_chunk.prepare,
+                tuner.capacity,
+                HK=tuner.hk,
+                HV=tuner.hv,
+                C=config["C"],
+                dynamic_rows=True,
             ),
             primitive(
-                gdn_chunk.recurrent, 4096, HK=tuner.hk, HV=tuner.hv, **config, dynamic_rows=True
+                gdn_chunk.recurrent,
+                tuner.capacity,
+                HK=tuner.hk,
+                HV=tuner.hv,
+                **config,
+                dynamic_rows=True,
             ),
         )
 
@@ -257,7 +268,7 @@ def chunked(tuner):
         configs,
         build,
         inputs,
-        measure_rows=[1, 17, 128, 512, 4096],
+        measure_rows=sorted({min(n, tuner.capacity) for n in (1, 17, 128, 512, tuner.capacity)}),
         validation_inputs=lambda rows: inputs(rows, True),
     )
     # One schedule covers all prefill lengths. These are candidates, not

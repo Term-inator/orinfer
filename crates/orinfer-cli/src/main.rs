@@ -98,7 +98,7 @@ enum Command {
     Plan,
     /// Check AOT fixture and file hashes without CUDA.
     ValidateArtifact { manifest: PathBuf },
-    /// Execute an SM87 AOT fixture and validate graph replay.
+    /// Execute an SM120 AOT fixture and validate graph replay.
     RunArtifact { manifest: PathBuf },
     /// Inspect a native execution library identity and capabilities without CUDA.
     InspectLibrary { library: PathBuf },

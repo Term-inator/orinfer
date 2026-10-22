@@ -1,0 +1,7 @@
+{
+  "device": "NVIDIA GeForce RTX 5070 Ti",
+  "host_arch": "x86_64",
+  "cuda_arch": "sm_120",
+  "compute_capability": [12, 0],
+  "elf_machine": 62
+}

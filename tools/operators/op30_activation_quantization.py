@@ -1,4 +1,4 @@
-"""Offline exact A8 validation, complete SwiGLU->A8 timing and SM87 export."""
+"""Offline exact A8 validation, complete SwiGLU->A8 timing and SM120 export."""
 
 import argparse
 import gc

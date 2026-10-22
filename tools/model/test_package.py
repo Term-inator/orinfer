@@ -22,7 +22,7 @@ class PackageTests(unittest.TestCase):
         (package / "kernels").mkdir()
         header = bytearray(20)
         header[:6] = b"\x7fELF\x02\x01"
-        header[16:20] = bytes((3, 0, 183, 0))
+        header[16:20] = bytes((3, 0, 62, 0))
         (package / "lib/model.so").write_bytes(header)
         cubin = b"fixture cubin bytes"
         (package / "kernels/test.cubin").write_bytes(cubin)
@@ -106,9 +106,9 @@ class PackageTests(unittest.TestCase):
             library = root / "model.so"
             header = bytearray(20)
             header[:6] = b"\x7fELF\x02\x01"
-            header[16:20] = bytes((3, 0, 183, 0))
+            header[16:20] = bytes((3, 0, 62, 0))
             library.write_bytes(header)
-            info = dict(package="external-model", version="3.7.9", target="sm_87", runtime_abi=1)
+            info = dict(package="external-model", version="3.7.9", target="sm_120", runtime_abi=1)
             with patch("tools.model.package.subprocess.run") as run:
                 run.return_value.stdout = json.dumps(info)
                 identity = execution_identity(library, Path("/bin/true"))

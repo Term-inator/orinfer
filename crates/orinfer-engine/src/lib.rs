@@ -1,4 +1,4 @@
-//! Orin-only AOT model execution.
+//! SM120 AOT model execution.
 //!
 //! AOT fixtures and explicit text-model programs execute through the CUDA Driver.
 
@@ -22,9 +22,9 @@ pub mod vision;
 mod weights;
 
 /// Build target; runtime device discovery must validate it before inference.
-pub const TARGET_DEVICE: &str = "Jetson AGX Orin 64GB";
-pub const TARGET_ARCH: &str = "aarch64";
-pub const CUDA_ARCH: &str = "sm_87";
+pub const TARGET_DEVICE: &str = orinfer_model_sdk::target::DEVICE;
+pub const TARGET_ARCH: &str = orinfer_model_sdk::target::HOST_ARCH;
+pub const CUDA_ARCH: &str = orinfer_model_sdk::target::CUDA_ARCH;
 pub const FIRST_MODEL: &str = "Qwen3.8-27B";
 pub const STATUS: &str = "Rust/TileLang resident image/text inference with OpenAI Chat API";
 

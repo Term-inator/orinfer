@@ -32,6 +32,39 @@ class AggregateSelectionTests(unittest.TestCase):
 
 
 class ValidationOnlyTuningTests(unittest.TestCase):
+    def test_small_workspace_tunes_only_its_published_row_capacity(self):
+        def inputs(rows):
+            def fixture(kernel, config):
+                return (lambda: None), (lambda: None), (lambda: None)
+
+            yield fixture
+
+        def benchmark(run, **kwargs):
+            return dict(median_ms=1.0), SimpleNamespace(replay=run)
+
+        modules = {
+            "torch": SimpleNamespace(manual_seed=lambda _: None),
+            "tools.operators.common": SimpleNamespace(
+                benchmark=benchmark, SEED=20261002, KernelResourceError=RuntimeError
+            ),
+        }
+
+        def build(config):
+            if config["tile"] == 64:
+                raise RuntimeError("shared-memory limit")
+            return config
+
+        with tempfile.TemporaryDirectory() as output, patch.dict("sys.modules", modules):
+            result = RowTuner(output, {}, capacity=128).select(
+                dict(kind="small-workspace"), [dict(tile=64), dict(tile=16)], build, inputs
+            )
+        self.assertEqual(result["configs"], [dict(tile=16)])
+        self.assertEqual(
+            result["rejected"], [dict(config=dict(tile=64), reason="shared-memory limit")]
+        )
+        self.assertEqual([r["rows"] for r in result["measurements"]], [1, 2, 3, 4, 8, 17, 64, 128])
+        self.assertTrue(all(c["max_rows"] <= 128 for c in result["selections"]))
+
     def test_extreme_cases_are_replayed_without_biasing_serving_cost(self):
         checked = set()
 
@@ -70,7 +103,9 @@ class ValidationOnlyTuningTests(unittest.TestCase):
 
         modules = {
             "torch": SimpleNamespace(manual_seed=lambda _: None),
-            "tools.operators.common": SimpleNamespace(benchmark=benchmark, SEED=20261002),
+            "tools.operators.common": SimpleNamespace(
+                benchmark=benchmark, SEED=20261002, KernelResourceError=RuntimeError
+            ),
         }
         with tempfile.TemporaryDirectory() as output, patch.dict("sys.modules", modules):
             result = RowTuner(output, {}).select(

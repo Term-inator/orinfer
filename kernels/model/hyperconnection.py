@@ -5,7 +5,7 @@ state/output dtype is chosen by the caller. FP32 reductions do not change the
 materialization boundaries of norm, SiLU, sigmoid, product or residual updates.
 
 Elementwise loops use scalar coalescing: the pinned TileLang/NVRTC combination
-can lower vectorized BF16 conversions to trap-only cubins on SM87. Keeping
+can lower vectorized BF16 conversions to trap-only cubins on SM120. Keeping
 coalesced_width as an explicit IntImm avoids that lowering; the projections
 still use BF16 Tensor Cores.
 """

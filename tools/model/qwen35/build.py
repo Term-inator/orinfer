@@ -18,6 +18,7 @@ from tools.build.gpu import gpu_lock
 import numpy as np
 from tools.model.publication import atomic_model
 from tools.build.files import file_hash, write_json
+from tools.build.target import CUDA_TARGET
 from tools.model.package import config_signature, execution_identity, model_library
 from tools.model.compact import compact_package
 from tools.model.qwen35.storage import Weights
@@ -179,10 +180,19 @@ def configuration(config, context):
 
 
 class Builder:
-    def __init__(self, source, root, output, cache, context, lock):
+    capacity = CAPACITY
+    head_rows = HEAD_ROWS
+
+    def __init__(
+        self, source, root, output, cache, context, lock, *, text_only=False, prefill_rows=CAPACITY
+    ):
         from tools.model.qwen35.compiler import Aot
         from tools.model.frontend import prepare_chat_template
 
+        if type(prefill_rows) is not int or not 128 <= prefill_rows <= CAPACITY:
+            raise ValueError("Prefill capacity must be in 128..4096")
+        self.capacity = prefill_rows
+        self.head_rows = min(HEAD_ROWS, prefill_rows)
         self.source, self.root, self.output = source, root, output
         self.config = json.loads((source / "config.json").read_text())
         self.text = configuration(self.config, context)
@@ -227,9 +237,12 @@ class Builder:
         )
         self.aot.identity["weights"] = hashlib.sha256(state["contract"].encode()).hexdigest()
         self.aot.identity["context"] = str(context)
+        self.aot.identity["prefill_rows"] = str(self.capacity)
         from tools.model.row_tuning import RowTuner
 
-        self.row_tuner = RowTuner(output / "row-tuning", self.aot.identity, self.text)
+        self.row_tuner = RowTuner(
+            output / "row-tuning", self.aot.identity, self.text, capacity=self.capacity
+        )
         self.workspace()
         from tools.model.qwen35 import vision
 
@@ -239,14 +252,14 @@ class Builder:
             from tools.model.qwen_asr.audio import build as build_audio
 
             build_audio(self)
-        else:
+        elif not text_only:
             vision.build(self)
         self.forward()
         self.head()
         from tools.model.qwen35 import mtp
 
         self.mtp = None
-        if not self.standard:
+        if not self.standard and not text_only:
             mtp.build(self)
         from tools.model.qwen35 import parallel
 
@@ -256,11 +269,11 @@ class Builder:
         packet.build(self)
         from tools.model.qwen35 import causal_parallel
 
-        if not self.standard:
+        if self.mtp:
             causal_parallel.build(self)
         from tools.model.qwen35 import commit
 
-        if not self.standard:
+        if self.mtp:
             commit.build(self)
             from tools.model.qwen35 import mtp_packets
 
@@ -269,7 +282,7 @@ class Builder:
     def workspace(self):
         w = self.weights
         h, f, v = self.h, self.f, self.v
-        c = CAPACITY
+        c = self.capacity
         for name, dtype, shape in [
             ("Hidden", "f16", [c, h]),
             ("R0", "f32", [c, h]),
@@ -301,14 +314,14 @@ class Builder:
             ("A8", "i8", [c * max(f, h, self.mixdim, 2 * h)]),
             ("AS", "f16", [c]),
             ("UnusedA8Mask", "u8", [max(f, h, self.mixdim, 2 * h)]),
-            ("HeadHidden", "f16", [HEAD_ROWS, h]),
-            ("HeadA8", "i8", [HEAD_ROWS, h]),
-            ("HeadAS", "f16", [HEAD_ROWS]),
-            ("HeadLogits", "f32", [HEAD_ROWS, v]),
-            ("GreedyValues", "f32", [HEAD_ROWS * math.ceil(v / 1024)]),
-            ("GreedyIndices", "i32", [HEAD_ROWS * math.ceil(v / 1024)]),
-            ("GreedyInvalid", "i32", [HEAD_ROWS * math.ceil(v / 1024)]),
-            ("Pairs", "i32", [HEAD_ROWS, 2]),
+            ("HeadHidden", "f16", [self.head_rows, h]),
+            ("HeadA8", "i8", [self.head_rows, h]),
+            ("HeadAS", "f16", [self.head_rows]),
+            ("HeadLogits", "f32", [self.head_rows, v]),
+            ("GreedyValues", "f32", [self.head_rows * math.ceil(v / 1024)]),
+            ("GreedyIndices", "i32", [self.head_rows * math.ceil(v / 1024)]),
+            ("GreedyInvalid", "i32", [self.head_rows * math.ceil(v / 1024)]),
+            ("Pairs", "i32", [self.head_rows, 2]),
         ]:
             if not (
                 self.standard
@@ -412,12 +425,13 @@ class Builder:
         key,
         build,
         bindings,
-        rows=CAPACITY,
+        rows=None,
         *,
         dynamic=True,
         row_divisor=1,
         row_multiplier=1,
     ):
+        rows = self.capacity if rows is None else rows
         return self.aot.emit(
             "qwen_rows/" + name,
             key,
@@ -429,7 +443,8 @@ class Builder:
             row_multiplier=row_multiplier,
         )
 
-    def embedding(self, name, input, output, rows=CAPACITY):
+    def embedding(self, name, input, output, rows=None):
+        rows = self.capacity if rows is None else rows
         from kernels.model import qwen35, e8p_q4
 
         weight = "model.language_model.embed_tokens.weight"
@@ -460,7 +475,7 @@ class Builder:
             f"norm-rotation-a8-{self.h}",
             lambda: primitive(
                 residual_norm_rotate_a8,
-                CAPACITY,
+                self.capacity,
                 self.h,
                 dynamic_rows=True,
                 zero_centered=not self.standard,
@@ -478,8 +493,9 @@ class Builder:
         )
 
     def rotation(
-        self, name, k, input, *, swiglu=False, rows=CAPACITY, dynamic=True, head=False, plane_rows=0
+        self, name, k, input, *, swiglu=False, rows=None, dynamic=True, head=False, plane_rows=0
     ):
+        rows = self.capacity if rows is None else rows
         from kernels.model.rotation_a8 import rotate_activation_a8
 
         if swiglu:
@@ -515,7 +531,7 @@ class Builder:
                         role + suffix,
                         f"rotation-tiles-{fn.__name__}-{k}-{parameters}",
                         lambda fn=fn, parameters=parameters: primitive(
-                            fn, CAPACITY, k, **parameters
+                            fn, self.capacity, k, **parameters
                         ),
                         args,
                         rows,
@@ -547,8 +563,9 @@ class Builder:
         yield from choices(selection, capacity, fixed)
 
     def attention(
-        self, name, *, q, gate, position, length, output, prefix="", rows=CAPACITY, staging=False
+        self, name, *, q, gate, position, length, output, prefix="", rows=None, staging=False
     ):
+        rows = self.capacity if rows is None else rows
         from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
         from tools.model.row_tuning import ATTENTION_TARGET
         from tools.model.qwen35.attention import causal_selection, CAUSAL_ROWS
@@ -593,7 +610,7 @@ class Builder:
                     f"gqa-stage-{self.context}-{self.kvh}",
                     lambda: primitive(
                         dequantize_attention_kv,
-                        CAPACITY,
+                        self.capacity,
                         self.context,
                         kv_heads=self.kvh,
                         dimension=self.dimension,
@@ -648,7 +665,7 @@ class Builder:
                     f"independent{config.get('independent_queries', False)}",
                     lambda fn=fn, options=options, config=config: primitive(
                         fn,
-                        CAUSAL_ROWS if config.get("independent_queries") else CAPACITY,
+                        CAUSAL_ROWS if config.get("independent_queries") else self.capacity,
                         **options,
                     ),
                     bindings,
@@ -660,7 +677,7 @@ class Builder:
 
         with gpu_lock(self.lock):
             selection = self.row_tuner.gdn_convolution()
-        for suffix, config in self.row_choices(selection, CAPACITY):
+        for suffix, config in self.row_choices(selection, self.capacity):
             tile = config["tile_tokens"]
             self.emit(
                 name + suffix,
@@ -668,7 +685,7 @@ class Builder:
                 lambda tile=tile: primitive(
                     gdn_conv_prep,
                     1,
-                    CAPACITY,
+                    self.capacity,
                     tile_tokens=tile,
                     dynamic_tokens=True,
                     key_heads=self.hk,
@@ -687,11 +704,12 @@ class Builder:
         *,
         stride=None,
         offset=0,
-        rows=CAPACITY,
+        rows=None,
         dynamic=True,
         head=False,
         kind="q4",
     ):
+        rows = self.capacity if rows is None else rows
         w = self.weights
         if stride == n:
             stride = None
@@ -808,8 +826,10 @@ class Builder:
             dynamic=dynamic,
             weights=actual,
             weight_identity=hashlib.sha256(identity.encode()).hexdigest(),
-            measure_rows=samples(rows) if dynamic and (rows >= CAPACITY or select_rows) else None,
-            objective="total_latency" if dynamic and rows >= CAPACITY else "relative_geomean",
+            measure_rows=samples(rows)
+            if dynamic and (rows >= self.capacity or select_rows)
+            else None,
+            objective="total_latency" if dynamic and rows >= self.capacity else "relative_geomean",
             output_stride=stride,
             packed_k=w.packed_k if kind == "e8p_q4" else 0,
             **(dict(fixed=SPECIALIZATIONS) if select_rows else {}),
@@ -828,7 +848,9 @@ class Builder:
         self.emit(
             "begin/prepare",
             "prepare",
-            lambda: primitive(qwen35.prepare, CAPACITY, self.h, self.context, mrope_input=True),
+            lambda: primitive(
+                qwen35.prepare, self.capacity, self.h, self.context, mrope_input=True
+            ),
             dict(
                 Step="Step",
                 Positions="Positions",
@@ -856,7 +878,7 @@ class Builder:
                 )
                 with gpu_lock(self.lock):
                     selection = self.row_tuner.gdn_ab()
-                for suffix, config in self.row_choices(selection, CAPACITY):
+                for suffix, config in self.row_choices(selection, self.capacity):
                     self.emit(
                         pre + "/ab" + suffix,
                         "gdn-ab-" + json.dumps(config, sort_keys=True),
@@ -909,13 +931,13 @@ class Builder:
                     Prefix="GdnScratch",
                     Out="Y",
                 )
-                for suffix, config in self.row_choices(selection, CAPACITY):
+                for suffix, config in self.row_choices(selection, self.capacity):
                     self.emit(
                         private + "/recurrent" + suffix,
                         "gdn-recurrent-" + str(config["token_unroll"]),
                         lambda config=config: primitive(
                             _gdn_sequence,
-                            CAPACITY,
+                            self.capacity,
                             in_place=True,
                             value_tile=16,
                             threads=32,
@@ -1036,7 +1058,7 @@ class Builder:
                     )
                     self.projection(post + "/gate_up", combined, 2 * self.f, self.h, "GateUp")
                 for role, offset in (
-                    [] if self.standard else [("gate", 0), ("up", CAPACITY * self.f)]
+                    [] if self.standard else [("gate", 0), ("up", self.capacity * self.f)]
                 ):
                     self.projection(
                         post + "/" + role,
@@ -1052,7 +1074,7 @@ class Builder:
                     self.f,
                     "GateUp",
                     swiglu=True,
-                    plane_rows=0 if self.standard else CAPACITY,
+                    plane_rows=0 if self.standard else self.capacity,
                 )
                 self.projection(
                     post + "/down", p + ".mlp.down_proj.weight", self.h, self.f, "Hidden"
@@ -1061,7 +1083,7 @@ class Builder:
         self.emit(
             "end/advance",
             "advance",
-            lambda: primitive(control.advance, CAPACITY, dynamic_rows=True),
+            lambda: primitive(control.advance, self.capacity, dynamic_rows=True),
             dict(Step="Step"),
         )
 
@@ -1083,7 +1105,7 @@ class Builder:
                 Y="HeadHidden",
             ),
         )
-        for name, rows, dynamic in [("head", HEAD_ROWS, True), ("head_last", 1, False)]:
+        for name, rows, dynamic in [("head", self.head_rows, True), ("head_last", 1, False)]:
             self.rotation(
                 name + "/rotate", self.h, "HeadHidden", rows=rows, dynamic=dynamic, head=True
             )
@@ -1152,9 +1174,9 @@ class Builder:
         prepare_generation_config(self.source, self.root / "generation_config.json")
         metadata = dict(
             schema_version=2,
-            target="sm_87",
+            target=CUDA_TARGET["arch"],
             model=f"{self.config.get('quantization_config', {}).get('source', 'Qwen3.5')}-{self.q4_codec}-A8",
-            chunk_tokens=CAPACITY,
+            chunk_tokens=self.capacity,
             max_context=self.context,
             vocab=self.v,
             toolchain=self.aot.identity,
@@ -1186,11 +1208,11 @@ class Builder:
         package = dict(
             schema_version=1,
             runtime_abi=1,
-            target="sm_87",
+            target=CUDA_TARGET["arch"],
             architecture=self.architecture,
             compute_policy="int8_quality",
             config_signature=config_signature(self.config),
-            prefill_profiles=[dict(tokens=CAPACITY, min_tokens=1, kind="qwen_q4_rows")],
+            prefill_profiles=[dict(tokens=self.capacity, min_tokens=1, kind="qwen_q4_rows")],
             kernels=self.aot.kernels,
             dynamic_batch_kernels=self.aot.dynamic,
             buffer_contracts=[
@@ -1256,7 +1278,11 @@ def main():
     for name in ["source", "model-output", "output"]:
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--cache", type=Path, default=ROOT / "artifacts/build-cache/qwen35")
-    p.add_argument("--context", type=int, default=262144)
+    p.add_argument("--context", type=int, default=4096)
+    p.add_argument("--prefill-rows", type=int, default=128)
+    p.add_argument(
+        "--text-only", action="store_true", help="Publish text generation without vision or MTP"
+    )
     p.add_argument("--gpu-lock", type=Path, default=ROOT / "artifacts/gpu-experiment.lock")
     p.add_argument(
         "--gpu-lock-held",
@@ -1270,7 +1296,14 @@ def main():
     a.output.mkdir(parents=True, exist_ok=True)
     with atomic_model(a.model_output) as staging:
         b = Builder(
-            a.source, staging, a.output, a.cache, a.context, None if a.gpu_lock_held else a.gpu_lock
+            a.source,
+            staging,
+            a.output,
+            a.cache,
+            a.context,
+            None if a.gpu_lock_held else a.gpu_lock,
+            text_only=a.text_only,
+            prefill_rows=a.prefill_rows,
         )
         digest = b.publish(a.engine.resolve(strict=True))
     print("COMPLETE", digest, flush=True)

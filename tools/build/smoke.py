@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 import torch
 import tilelang
-from tools.build.target import CUDA_TARGET
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 from kernels.model.greedy import greedy_merge
 from kernels.model.rows import explicit_rows
 from kernels.operators.op02_residual_norm import residual_norm
@@ -15,7 +15,9 @@ from tools.operators.common import configure, export_kernel, write_json
 def dynamic_greedy(output):
     """One cubin must honor actual rows, affine shapes, tails and graph inputs."""
     fn = explicit_rows(greedy_merge.__wrapped__(2049, rows=8, dynamic_rows=True))
-    kernel = tilelang.compile(fn, out_idx=[], execution_backend="nvrtc", target=CUDA_TARGET)
+    kernel = tilelang.compile(
+        fn, out_idx=[], execution_backend="nvrtc", target=CUDA_TARGET, pass_configs=COMPILER_PASSES
+    )
     export_kernel(kernel, output)
     (host,) = parse_host((output / "host.txt").read_text())
     validate_parameter_count((output / "kernel.cu").read_text(), host)
@@ -57,6 +59,85 @@ def dynamic_greedy(output):
             assert result[-2:].tolist() == [-99, -99]
 
 
+def integer_pointer_abi(output):
+    """Production Tensor Core kernels retain the raw-pointer/scalar native ABI."""
+    from kernels.model.int8_projection import int8_projection
+    from tools.model.compile import primitive
+
+    kernel = primitive(int8_projection, 8, 64, 128, output_dtype="float32", dynamic_rows=True)
+    export_kernel(kernel, output)
+    [host] = parse_host((output / "host.txt").read_text())
+    assert all(
+        a["ctype"] in ("ctypes.c_void_p", "ctypes.c_int32") for a in host["ordered_arguments"]
+    )
+    assert "CUtensorMap" not in (output / "kernel.cu").read_text()
+    validate_parameter_count((output / "kernel.cu").read_text(), host)
+    for rows in (3, 7):
+        x = torch.randint(-128, 128, (rows, 128), device="cuda", dtype=torch.int8)
+        w = torch.randint(-128, 128, (64, 128), device="cuda", dtype=torch.int8)
+        ws = torch.ones(64, device="cuda", dtype=torch.float16)
+        scale = torch.ones(rows, device="cuda", dtype=torch.float16)
+        out = torch.empty((rows, 64), device="cuda", dtype=torch.float32)
+        graph = torch.cuda.CUDAGraph()
+
+        def run():
+            kernel.adapter.func(
+                x, w, ws, scale, out, rows, stream=torch.cuda.current_stream().cuda_stream
+            )
+
+        run()
+        with torch.cuda.graph(graph):
+            run()
+        for changed in (False, True):
+            if changed:
+                x.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = x.cpu().to(torch.int32) @ w.cpu().to(torch.int32).T
+            torch.testing.assert_close(out.cpu(), expected.float(), atol=0, rtol=0)
+
+
+def compressed_integer_regression(output):
+    """Static M=1 must not alias pipelined E8P shared-memory allocations."""
+    from kernels.model.e8p_q4 import projection
+    from tools.model.compile import primitive
+    from tools.model.projection_tuning import ProjectionTuner
+
+    config = dict(algorithm="tensor_core", block_m=8, block_n=64, block_k=128, stages=2)
+    for dynamic, capacity, live_rows in (
+        (False, 1, [1]),
+        (False, 3, [3]),
+        (True, 128, [1, 3, 17, 128]),
+    ):
+        kernel = primitive(
+            projection,
+            capacity,
+            10240,
+            5120,
+            packed_k=128,
+            basis_nonzero=True,
+            dynamic_rows=dynamic,
+            **config,
+        )
+        spec = dict(
+            kind="e8p_q4",
+            rows=capacity,
+            outputs=10240,
+            inputs=5120,
+            dtype="float16",
+            dynamic=dynamic,
+            packed_k=128,
+            basis_nonzero=True,
+        )
+        export_kernel(kernel, output / f"rows-{capacity}")
+        [host] = parse_host((output / f"rows-{capacity}" / "host.txt").read_text())
+        assert all(
+            a["ctype"] in ("ctypes.c_void_p", "ctypes.c_int32") for a in host["ordered_arguments"]
+        )
+        for live in live_rows:
+            ProjectionTuner._validate(kernel, spec, config, live)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -89,6 +170,8 @@ def main():
         torch.testing.assert_close(y, output, atol=0.008, rtol=0.004)
     export_kernel(kernel, args.output / "norm")
     dynamic_greedy(args.output / "dynamic-greedy")
+    integer_pointer_abi(args.output / "integer-pointer-abi")
+    compressed_integer_regression(args.output / "compressed-integer")
     write_json(
         args.output / "results.json",
         {
@@ -97,6 +180,8 @@ def main():
             "graph_changed_input": True,
             "dynamic_rows": [3, 7],
             "affine_scalar_abi": True,
+            "integer_pointer_abi": True,
+            "compressed_static_and_dynamic_rows": True,
             "output_guard": True,
         },
     )

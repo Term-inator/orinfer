@@ -183,17 +183,21 @@ def build(b, *, attention=None, conv=None):
             TABLE,
             scalar_columns={v.name: ("SegmentLength", 8) for v in variables},
             row_offset=OFFSET,
-            row_capacity=4096,
+            row_capacity=b.capacity,
             batch_parameters=("independent_instances",)
             if role in ("attention", "attention_merge")
             else (),
         )
 
         key = "causal-rows-" + role + "-" + hashlib.sha256(str(fn).encode()).hexdigest()
+        from kernels.operators.op17_gdn_gated_norm import GATED_NORM_PASSES
+
         b.emit(
             f"verify_state/layer{layer}/{role}",
             key,
-            lambda fn=fn: compile_function(fn),
+            lambda fn=fn, role=role: compile_function(
+                fn, pass_configs=GATED_NORM_PASSES if role == "gated_norm" else {}
+            ),
             bindings,
             LANES,
         )

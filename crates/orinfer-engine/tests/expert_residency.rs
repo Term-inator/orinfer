@@ -63,7 +63,7 @@ fn batch(model: &mut Model, cases: &[Vec<u32>]) -> (Vec<Vec<u32>>, Vec<usize>) {
 }
 
 #[test]
-#[ignore = "Requires an SM87 native Flash package and exclusive GPU experiment lock"]
+#[ignore = "Requires an SM120 native Flash package and exclusive GPU experiment lock"]
 fn finite_experts_preserve_mtp_batch_and_prefix_outputs() {
     let fixture: Fixture = serde_json::from_slice(
         &std::fs::read(std::env::var("ORINFER_EXPERT_FIXTURE").unwrap()).unwrap(),

@@ -1,4 +1,4 @@
-"""SM87 ViT kernels: BF16/FP16 tensors, FP32 reductions/accumulators.
+"""SM120 ViT kernels: BF16/FP16 tensors, FP32 reductions/accumulators.
 
 Online execution is through exported AOT CUDA kernels. Padding is workspace
 only: Length masks every attention key; it never adds model input tokens.

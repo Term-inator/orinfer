@@ -151,6 +151,7 @@ pub(crate) struct Executor {
     pub(super) direct: Option<DirectPrograms>,
     pub(super) kernels: RefCell<super::kernels::Catalog>,
     pub(super) cuda_graph: CudaGraphMode,
+    pub(super) weight_cache: RefCell<Option<super::weight_cache::Pager>>,
     pub(super) expert_cache: RefCell<Option<super::experts::Pager>>,
     pub(super) growth: BTreeMap<String, crate::model::KvGrowth>,
     pub(crate) peak_kv_bytes: std::cell::Cell<usize>,
@@ -260,7 +261,7 @@ impl Executor {
         let decode_programs = &prepared.decode_programs;
         let fingerprint = prepared.fingerprint.clone();
         let expert_plan = super::experts::Plan::new(prepared, options.resident_experts)?;
-        let cuda_graph = if expert_plan.is_some() {
+        let mut cuda_graph = if expert_plan.is_some() {
             if options.cuda_graph != CudaGraphMode::Off {
                 eprintln!(
                     "Finite expert residency uses direct execution for route-dependent SSD paging (requested CUDA graph mode: {})",
@@ -382,6 +383,7 @@ impl Executor {
         let (mut major, mut minor, mut version) = (0, 0, 0);
         let mut name = [0u8; 256];
         let mut total = 0usize;
+        let mut free = 0usize;
         // SAFETY: This owner initializes and retains the context on this thread.
         // The synchronous upload borrows live host storage until the driver returns.
         // Async memset touches separate session-owned allocations on our stream.
@@ -404,8 +406,8 @@ impl Executor {
                 ),
                 "SM minor",
             )?;
-            if [major, minor] != [8, 7] {
-                return Err("Model requires SM87".into());
+            if [major, minor] != orinfer_model_sdk::target::COMPUTE_CAPABILITY {
+                return Err("Model requires SM120".into());
             }
             check(sys::cuDriverGetVersion(&mut version), "driver version")?;
             check(
@@ -425,25 +427,73 @@ impl Executor {
             s.retained = true;
             check(sys::cuCtxSetCurrent(context), "current context")?;
             check(sys::cuStreamCreate(&mut s.stream, 1), "model stream")?;
-            let (mut free, mut memtotal) = (0usize, 0usize);
+            let mut memtotal = 0usize;
             check(
                 sys::cuMemGetInfo_v2(&mut free, &mut memtotal),
                 "available memory",
             )?;
-            if buffer_bytes > memtotal {
-                return Err(format!(
-                    "Model needs {buffer_bytes} bytes, device total {memtotal}"
-                ));
-            }
-            // On Tegra the instantaneous free estimate excludes memory the OS
-            // can reclaim (CUDA for Tegra, memory management). Let checked
-            // allocations decide availability; Session rolls back on failure.
-            if buffer_bytes > free {
-                eprintln!(
-                    "Model needs {buffer_bytes} bytes, CUDA free estimate {free}; checking allocations"
-                );
-            }
         }
+        let weight_bytes = manifest
+            .buffers
+            .iter()
+            .filter(|b| {
+                b.data.is_some()
+                    && b.access == crate::artifact::Access::Read
+                    && used.contains(b.name.as_str())
+            })
+            .try_fold(0usize, |n, b| -> Result<usize> {
+                n.checked_add(b.bytes()?)
+                    .ok_or("Weight sum overflow".into())
+            })?;
+        let nonweights = capacity_bytes - lazy_bytes - unused_weights - weight_bytes;
+        let weight_budget = free
+            .saturating_sub(nonweights)
+            .saturating_sub(super::weight_cache::REQUEST_RESERVE);
+        let weight_plan = if expert_plan.is_none() && prepared.expert_banks.is_empty() {
+            super::weight_cache::Plan::new(
+                manifest,
+                &used,
+                weight_budget,
+                super::weight_cache::granularity(&s)?,
+            )?
+        } else {
+            None
+        };
+        if let Some(plan) = &weight_plan {
+            cuda_graph = CudaGraphMode::Off;
+            eprintln!(
+                "Dense weight paging: {} cold bytes, {} device cache bytes; CUDA graphs off",
+                plan.cold_bytes, plan.capacity
+            );
+        }
+        let weight_layout =
+            super::weight_arena::ArenaLayout::new(manifest.buffers.iter().filter(|b| {
+                b.data.is_some()
+                    && b.access == crate::artifact::Access::Read
+                    && used.contains(b.name.as_str())
+                    && !weight_plan
+                        .as_ref()
+                        .is_some_and(|p| p.cold.contains(&b.name))
+                    && !expert_plan
+                        .as_ref()
+                        .is_some_and(|p| p.names.contains(&b.name))
+            }))?;
+        let capacity_bytes = capacity_bytes
+            .checked_add(weight_layout.padding_bytes)
+            .ok_or("Model allocation sum overflow")?;
+        let buffer_bytes = capacity_bytes
+            - lazy_bytes
+            - unused_weights
+            - paged_bytes
+            - weight_plan.as_ref().map_or(0, |p| p.cold_bytes)
+            + weight_plan.as_ref().map_or(0, |p| p.capacity);
+        if buffer_bytes > free {
+            return Err(format!(
+                "Model needs {buffer_bytes} device bytes, CUDA free {free}"
+            ));
+        }
+        let mut cold_sources = BTreeMap::new();
+
         let mut load_stages = crate::model::LoadStages {
             cuda_init_s: init_started.elapsed().as_secs_f64(),
             buffer_alloc_s: 0.,
@@ -485,6 +535,24 @@ impl Executor {
                 continue;
             }
             let bytes = initial_buffer_bytes(manifest, b, scopes[&b.name])?;
+            if weight_plan
+                .as_ref()
+                .is_some_and(|p| p.cold.contains(&b.name))
+            {
+                let reservation = super::virtual_memory::Reservation::reserve(&s, bytes, 1)?;
+                let address = reservation.address;
+                s.weight_buffers
+                    .borrow_mut()
+                    .insert(b.name.clone(), reservation);
+                pointers.insert(b.name.clone(), address);
+                sizes.insert(b.name.clone(), bytes);
+                allocations
+                    .weights
+                    .addresses
+                    .insert(b.name.clone(), address);
+                cold_sources.insert(b.name.clone(), weights.source(b)?);
+                continue;
+            }
             let mut address = 0;
             let paged = expert_plan
                 .as_ref()
@@ -798,6 +866,11 @@ impl Executor {
             direct,
             kernels: RefCell::new(catalog),
             cuda_graph,
+            weight_cache: RefCell::new(
+                weight_plan.map(|p| {
+                    super::weight_cache::Pager::new(p.capacity, cold_sources, load_workers)
+                }),
+            ),
             expert_cache: RefCell::new(
                 expert_plan.map(|p| super::experts::Pager::new(p, expert_sources, load_workers)),
             ),
@@ -1111,6 +1184,7 @@ impl Executor {
                             }
                         }
                         self.ensure_experts(&kernel.spec, &kernel.values)?;
+                        self.ensure_weights(&kernel.spec)?;
                         launch_kernel(
                             &kernel.spec,
                             kernel
@@ -1309,7 +1383,7 @@ impl Executor {
                 "KV available memory",
             )?;
         }
-        if additional > free {
+        if additional > free.saturating_sub(self.cold_weight_reserve()) {
             return Err(format!("KV growth needs {additional} bytes, free {free}"));
         }
         for name in &growth.buffers {

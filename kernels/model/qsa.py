@@ -1,4 +1,4 @@
-"""Original QSA semantics on SM87: group-4 index, exact radix top-k, sparse GQA.
+"""Original QSA semantics on SM120: group-4 index, exact radix top-k, sparse GQA.
 
 The index stores the mean of raw projected keys, normalized with zero-centered
 RMS gamma and rotated at the FIRST token of each complete group. Scores are

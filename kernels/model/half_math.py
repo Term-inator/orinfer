@@ -1,4 +1,4 @@
-"""Stream sigmoid with the existing FP32-to-FP16 rounding on SM87.
+"""Stream sigmoid with the existing FP32-to-FP16 rounding on SM120.
 
 The SFU path matches the original exp/divide expression for every finite FP16
 input except two midpoint cases. Their original rounded outputs are explicit.

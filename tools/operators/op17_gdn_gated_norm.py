@@ -166,7 +166,7 @@ def export(kernel, directory, dtype, hpb, threads, M=None):
         "dtypes": {"X": dtype, "Z": "float16", "W": "float16", "Y": "float16"},
         "layout": "contiguous row-major; shared ordinary W[128]",
         "M": M or "runtime rows",
-        "sm": 87,
+        "sm": 120,
         "heads_per_block": hpb,
         "threads": threads,
         "actual_host_launches": parse_host((directory / "host.txt").read_text()),

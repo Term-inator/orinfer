@@ -2,23 +2,26 @@
 
 import inspect
 
-from tools.build.target import CUDA_TARGET
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 
 
 def instantiate(function, *args, **kwargs):
     return inspect.unwrap(getattr(function, "func", function))(*args, **kwargs)
 
 
-def compile_function(function, **options):
+def compile_function(function, *, pass_configs=None, **options):
     import tilelang
+    from tools.operators.common import validate_kernel_resources
 
-    return tilelang.compile(
+    kernel = tilelang.compile(
         function,
         out_idx=[],
         execution_backend="nvrtc",
         target=CUDA_TARGET,
+        pass_configs={**COMPILER_PASSES, **(pass_configs or {})},
         **options,
     )
+    return validate_kernel_resources(kernel)
 
 
 def primitive(function, *args, compiler_options=None, **kwargs):
@@ -35,5 +38,6 @@ def primitive(function, *args, compiler_options=None, **kwargs):
         if kwargs.get("prefetch_qk")
         else {}
     )
+    passes.update(getattr(function, "pass_configs", None) or {})
     passes.update(compiler_options or {})
     return compile_function(fn, pass_configs=passes)

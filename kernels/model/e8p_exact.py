@@ -1,4 +1,4 @@
-"""Exact E8P/A8 products using two INT4 Tensor Core products on SM87.
+"""Exact E8P/A8 products using two INT4 Tensor Core products on SM120.
 
 For the nonzero spread29 basis, decoded w=2*y+1 with signed INT4 y.
 A8 a=low_u4+16*high_s4, so dot(w,a)=2*(dot(y,low)+16*dot(y,high))+sum(a).

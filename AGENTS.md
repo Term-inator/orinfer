@@ -4,7 +4,7 @@
 
 ## 范围
 
-- 硬件固定本机 Jetson AGX Orin 64GB，aarch64/CUDA SM87。
+- 硬件固定本机 RTX 5070 Ti 16GB，x86_64/CUDA SM120；目标身份以 `configs/deployment-target.json` 为准。主机 RAM、pinned slab 与 GPU 权重、工作区及请求状态分别计费。
 - 支持 Qwen3.8-27B、Qwen3.5-4B（Qwen3_5）、Qwen3.8-Flash-Next（qwen4_exp）和 Index-Translate-2B/9B/35B（Qwen3_5）的文本、图片和多图输入。
 - Qwen3-ASR-1.7B 使用 Qwen3 全注意力解码器、标准 RMSNorm、128 维全 RoPE 和无输出 gate；复用 Qwen 动态行执行流程。文本采用两级 E8P Q4A8，前 4 层 Q/K/V 与 FFN 保留同一 signed-block128 输入基下的 W8，attention 输出投影保留 W8；音频编码器和 projector 保留 FP16，KV 使用 group-64 INT8。Rust 负责音频解码、16 kHz 重采样和 128-bin log-mel，TileLang 执行有界 CNN 与 104-token 窗口编码器。音频特征、位置和输入身份属于请求私有状态及 prefix 缓存身份。
 - ASR 的 Q/K/V 与 gate/up 通过无损拼接权重输出行共享整数投影模板。音频 CNN 使用 NHWC；前处理按帧组并行，多个录音按 104-token 窗口边界打包编码，再写回各 owner 的特征。逐窗口有效长度保持录音边界；GPU 验收覆盖改变输入、反向准入、空闲 arena 复用、prefix 恢复及完整请求。
@@ -26,7 +26,7 @@
 - KV 增长契约可以同时引用请求私有 KV 和按上下文增长的共享 workspace；私有映射按 owner 查找，共享映射从会话查找，逐项按声明的作用域解析增长列表。
 - 单份常驻 W4；scale、zero、LUT、padding 和持久重复表示计入权重平均 bits。展开 W8 的存活期限定为临时计算。
 - Flash Next 扩展采用 Q2A8 和质量优先的混合精度；其 QSA 长上下文 KV 使用 group-64 对称 INT8 及 FP16 scale，压缩索引与未完成块也纳入请求私有状态；Q2 专家直接索引固定地址的压缩权重库，默认全量常驻；`--resident-experts N` 使用模型包声明的专家 bank 与路由计数，按需从 SSD 加载到 CUDA VMM 页，并共享全局 SLRU。有限模式暂关闭 CUDA Graph，MTP 专家全量常驻；专家数约束常驻容量；实际字节占用另含临时路由集合和页粒度开销，W8 展开限定在临时计算中。HC 保留 BF16 权重；PLE 表使用受预算限制的 CPU 缓存，其 n-gram 历史与卷积历史必须纳入请求状态及 prefix 恢复。
-- 27B 后续实验与部署使用已重新编码的两级 E8P Q4A8 权重（coefficients=[4,1]、beam8 搜索），本机当前模型目录为 `artifacts/models/qwen3.8-27b-e8p-q4a8-current`，离线量化产物为 `artifacts/quantization/qwen35-e8p-beam8-20261016/converted`。当前权重作为后续唯一部署与回退基线，旧量化和 TCQ 实验保留结果记录。更换权重值而配置和 buffer 契约相同时，可复用匹配执行包，仍需验证质量、状态和真实请求性能。
+- 27B 使用固定来源的两级 E8P Q4A8 权重（coefficients=[4,1]、beam8 搜索），本机离线产物为 `artifacts/quantization/qwen3.8-27b-e8p-beam8-sm120/converted`，原始 BF16 位于 `/home/csc/data/models/Qwen3.8-27B`。执行包目标为 x86_64/SM120；首次先验证 4K 上下文、纯文本、单请求及关闭 MTP，再验收完整状态、质量和真实请求性能后指定部署基线。
 - Qwen3_5 整数投影每种矩阵几何、dtype/stride 及压缩布局只发布一个 prefill 动态 fallback；常用 1/2/3/4/8/16/32 行可保留同源 AOT，128 行内的非 AOT packet 可由离线测量选择同源有界动态特化，显式传递真实行数、排除固定 AOT 点，各 batch 复用同源计算体，仅发布被选择的配置。离线调优汇总多个长度的代价，为 prefill 选择一个动态配置；候选保留在离线调优阶段。收敛后检查实际发布包，验证尾部、完整请求性能和全部状态。
 - 27B 的 prefill 以模型声明的层边界暂停，保留同一动态行块，仅将 Hidden 和 FP32 residual 列为跨层存活 workspace；状态增长与最终提交复用公共 Frame 流程。普通 decode 的 1–128 路私有 GDN/attention 复用单行 TileLang 计算体的地址表包装。普通、验证和混合 packet 复用共享 target 前后置计算，MixedRows 显式携带角色边界；验证输出全部位置，普通请求输出末位置。批量 draft/commit/warm 沿用公共 MTP 流程，草稿条件、紧凑 GDN 因子、卷积历史、KV 及隐藏环均按 owner 绑定。公共 packet 调用、地址表绑定和 prefill 分层注册与 Flash Next 共用，模型各自声明 HC/PLE/QSA 及层布局。
 - Flash Next 采用已确定的混合量化方案：专家保留整数 E8P Q2A8；主干 GDN QKV/Z、QSA Q/gate 和 target/MTP 共享输出头采用 signed-block128 旋转、输出行 scale 的 Q4A8。GDN/QSA 输出投影、共享 FFN 和 MTP 草稿 Q/O 保留 W8；其余精度敏感部分维持原混合精度。原生适配器统一校验和执行该策略。
@@ -59,7 +59,7 @@
 - 先用 rg 检查调用者和依赖；保持修改小而完整。subagent 仅在用户或适用指令明确要求时启动。
 - 模型 packet 通过公共 Rows、视图及地址表绑定组件计算行布局；模型声明 owner 角色候选、计算顺序与状态边界。普通、混合、验证和 draft 复用这些组件。
 - 离线编译复用 compile/private_rows，调优复用 tuning 的候选、缓存及 Graph 测量；文件身份、原子元数据和共享 GPU 锁位于 tools/build。共享组件源码计入消费者缓存身份。
-- CPU Python 依赖用 uv 管理项目 `.venv`，通过 `make python-env` 在独立虚拟环境中同步固定版本。`make check` 执行 Rust 格式/编译/clippy/测试及 CPU 评测检查；GPU 验证用 `bash tools/operators/run.sh` 的固定编译镜像。
+- CPU Python 依赖用 uv 管理项目 `.venv`，通过 `make python-env` 在独立虚拟环境中同步固定版本。`make check` 执行 Rust 格式/编译/clippy/测试及 CPU 评测检查；GPU 验证用 `bash tools/operators/run.sh` 的固定编译镜像。`make build` 在该镜像内编译原生 CLI 与模型库，以固定 glibc 基线。
 - GPU 工作通过 `artifacts/gpu-experiment.lock` 串行，保留其他服务，并保持全局频率、功耗和缓存设置。
 - GPU 单测使用本轮构建输出的测试可执行文件，核对测试确实执行，并从本轮构建结果解析实际可执行文件路径。
 - 当前原生 Flash Next 的整数算子重建使用 `tools/model/flash_next/build.py`：从权重几何和 host ABI 读取构造契约，真实权重调优，编译对象按内容校验并原子缓存，最终模型经 Rust 计划检查后原子发布。其输入为模型固定的执行契约；HC/QSA/状态及专家联合选择表保留输入已验证实现，专家真实几何另行验证。正式重建统一使用该入口。

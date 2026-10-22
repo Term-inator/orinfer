@@ -1,4 +1,4 @@
-"""SM87 GDN gates. Explicit FP32 outputs; dynamic M, 48 value heads.
+"""SM120 GDN gates. Explicit FP32 outputs; dynamic M, 48 value heads.
 
 No Torch/reference calls occur here. ``parameter_mode='exp_a'`` consumes an
 offline FP32 exp(A_log) buffer instead of A_log; its preparation identity and
@@ -22,7 +22,7 @@ def stable_sigmoid(x):
     return T.if_then_else(x >= 0.0, 1.0 / (1.0 + e), e / (1.0 + e))
 
 
-@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
+@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_120"})
 def _compile_gates(
     dtype: str = "float16",
     block: int = 256,

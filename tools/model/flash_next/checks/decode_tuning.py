@@ -1,4 +1,4 @@
-"""Compile and validate tuned fixed and runtime-row decode kernels on SM87."""
+"""Compile and validate tuned fixed and runtime-row decode kernels on SM120."""
 
 import argparse
 from pathlib import Path

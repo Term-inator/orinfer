@@ -1,5 +1,6 @@
 """Check fused decode routing against stable histogram, offsets and tile emission."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import argparse
 from pathlib import Path
 import torch
@@ -24,7 +25,8 @@ def main():
                 explicit_rows(fn),
                 out_idx=[],
                 execution_backend="nvrtc",
-                target={"kind": "cuda", "arch": "sm_87"},
+                target=CUDA_TARGET,
+                pass_configs=COMPILER_PASSES,
             )
         )
 

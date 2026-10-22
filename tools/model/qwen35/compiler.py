@@ -1,6 +1,7 @@
 """Reuse Flash Next's content cache and host-ABI emitter for native Qwen AOT."""
 
 from pathlib import Path
+from tools.build.target import CUDA_TARGET
 from tools.model.build_cache import BuildCache
 from tools.model.host_compiler import Compiler
 from tools.model.row_convergence import divide_rows
@@ -35,6 +36,8 @@ class Aot:
         sources.extend(
             [
                 ROOT / "tools/model/compile.py",
+                ROOT / "tools/build/target.py",
+                ROOT / "configs/deployment-target.json",
                 ROOT / "tools/model/encoder.py",
                 ROOT / "tools/model/row_tuning.py",
                 ROOT / "tools/model/tuning.py",
@@ -58,7 +61,9 @@ class Aot:
             source=source_hash(ROOT, sources),
             tilelang=tilelang.__version__,
             cuda=torch.version.cuda,
-            target="sm_87",
+            target=CUDA_TARGET["arch"],
+            device=torch.cuda.get_device_name(),
+            capability=".".join(map(str, torch.cuda.get_device_capability())),
         )
 
     def emit(

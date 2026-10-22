@@ -1,4 +1,4 @@
-"""GDN ordinary per-value-head RMSNorm then SiLU gate; SM87 TileLang.
+"""GDN ordinary per-value-head RMSNorm then SiLU gate; SM120 TileLang.
 
 X[M,48,128] FP16/FP32, Z same shape FP16, shared ordinary W[128]
 FP16, Y same shape FP16. All arrays contiguous, nonaliasing; eps=1e-6.
@@ -7,8 +7,12 @@ FP32 arithmetic throughout; only the final output is rounded to FP16.
 
 import tilelang
 import tilelang.language as T
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 
 HEADS, WIDTH = 48, 128
+# CUDA 12.8 NVRTC crashes on the vectorized gated epilogue. Scalar lowering
+# keeps the same fragment layout, FP32 expression and final FP16 boundary.
+GATED_NORM_PASSES = {"tirx.disable_vectorize": True}
 
 
 @T.macro
@@ -25,7 +29,12 @@ def gated_norm_epilogue(x, z, weight, rstd):
     return T.cast(((xf * rstd) * wf) * (zf * sigmoid), T.float16)
 
 
-@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
+@tilelang.jit(
+    out_idx=[],
+    execution_backend="nvrtc",
+    target=CUDA_TARGET,
+    pass_configs={**COMPILER_PASSES, **GATED_NORM_PASSES},
+)
 def _compile_gated_norm(
     M: int | None = None,
     x_dtype: str = "float16",

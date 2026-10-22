@@ -1,5 +1,6 @@
 """Check HC row tiling preserves the lossless cache and every FP16 boundary."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import argparse
 from pathlib import Path
 import numpy as np
@@ -50,7 +51,8 @@ def main():
                     ),
                     out_idx=[],
                     execution_backend="nvrtc",
-                    target={"kind": "cuda", "arch": "sm_87"},
+                    target=CUDA_TARGET,
+                    pass_configs=COMPILER_PASSES,
                 )
             )
 

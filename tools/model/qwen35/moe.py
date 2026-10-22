@@ -10,7 +10,7 @@ from tools.model.compile import primitive
 def workspace(b):
     w, c, e, top, f, h = (
         b.weights,
-        4096,
+        b.capacity,
         b.text["num_experts"],
         b.text["num_experts_per_tok"],
         b.f,
@@ -131,7 +131,8 @@ def emitter(b, section, rows):
     return emit
 
 
-def projections(b, section, bank_up, bank_down, *, rows=4096, draft=False):
+def projections(b, section, bank_up, bank_down, *, rows=None, draft=False):
+    rows = b.capacity if rows is None else rows
     from kernels.model import moe
     from tools.model.expert_tuning import (
         expert_projection,
@@ -157,10 +158,10 @@ def projections(b, section, bank_up, bank_down, *, rows=4096, draft=False):
     cold_config = cold_expert_config()
     if (planes or cold) and "MoeLow" not in w.buffers:
         for name in ("MoeLow", "MoeHigh"):
-            w.fixed(name, "i8", [4096 * top * max(h, f) // 2])
-        w.fixed("MoeSum", "i32", [4096 * top])
+            w.fixed(name, "i8", [b.capacity * top * max(h, f) // 2])
+        w.fixed("MoeSum", "i32", [b.capacity * top])
     if cold and "MoeColdTileCount" not in w.buffers:
-        capacity = tile_capacity(4096, e, top, cold_config["block_m"])
+        capacity = tile_capacity(b.capacity, e, top, cold_config["block_m"])
         for name, shape in [
             ("Offsets", [e]),
             ("Expert", [capacity]),
@@ -419,7 +420,8 @@ def projections(b, section, bank_up, bank_down, *, rows=4096, draft=False):
     expert("expert_down", h, f, bank_down, "MoeDownA8", "MoeDownAS", "MoeOutput")
 
 
-def build(b, section, prefix, *, rows=4096, draft=False):
+def build(b, section, prefix, *, rows=None, draft=False):
+    rows = b.capacity if rows is None else rows
     from kernels.model import moe, rotation_a8
     from kernels.operators.op30_activation_quantization import _compile as a8_compile
 
@@ -510,7 +512,7 @@ def build(b, section, prefix, *, rows=4096, draft=False):
         top,
         h,
     )
-    for role, offset in (("gate", 0), ("up", f if draft else 4096 * f)):
+    for role, offset in (("gate", 0), ("up", f if draft else b.capacity * f)):
         b.projection(
             section + "/" + role,
             prefix + ".shared_expert." + role + "_proj.weight",
@@ -534,7 +536,7 @@ def build(b, section, prefix, *, rows=4096, draft=False):
             256,
         )
     else:
-        b.rotation(section + "/swiglu_rotate", f, gate_up, swiglu=True, plane_rows=4096)
+        b.rotation(section + "/swiglu_rotate", f, gate_up, swiglu=True, plane_rows=b.capacity)
     b.projection(
         section + "/down",
         prefix + ".shared_expert.down_proj.weight",

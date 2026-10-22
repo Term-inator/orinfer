@@ -124,7 +124,7 @@ impl Catalog {
                     .get(&spec.module.key())
                     .ok_or("Unverified CUDA module")?;
                 let mut module = ptr::null_mut();
-                // SAFETY: Verified SM87 ELF; the driver copies the image. Session
+                // SAFETY: Verified SM120 ELF; the driver copies the image. Session
                 // owns the module until all queued/captured work is destroyed.
                 unsafe {
                     check(

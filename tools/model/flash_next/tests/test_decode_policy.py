@@ -14,7 +14,7 @@ from tools.model.projection_policy import (
 class DecodeAlignmentTests(unittest.TestCase):
     def test_specializations_and_symbolic_fallback_cover_each_live_row_once(self):
         shapes = decode_shapes()
-        self.assertEqual([s.rows for s in shapes if not s.dynamic], [1, 2, 3, 4, 8, 16, 32])
+        self.assertEqual([s.rows for s in shapes if not s.dynamic], [1])
         self.assertEqual(sum(s.dynamic for s in shapes), 1)
         covered = []
         for shape in shapes:

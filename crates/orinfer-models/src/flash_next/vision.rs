@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn vision_capacity_does_not_widen_text_or_mtp_programs() {
         let mut m: Manifest = serde_json::from_value(serde_json::json!({
-            "schema_version":1,"target":"sm_87","model":"flash","chunk_tokens":4096,
+            "schema_version":1,"target":"sm_120","model":"flash","chunk_tokens":4096,
             "max_context":262144,"vocab":32,"toolchain":{},"buffers":[],"reset_buffers":[],
             "input":"i","token":"t","status":"s","logits":"l","position":"p",
             "weight_bytes":0,"weight_parameters":1,"weight_scope":"test",

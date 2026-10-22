@@ -35,7 +35,7 @@ impl ModelImplementation for Models {
         abi::PackageInfo {
             package: env!("CARGO_PKG_NAME").into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            target: "sm_87".into(),
+            target: orinfer_model_sdk::target::CUDA_ARCH.into(),
             runtime_abi: abi::RUNTIME_ABI,
             architectures: registry::architectures(),
             compute_policies: registry::policies(),

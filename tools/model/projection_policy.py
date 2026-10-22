@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import math
 
 CAPACITY = 128
-SPECIALIZATIONS = (1, 2, 3, 4, 8, 16, 32)
+SPECIALIZATIONS = (1,)
 
 
 @dataclass(frozen=True)

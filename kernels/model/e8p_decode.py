@@ -1,7 +1,7 @@
 """Warp-owned E8P decode tiles; original compressed bank and integer arithmetic.
 
 TileLang owns staging, routing, split-K and synchronization. Imported helpers
-only expose PRMT and one SM87 INT8 MMA instruction, with no kernel or loops.
+only expose PRMT and one SM120 INT8 MMA instruction, with no kernel or loops.
 """
 
 import tilelang.language as T

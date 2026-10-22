@@ -306,7 +306,7 @@ mod tests {
     fn dynamic_fixture() -> Manifest {
         let identity = serde_json::json!({"file":"kernel.cubin", "sha256":"0".repeat(64)});
         serde_json::from_value(serde_json::json!({
-            "schema_version":2,"target":"sm_87","model":"test","chunk_tokens":2,
+            "schema_version":2,"target":"sm_120","model":"test","chunk_tokens":2,
             "max_context":128,"vocab":4,"toolchain":{},"buffers":[],"reset_buffers":[],
             "input":"Input","token":"Token","status":"Status","position":"Step",
             "logits":"Logits","weight_bytes":0,"weight_parameters":1,"weight_scope":"test",
@@ -452,7 +452,7 @@ mod tests {
         fs::create_dir_all(root.join("cache")).unwrap();
         let descriptor = serde_json::json!({"schema_version":1,"architecture":"test_family",
             "compute_policy":"int8_quality","execution_package":"0".repeat(64),"buffer_scopes":{},"frontend_assets":{},
-            "metadata":{"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":2,
+            "metadata":{"schema_version":2,"target":"sm_120","model":"test","chunk_tokens":2,
                 "max_context":8,"vocab":4,"toolchain":{},"buffers":[],"programs":{"decode":[]},
                 "reset_buffers":[],"input":"Input","token":"Token","status":"Status",
                 "logits":"Logits","position":"Step","weight_bytes":0,"weight_parameters":1,"weight_scope":"test"}});

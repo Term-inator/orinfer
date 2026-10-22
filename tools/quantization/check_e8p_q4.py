@@ -1,4 +1,4 @@
-"""SM87 checks for two-stage Q4: integer decoder, row tails and graph replay."""
+"""SM120 checks for two-stage Q4: integer decoder, row tails and graph replay."""
 
 import argparse
 from pathlib import Path

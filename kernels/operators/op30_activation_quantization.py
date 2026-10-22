@@ -1,4 +1,4 @@
-"""SM87 dynamic-M A8 and bit-exact FP16 SwiGLU -> A8 fusion candidates.
+"""SM120 dynamic-M A8 and bit-exact FP16 SwiGLU -> A8 fusion candidates.
 
 No compensation or model quality policy is implemented here. All buffers are
 explicit; callers own validation, stable addresses and CUDA stream selection.
@@ -18,7 +18,7 @@ def quantized_code(value, scale):
     return T.cast(T.max(-127.0, T.min(127.0, T.round(ratio))), T.int8)
 
 
-@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
+@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_120"})
 def _compile(K: int, group: int, masked: bool, fused: bool, threads: int):
     rows = T.dynamic("rows")
     groups = (K + group - 1) // group

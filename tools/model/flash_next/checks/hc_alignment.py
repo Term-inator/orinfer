@@ -1,5 +1,6 @@
 """Validate symbolic HC views, padded inputs, tail writes and graph replay."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import argparse
 from pathlib import Path
 
@@ -28,7 +29,8 @@ def main():
             explicit_rows(fn),
             out_idx=[],
             execution_backend="nvrtc",
-            target={"kind": "cuda", "arch": "sm_87"},
+            target=CUDA_TARGET,
+            pass_configs=COMPILER_PASSES,
         )
         kernels[name] = kernel
         export_kernel(kernel, args.output / "aot" / name)

@@ -193,7 +193,7 @@ mod tests {
             .iter()
             .map(|name| serde_json::json!({"kind":"kernel","name":name}))
             .collect();
-        serde_json::from_value(serde_json::json!({"schema_version":1,"target":"sm_87","model":"test",
+        serde_json::from_value(serde_json::json!({"schema_version":1,"target":"sm_120","model":"test",
             "chunk_tokens":4096,"max_context":262144,"vocab":16,"toolchain":{},"buffers":[],
             "reset_buffers":[],"input":"Input","token":"Token","status":"Status","logits":"Logits",
             "position":"Position","weight_bytes":0,"weight_parameters":0,"weight_scope":"test",

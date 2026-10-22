@@ -1,7 +1,7 @@
 {
   "status": "Benchmark workload specification; measurements are generated separately.",
   "requirements": {
-    "device": "Local Jetson AGX Orin 64GB",
+    "device": "Local NVIDIA GeForce RTX 5070 Ti 16GB",
     "model": "Qwen3.8-27B",
     "frontend_and_runtime": "Rust",
     "kernels": "TileLang",

@@ -1,5 +1,6 @@
 """Validate shared BF16 row tiles against the direct single-row MMA order."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import argparse
 from pathlib import Path
 import torch
@@ -27,7 +28,8 @@ def main():
                     explicit_rows(bf16_rows.__wrapped__(n, k, groups, rows=1024, block_m=bm)),
                     out_idx=[],
                     execution_backend="nvrtc",
-                    target={"kind": "cuda", "arch": "sm_87"},
+                    target=CUDA_TARGET,
+                    pass_configs=COMPILER_PASSES,
                 )
             )
             for rows in [1, 2, 5, 17, 33, 128, 512]:

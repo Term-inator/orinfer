@@ -1,5 +1,6 @@
 """Validate exact Q4 prefill implementations and temporary INT8 expansion."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import argparse
 from pathlib import Path
 
@@ -29,7 +30,8 @@ def main():
             explicit_rows(function),
             out_idx=[],
             execution_backend="nvrtc",
-            target={"kind": "cuda", "arch": "sm_87"},
+            target=CUDA_TARGET,
+            pass_configs=COMPILER_PASSES,
         )
 
     def launch(kernel, *inputs):

@@ -1,5 +1,6 @@
 """Validate exact routing, QSA selection and PLE fusion on the target GPU."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import argparse
 import importlib.util
 from pathlib import Path
@@ -18,7 +19,8 @@ def compile_kernel(fn):
         explicit_rows(fn),
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
+        target=CUDA_TARGET,
+        pass_configs=COMPILER_PASSES,
     )
 
 

@@ -1,5 +1,6 @@
 """GPU checks for Qwen strided Q4 outputs, block128 rotations and dynamic KV."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import argparse
 import json
 from pathlib import Path
@@ -38,7 +39,8 @@ def run():
                 make_prim(spec, config),
                 out_idx=[],
                 execution_backend="nvrtc",
-                target={"kind": "cuda", "arch": "sm_87"},
+                target=CUDA_TARGET,
+                pass_configs=COMPILER_PASSES,
             )
             for live in [1, 5, 17]:
                 ProjectionTuner._validate(kernel, spec, config, live)

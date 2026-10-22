@@ -1,5 +1,6 @@
 """Check decode row tails and address changes across CUDA Graph replay."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import argparse
 from pathlib import Path
 
@@ -18,7 +19,8 @@ def compile_rows(fn):
         explicit_rows(fn),
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
+        target=CUDA_TARGET,
+        pass_configs=COMPILER_PASSES,
     )
 
 

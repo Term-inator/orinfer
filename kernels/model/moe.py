@@ -1,4 +1,4 @@
-"""Explicit routing and deterministic mixture reduction for SM87 MoE.
+"""Explicit routing and deterministic mixture reduction for SM120 MoE.
 
 Router logits and probabilities remain FP32. Top-k uses ascending expert IDs
 to break exact ties, and can normalize over the selected experts or all experts.

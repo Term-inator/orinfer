@@ -132,7 +132,7 @@ mod tests {
             })
             .collect();
         let manifest = serde_json::from_value(serde_json::json!({
-            "schema_version":1,"target":"sm_87","model":"test","chunk_tokens":4096,
+            "schema_version":1,"target":"sm_120","model":"test","chunk_tokens":4096,
             "max_context":262144,"vocab":16,"toolchain":{},"buffers":buffers,
             "reset_buffers":[],"input":"Input","token":"Token","status":"Status",
             "logits":"Logits","position":"Position","weight_bytes":0,

@@ -1,5 +1,6 @@
 """Verify independent HC streams against the original ordered projection."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import argparse
 from pathlib import Path
 
@@ -20,7 +21,8 @@ def compile_kernel(primitive):
         explicit_rows(primitive),
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
+        target=CUDA_TARGET,
+        pass_configs=COMPILER_PASSES,
     )
 
 

@@ -13,3 +13,8 @@ pub mod reranking;
 pub mod vision;
 
 pub mod audio;
+
+/// Fixed deployment identity, generated from the workspace machine contract.
+pub mod target {
+    include!(concat!(env!("OUT_DIR"), "/target.rs"));
+}

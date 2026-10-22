@@ -1,4 +1,4 @@
-"""SM87 SwiGLU: FP16 input/output, FP32 nonlinear arithmetic, no workspace.
+"""SM120 SwiGLU: FP16 input/output, FP32 nonlinear arithmetic, no workspace.
 
 ``split`` is the canonical [gate | up] layout. ``interleaved`` is physically
 [gate0, up0, gate1, up1, ...]; it requires an upstream layout change or packing.
@@ -26,7 +26,7 @@ def swiglu_fp16(gate, up):
     return T.cast((g * sigmoid) * u, T.float16)
 
 
-@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
+@tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_120"})
 def _compile_swiglu(block: int = 1024, threads: int = 256, layout: str = "split"):
     assert layout in ("split", "interleaved")
     assert block > 0 and block % threads == 0

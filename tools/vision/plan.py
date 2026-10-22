@@ -31,7 +31,7 @@ class EncoderBuilder:
             subprocess.run(
                 [
                     "/usr/local/cuda/bin/nvcc",
-                    "-arch=sm_87",
+                    "-arch=sm_120",
                     "-std=c++17",
                     "--cubin",
                     f"-I{includes}/src",

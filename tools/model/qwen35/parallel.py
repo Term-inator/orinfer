@@ -247,6 +247,8 @@ def build(b, attention=None, recurrent=None):
             key = f"private-rows-{role}-{b.h}-{b.hv}-{b.qh}-{attention if role.startswith('attention') else config}"
 
             def compile_wrapped(wrapped=wrapped, role=role, config=config):
+                from kernels.operators.op17_gdn_gated_norm import GATED_NORM_PASSES
+
                 return compile_function(
                     wrapped,
                     pass_configs={
@@ -254,6 +256,8 @@ def build(b, attention=None, recurrent=None):
                         "tl.disable_shared_memory_reuse": True,
                     }
                     if role == "recurrent" and config.get("prefetch_qk")
+                    else GATED_NORM_PASSES
+                    if role == "gated_norm"
                     else {},
                 )
 

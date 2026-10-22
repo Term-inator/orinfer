@@ -1,4 +1,4 @@
-"""Integer E8P tiles expanded in shared memory for SM87 INT8 MMA.
+"""Integer E8P tiles expanded in shared memory for SM120 INT8 MMA.
 
 Reference ABI: group-major indices, integer table, output-row scale, A8
 activation and token scale. Full K is accumulated in INT32. Tables can be
@@ -30,7 +30,7 @@ __device__ __forceinline__ unsigned int integer_e8p_quad(unsigned int code, unsi
     unsigned int mask = flags * 255u;
     // Ordinary word arithmetic with each byte's carry confined to its own
     // sign bit. CUDA's vadd4/vsub4 intrinsics expand into costly emulation on
-    // SM87; these expressions preserve even zero-valued diagnostic tables.
+    // SM120; these expressions preserve even zero-valued diagnostic tables.
     unsigned int negative = ((~basis & 0x7f7f7f7fu) + 0x01010101u) ^ (~basis & 0x80808080u);
     unsigned int oriented = basis ^ ((basis ^ negative) & mask);
     unsigned int plus = oriented | 0x01010101u; // every E8P basis byte is even
@@ -159,7 +159,7 @@ def _compile(
                         patch[n] = Patch[expert, kg, bx * BN + n]
             # Decode each four-byte word once in registers. The separate,
             # layout-aware shared write lets TileLang vectorize four bytes;
-            # a scalar alloc_var in the byte loop prevents that on SM87.
+            # a scalar alloc_var in the byte loop prevents that on SM120.
             for n, q in T.Parallel(BN, G // 4):
                 code = T.cast(packed[n, q // 2], T.uint32)
                 if selectorbook:

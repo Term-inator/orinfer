@@ -364,7 +364,7 @@ mod tests {
 
     fn manifest(_layer: usize) -> Manifest {
         serde_json::from_value(serde_json::json!({
-            "schema_version":2,"target":"sm_87","model":"test","chunk_tokens":4096,
+            "schema_version":2,"target":"sm_120","model":"test","chunk_tokens":4096,
             "max_context":262144,"vocab":16,"toolchain":{},"buffers":[],
             "reset_buffers":[],"input":"Input","token":"Token","status":"Status",
             "logits":"Logits","position":"Position","weight_bytes":0,

@@ -401,7 +401,7 @@ impl Executor {
                 "sequence free memory",
             )?;
         }
-        Ok(free)
+        Ok(free.saturating_sub(self.cold_weight_reserve()))
     }
     pub(crate) fn request_fixed_bytes(&self, limits: &BTreeMap<String, usize>) -> Result<usize> {
         let payload = self
@@ -1277,6 +1277,7 @@ impl Executor {
                     &k.spec
                 };
                 self.ensure_experts(spec, &values)?;
+                self.ensure_weights(spec)?;
                 super::launch_kernel(
                     spec,
                     k.function

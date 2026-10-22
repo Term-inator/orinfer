@@ -7,7 +7,7 @@ python-env:
 	uv pip sync --python $(PYTHON) tools/build/cpu-requirements.txt
 
 build:
-	cargo build --release --locked --offline
+	bash tools/build/native.sh
 
 fmt:
 	cargo fmt --all

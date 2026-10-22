@@ -104,7 +104,7 @@ def main():
     manifest = dict(
         schema_version=1,
         runtime_abi=1,
-        target="sm_87",
+        target="sm_120",
         architecture="test_family",
         compute_policy="test_policy",
         config_signature=None,
@@ -182,7 +182,7 @@ def main():
     package.rename(package.with_name(digest))
     metadata = dict(
         schema_version=2,
-        target="sm_87",
+        target="sm_120",
         model="native-package-fixture",
         chunk_tokens=1,
         max_context=8,

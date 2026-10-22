@@ -6,6 +6,7 @@
 
 ```bash
 make compiler-image
+make build
 make check-offline
 ```
 
@@ -13,7 +14,9 @@ make check-offline
 
 `compiler.Dockerfile` 使用固定 digest 的 Linux x86_64 CUDA 12.8.1 最小镜像，安装固定版本 NVCC/NVRTC 开发工具，固定版本 uv 在 `/opt/venv` 同步完整 Python 依赖。Torch 2.9.1、TileLang 0.1.15、CUDA Python 12.8.0 和 NVIDIA CUDA wheel 均记录在 `compiler-requirements.txt`，构建时检查平台、Torch CUDA 版本与依赖完整性。默认镜像为 `orinfer-compiler:0.2.0-sm120`，模型与缓存通过运行时挂载提供。
 
-公共离线 JIT、AOT 编译器和量化编码器使用 `tools/build/target.py` 声明的 SM120 目标，GPU 初始化检查 compute capability 12.0。量化仍使用原有两级 E8P Q4A8、beam8、signed-block128 和 W8/浮点例外策略。当前阶段准备 RTX 5070 Ti 的量化产物；在线 Rust 引擎、执行包目标校验、模型容量及完整请求仍需分别迁移与验收。
+机器目标在 `configs/deployment-target.json` 固定为 x86_64/SM120，Rust SDK 在构建时生成对应常量，Python 通过 `tools/build/target.py` 读取同一契约。公共离线 JIT、AOT 编译器和量化编码器使用此 SM120 目标，GPU 初始化检查 compute capability 12.0。量化仍使用原有两级 E8P Q4A8、beam8、signed-block128 和 W8/浮点例外策略。Rust 原生库与执行包校验同样严格匹配该目标。完整请求、模型质量与功能验收分别记录。
+
+`make build` 在同一固定镜像内编译 Rust CLI 与模型库，并原子复制到 `target/release`，使离线构建器使用与模型库相同的 glibc 基线。CPU 构建缓存位于 `artifacts/native-build-sm120`；CPU 格式、编译与测试仍在项目 uv/宿主 Rust 环境执行。
 
 GPU 编译入口使用 `--gpus all` 和镜像内的 `/opt/venv/bin/python`，通过 NVIDIA Container Toolkit 加载本机驱动。部分离线原生算子参考保留 Triton 3.5.1。在线部署只加载已编译的原生执行包。
 
@@ -36,7 +39,7 @@ bash tools/operators/run.sh tools/build/smoke.py artifacts/build/compiler-smoke
 
 ## 自动检查
 
-`make check` 包含 Rust/Ruff 格式、Python 静态检查、编译、clippy、Rust/CPU Python 测试和验收配置校验；GitHub Actions 在 x86_64 和 aarch64 runner 执行同一入口；原生 C ABI 加载测试在 aarch64 执行，读取 `rust-toolchain.toml`。`make fmt` 统一格式，`make lint` 执行格式和静态检查；Rust 编译将死代码视为错误，clippy 以零警告为通过条件。使用 `uv` 隔离 CPU 依赖：`make python-env` 创建 Python3.12 的 `.venv` 并同步固定版本；检查默认使用 `.venv/bin/python`，CPU 依赖隔离在虚拟环境中，可通过 `PYTHON` 覆盖解释器；CI 和编译镜像固定 uv0.13.4，Rust 版本由 `rust-toolchain.toml` 固定。
+`make check` 包含 Rust/Ruff 格式、Python 静态检查、编译、clippy、Rust/CPU Python 测试和验收配置校验；GitHub Actions 在 x86_64 runner 执行同一入口；原生 C ABI 加载测试在本机 x86_64 执行，读取 `rust-toolchain.toml`。`make fmt` 统一格式，`make lint` 执行格式和静态检查；Rust 编译将死代码视为错误，clippy 以零警告为通过条件。使用 `uv` 隔离 CPU 依赖：`make python-env` 创建 Python3.12 的 `.venv` 并同步固定版本；检查默认使用 `.venv/bin/python`，CPU 依赖隔离在虚拟环境中，可通过 `PYTHON` 覆盖解释器；CI 和编译镜像固定 uv0.13.1，Rust 版本由 `rust-toolchain.toml` 固定。GPU 编译镜像使用 Python 3.10，新增离线模块按该解释器验证。
 
 `make check-offline` 在编译镜像中检查全部离线模块引用，并在 CPU 上执行需要 Torch 的参考数学及动态行数 ABI 测试。
 
@@ -59,7 +62,7 @@ python3 tools/release/package.py --version v0.2.1 \
   --output artifacts/releases/v0.2.1
 ```
 
-默认仅生成和校验产物。工具要求工作区干净，使用 `Cargo.lock` 构建，验证 aarch64/版本，打包完整源码、许可证、依赖声明、模型打包工具和架构契约，并逐个验证原生执行包及实际库身份。引擎、执行包和随附的源码归档统一使用 XZ 压缩（`.tar.xz`，preset 6）；输入旧 `.tar.gz` 执行包会经过验证并重新执行 XZ 压缩。资产名称取自架构规格 ID、计算策略、GPU 目标和版本，例如 `orinfer-exec-qwen35-2b-a8-sm87-v0.2.1.tar.xz`。规格 ID 由 `configs/architecture-contract.json` 中的配置签名选择器识别；`a8` 对应 `int8_quality` 混合精度策略。每种规格分别发布，重复规格与策略会阻止发布；`RELEASE.json` 保留完整包 digest 和架构规格 ID；完整离线工具及 Flash Next 文档随包提供。权重通过模型仓库单独发布。部署使用 Rust CLI 的 `orinfer package install` 安装执行包；详见[安装说明](../../docs/model-packages.md#安装执行包)。
+默认仅生成和校验产物。工具要求工作区干净，使用 `Cargo.lock` 构建，验证 x86_64/版本，打包完整源码、许可证、依赖声明、模型打包工具和架构契约，并逐个验证原生执行包及实际库身份。引擎、执行包和随附的源码归档统一使用 XZ 压缩（`.tar.xz`，preset 6）；输入旧 `.tar.gz` 执行包会经过验证并重新执行 XZ 压缩。资产名称取自架构规格 ID、计算策略、GPU 目标和版本，例如 `orinfer-exec-qwen35-2b-a8-sm120-v0.2.0.tar.xz`。规格 ID 由 `configs/architecture-contract.json` 中的配置签名选择器识别；`a8` 对应 `int8_quality` 混合精度策略。每种规格分别发布，重复规格与策略会阻止发布；`RELEASE.json` 保留完整包 digest 和架构规格 ID；完整离线工具及 Flash Next 文档随包提供。权重通过模型仓库单独发布。部署使用 Rust CLI 的 `orinfer package install` 安装执行包；详见[安装说明](../../docs/model-packages.md#安装执行包)。
 
 从 0.1.2 起，引擎使用包含 `.so` 与 cubin 的 schema 1 原生执行包。0.1.1 及更早格式的模型需通过当前构建工具重新发布。当前原生格式的模型可以用[执行库更新工具](../../docs/model-packages.md)生成新目录，保留权重和 kernel 资产。
 

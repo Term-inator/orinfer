@@ -96,7 +96,7 @@ class CompactTests(unittest.TestCase):
             kernels.append(dict(file=filename, sha256=hashlib.sha256(raw).hexdigest()))
         library = bytearray(20)
         library[:6] = b"\x7fELF\x02\x01"
-        library[16:20] = bytes((3, 0, 183, 0))
+        library[16:20] = bytes((3, 0, 62, 0))
         (package / "lib").mkdir()
         (package / "lib/model.so").write_bytes(library)
         self.library = package / "lib/model.so"

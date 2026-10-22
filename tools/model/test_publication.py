@@ -24,7 +24,7 @@ class PublicationTests(unittest.TestCase):
             root = Path(directory)
             source, target = root / "source", root / "target"
             target.mkdir()
-            for layout in ("v1/kernels", "v2/linux-aarch64/kernels"):
+            for layout in ("v1/kernels", "v2/linux-x86_64/kernels"):
                 good = source / layout / "complete"
                 good.mkdir(parents=True)
                 (good / "kernel.cubin").write_bytes(b"compiled")
@@ -35,7 +35,7 @@ class PublicationTests(unittest.TestCase):
                 other.mkdir()
                 (other / "kernel.cubin").write_bytes(b"older")
             seed_compile_cache(source, target)
-            for layout in ("v1/kernels", "v2/linux-aarch64/kernels"):
+            for layout in ("v1/kernels", "v2/linux-x86_64/kernels"):
                 self.assertEqual(
                     (target / layout / "complete/kernel.cubin").read_bytes(), b"compiled"
                 )

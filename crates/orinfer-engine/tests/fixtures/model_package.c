@@ -6,7 +6,7 @@ static int32_t bytes(OrinferOwnedBytes *out, const char *s) {
     out->len=strlen(s); out->data=malloc(out->len); memcpy(out->data,s,out->len); return 0;
 }
 static int32_t describe(OrinferOwnedBytes *out) {
-    return bytes(out,"{\"package\":\"test-model\",\"version\":\"1\",\"target\":\"sm_87\",\"runtime_abi\":1,\"architectures\":[\"test_family\"],\"compute_policies\":[\"test_policy\"]}");
+    return bytes(out,"{\"package\":\"test-model\",\"version\":\"1\",\"target\":\"sm_120\",\"runtime_abi\":1,\"architectures\":[\"test_family\"],\"compute_policies\":[\"test_policy\"]}");
 }
 static int32_t create(const uint8_t *p,size_t n,void **model,OrinferOwnedBytes *out) {
     char *input=malloc(n+1);memcpy(input,p,n);input[n]=0;

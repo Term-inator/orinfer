@@ -11,10 +11,10 @@ def prefill(b, section, layer):
     w, hv = b.weights, b.hv
     if "GdnChunkW" not in w.buffers:
         for name, dtype, shape in [
-            ("GdnChunkW", "f16", [hv, 4096, 128]),
-            ("GdnChunkU", "f16", [hv, 4096, 128]),
-            ("GdnChunkD", "f16", [hv, 4096, 32]),
-            ("GdnChunkG", "f32", [hv, 4096, 2]),
+            ("GdnChunkW", "f16", [hv, b.capacity, 128]),
+            ("GdnChunkU", "f16", [hv, b.capacity, 128]),
+            ("GdnChunkD", "f16", [hv, b.capacity, 32]),
+            ("GdnChunkG", "f32", [hv, b.capacity, 2]),
         ]:
             w.fixed(name, dtype, shape)
     with gpu_lock(b.lock):
@@ -27,13 +27,15 @@ def prefill(b, section, layer):
         section + "/recurrent_prepare",
         "gdn-wy-prepare-" + identity,
         lambda: primitive(
-            gdn_chunk.prepare, 4096, HK=b.hk, HV=hv, C=config["C"], dynamic_rows=True
+            gdn_chunk.prepare, b.capacity, HK=b.hk, HV=hv, C=config["C"], dynamic_rows=True
         ),
         dict(common, V="V", G="g", Beta="Beta"),
     )
     b.emit(
         section + "/recurrent_chunk",
         "gdn-wy-recurrent-" + identity,
-        lambda: primitive(gdn_chunk.recurrent, 4096, HK=b.hk, HV=hv, **config, dynamic_rows=True),
+        lambda: primitive(
+            gdn_chunk.recurrent, b.capacity, HK=b.hk, HV=hv, **config, dynamic_rows=True
+        ),
         dict(common, State=f"L{layer}_State", Out="Y"),
     )

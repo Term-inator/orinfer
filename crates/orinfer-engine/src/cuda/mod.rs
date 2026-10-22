@@ -18,6 +18,7 @@ mod state_table;
 mod transfers;
 mod virtual_memory;
 mod weight_arena;
+mod weight_cache;
 mod weight_upload;
 pub(crate) use cudarc::driver::sys;
 pub(crate) type Handle = sys::CUgraphExec;
@@ -30,7 +31,7 @@ impl Driver {
         // SAFETY: Loading the installed CUDA driver; retaining it for the session.
         let library = unsafe { Library::new("libcuda.so.1") }.map_err(|e| e.to_string())?;
         // Preflight prevents cudarc's lazy symbol loader from panicking during execution.
-        // Signatures and CUDA types come entirely from its generated CUDA 12.6 bindings.
+        // Signatures and CUDA types come entirely from its generated CUDA 12.8 bindings.
         for name in [
             b"cuInit\0".as_slice(),
             b"cuDriverGetVersion\0".as_slice(),
@@ -137,6 +138,7 @@ pub(crate) struct Session {
     pub(crate) buffers: Vec<u64>,
     pub(crate) virtual_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) workspace_buffers: std::cell::RefCell<virtual_memory::Reservations>,
+    pub(crate) weight_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) expert_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) prefix_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) modules: std::cell::RefCell<Vec<sys::CUmodule>>,
@@ -161,6 +163,7 @@ impl Session {
             virtual_buffers: Default::default(),
             workspace_buffers: Default::default(),
             expert_buffers: Default::default(),
+            weight_buffers: Default::default(),
             prefix_buffers: Default::default(),
             modules: Default::default(),
             events: vec![],
@@ -227,6 +230,7 @@ impl Session {
                 .into_iter()
                 .chain(std::mem::take(self.expert_buffers.get_mut()))
                 .chain(std::mem::take(self.workspace_buffers.get_mut()))
+                .chain(std::mem::take(self.weight_buffers.get_mut()))
                 .chain(std::mem::take(self.prefix_buffers.get_mut()))
             {
                 if let Err(e) = buffer.release_slabs(&self.driver) {
@@ -407,8 +411,8 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
             ),
             "SM minor",
         )?;
-        if [major, minor] != [8, 7] {
-            return Err(format!("Expected SM87, got {major}.{minor}"));
+        if [major, minor] != orinfer_model_sdk::target::COMPUTE_CAPABILITY {
+            return Err(format!("Expected SM120, got {major}.{minor}"));
         }
         check(sys::cuDriverGetVersion(&mut version), "driver version")?;
         check(

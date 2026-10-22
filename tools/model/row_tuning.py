@@ -5,6 +5,7 @@ Every candidate receives the same data, tail guards and changed-input graph
 check. Only selected tiles are emitted; no tuning runs in the Rust runtime.
 """
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import math
 from itertools import chain
 from pathlib import Path
@@ -32,10 +33,15 @@ def launch(kernel, *args):
 
 
 class RowTuner:
-    def __init__(self, output, identity, text=None):
+    capacity = 4096
+
+    def __init__(self, output, identity, text=None, *, capacity=4096):
         self.output = Path(output)
         self.output.mkdir(parents=True, exist_ok=True)
         self.identity = identity
+        if type(capacity) is not int or not 1 <= capacity <= 4096:
+            raise ValueError("Row tuning capacity must be in 1..4096")
+        self.capacity = capacity
         self.records = {}
         text = text or {}
         self.h = text.get("hidden_size", 5120)
@@ -60,8 +66,12 @@ class RowTuner:
         from tools.operators.common import SEED
         import torch
 
-        measured = [1, 2, 3, 4, 8, 17, 64, 129, 512, 4096] if measure_rows is None else measure_rows
-        if not measured or any(type(r) is not int or not 1 <= r <= 4096 for r in measured):
+        measured = (
+            [min(n, self.capacity) for n in (1, 2, 3, 4, 8, 17, 64, 129, 512, self.capacity)]
+            if measure_rows is None
+            else measure_rows
+        )
+        if not measured or any(type(r) is not int or not 1 <= r <= self.capacity for r in measured):
             raise ValueError("Invalid row tuning measurements")
         measured = sorted(set(measured))
         if not 0 <= relative_tolerance <= 0.1:
@@ -77,7 +87,7 @@ class RowTuner:
         cached = read_record(path, identity)
         if cached is not None:
             return cached
-        kernels, _, _ = compile_candidates(configs, build)
+        kernels, configs, rejected = compile_candidates(configs, build, tolerate_failures=True)
         records = []
         for rows in measured:
             times = {str(i): [] for i in range(len(configs))}
@@ -126,8 +136,8 @@ class RowTuner:
                 )
                 for r in records
             ]
-        chosen = ranges(decisions, capacity=4096)
-        result = dict(identity=identity, configs=configs, measurements=records, **chosen)
+        chosen = ranges(decisions, capacity=self.capacity)
+        result = dict(identity=identity, configs=configs, rejected=rejected, measurements=records, **chosen)
         atomic_json(path, result)
         return result
 
@@ -147,7 +157,7 @@ class RowTuner:
         def build(config):
             return primitive(
                 rotate_activation_a8,
-                4096 * multiplier,
+                self.capacity * multiplier,
                 k,
                 swiglu=swiglu,
                 dynamic_rows=True,
@@ -183,7 +193,13 @@ class RowTuner:
             yield fixture
 
         result = self.select(
-            spec, configs, build, inputs, measure_rows=[1, 17, 128, 512, 2048, 4096]
+            spec,
+            configs,
+            build,
+            inputs,
+            measure_rows=sorted(
+                {min(n, self.capacity) for n in (1, 17, 128, 512, 2048, self.capacity)}
+            ),
         )
         default = min(
             result["used"],
@@ -208,14 +224,16 @@ class RowTuner:
             dict(block_k=b, registers=True, threads=t)
             for b, t in ((512, 128), (1024, 128), (1024, 256), (2048, 256))
         ]
-        reference = primitive(rotate_activation_a8, 4096, k, swiglu=swiglu, dynamic_rows=True)
+        reference = primitive(
+            rotate_activation_a8, self.capacity, k, swiglu=swiglu, dynamic_rows=True
+        )
 
         def build(c):
             b = c["block_k"]
             return (
                 primitive(
                     rotate_activation_tiles,
-                    4096,
+                    self.capacity,
                     k,
                     b,
                     swiglu,
@@ -223,7 +241,7 @@ class RowTuner:
                     plane_rows=plane_rows,
                     **{key: value for key, value in c.items() if key != "block_k"},
                 ),
-                primitive(quantize_rotation_tiles, 4096, k, b, dynamic_rows=True),
+                primitive(quantize_rotation_tiles, self.capacity, k, b, dynamic_rows=True),
             )
 
         def inputs(rows):
@@ -342,7 +360,7 @@ class RowTuner:
             # Decoder launch, attention and merge are timed together. Small
             # prefill tails compete with large extents; no row cutoff is assumed.
             self.records[key] = self._measure_attention(
-                context, spec, configs, measure_rows=samples(4096)
+                context, spec, configs, measure_rows=samples(self.capacity)
             )
         return self.records[key]
 
@@ -355,7 +373,7 @@ class RowTuner:
         reference = primitive(
             attention_prefill_int8,
             1,
-            4096,
+            self.capacity,
             context,
             dynamic_rows=True,
             query_heads=self.qh,
@@ -368,7 +386,7 @@ class RowTuner:
             return (
                 primitive(
                     causal_attention_int8,
-                    4096,
+                    self.capacity,
                     context,
                     c["block_m"],
                     c["block_n"],
@@ -385,7 +403,7 @@ class RowTuner:
                 ),
                 primitive(
                     merge_attention_int8,
-                    4096,
+                    self.capacity,
                     c["block_m"],
                     ATTENTION_TARGET,
                     c["max_splits"],
@@ -397,7 +415,7 @@ class RowTuner:
                 ),
                 primitive(
                     dequantize_attention_kv,
-                    4096,
+                    self.capacity,
                     context,
                     kv_heads=self.kvh,
                     dimension=self.dimension,
@@ -409,7 +427,9 @@ class RowTuner:
         def inputs(rows):
             # Autoregressive positions usually end inside a tile. Exact tile
             # multiples alone hide loading/masking and instruction-cache costs.
-            for length in sorted({max(rows, 536), max(rows, 8216)}):
+            if rows > context:
+                raise ValueError("Attention fixture rows exceed context capacity")
+            for length in sorted({min(context, max(rows, n)) for n in (536, 8216)}):
                 q = (
                     torch.randn((rows, self.qh, self.dimension), device="cuda", dtype=torch.float16)
                     * 0.1
@@ -558,14 +578,14 @@ class RowTuner:
         spec = dict(kind="gdn_convolution", key_heads=self.hk, value_heads=self.hv)
         if str(spec) in self.records:
             return self.records[str(spec)]
-        configs = [dict(tile_tokens=t) for t in (1, 2, 4, 8, 16)]
+        configs = [dict(tile_tokens=t) for t in (2, 4, 8, 16)]
         channels = (2 * self.hk + self.hv) * 128
 
         def build(config):
             return primitive(
                 gdn_conv_prep,
                 1,
-                4096,
+                self.capacity,
                 dynamic_tokens=True,
                 key_heads=self.hk,
                 value_heads=self.hv,
@@ -614,7 +634,9 @@ class RowTuner:
 
         # Include the exact AOT rows: a tail at 17 can favour a smaller tile,
         # while an aligned 32-row chunk needs its own measured cost.
-        measured = sorted(set(SPECIALIZATIONS) | {17, 64, 129, 512, 4096})
+        measured = sorted(
+            {min(n, self.capacity) for n in (*SPECIALIZATIONS, 17, 64, 129, 512, self.capacity)}
+        )
         result = self.select(spec, configs, build, inputs, measure_rows=measured)
         self.records[str(spec)] = result
         return result
@@ -639,7 +661,7 @@ class RowTuner:
         def build(config):
             return primitive(
                 _gdn_sequence,
-                4096,
+                self.capacity,
                 in_place=True,
                 value_tile=16,
                 threads=32,
@@ -725,13 +747,18 @@ class RowTuner:
                 fn,
                 out_idx=[],
                 execution_backend="nvrtc",
-                target={"kind": "cuda", "arch": "sm_87"},
+                target=CUDA_TARGET,
                 pass_configs={
-                    "tl.disable_thread_storage_sync": True,
-                    "tl.disable_shared_memory_reuse": True,
-                }
-                if config["prefetch_qk"]
-                else {},
+                    **COMPILER_PASSES,
+                    **(
+                        {
+                            "tl.disable_thread_storage_sync": True,
+                            "tl.disable_shared_memory_reuse": True,
+                        }
+                        if config["prefetch_qk"]
+                        else {} or {}
+                    ),
+                },
             )
             return kernel, names
 

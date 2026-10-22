@@ -1,4 +1,4 @@
-"""SM87 residual + zero-centered RMSNorm with explicit output buffers.
+"""SM120 residual + zero-centered RMSNorm with explicit output buffers.
 
 The matched Qwen3.5/vLLM Gemma norm sums in FP32, normalizes that unrounded
 sum, and returns FP32 residuals. FP16 residual output is an explicit alternate

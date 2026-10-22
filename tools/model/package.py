@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.model.publication import AssetReader, source_path
 from tools.build.files import file_hash
+from tools.build.target import CUDA_TARGET, ELF_MACHINE
 
 
 CONTRACT = json.loads(
@@ -46,9 +47,9 @@ def verify_library(path):
         or header[:4] != b"\x7fELF"
         or header[4:6] != bytes((2, 1))
         or int.from_bytes(header[16:18], "little") != 3
-        or int.from_bytes(header[18:20], "little") != 183
+        or int.from_bytes(header[18:20], "little") != ELF_MACHINE
     ):
-        raise ValueError("Execution library must be an aarch64 ELF shared object")
+        raise ValueError("Execution library must be an x86_64 ELF shared object")
 
 
 def execution_identity(library, engine=None, architecture=None, compute_policy=None):
@@ -64,7 +65,7 @@ def execution_identity(library, engine=None, architecture=None, compute_policy=N
     info = json.loads(result.stdout)
     if (
         info.get("runtime_abi") != 1
-        or info.get("target") != "sm_87"
+        or info.get("target") != CUDA_TARGET["arch"]
         or not info.get("package")
         or not info.get("version")
     ):

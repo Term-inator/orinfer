@@ -1,4 +1,4 @@
-"""Width-four causal depthwise conv, SiLU, L2 and private history (SM87).
+"""Width-four causal depthwise conv, SiLU, L2 and private history (SM120).
 
 Q scaling is an explicit build parameter; default Q is unscaled native prefill.
 All buffers are caller owned, contiguous and mutually non-aliasing. No Torch
@@ -60,7 +60,7 @@ def gdn_conv_prep(
     CHANNELS = (2 * KEY_HEADS + VALUE_HEADS) * DIM
     if min(KEY_HEADS, VALUE_HEADS) <= 0 or VALUE_HEADS % KEY_HEADS:
         raise ValueError("Invalid GDN head geometry")
-    assert tile_tokens in (1, 2, 4, 8, 16)
+    assert tile_tokens in (2, 4, 8, 16)
     assert qk_output_dtype in ("float16", "float32") and q_scale > 0
     assert weight_dtype in ("float16", "float32")
     if type(compact_decode) is not bool or compact_decode and (tokens != 1 or tile_tokens != 16):
@@ -70,7 +70,8 @@ def gdn_conv_prep(
     if type(inplace_history) is not bool or inplace_history and (not compact_decode or B != 1):
         raise ValueError("In-place history requires a fixed single-request compact decode")
     if compact_decode:
-        tile_tokens = 1
+        # Keep both sixteen-lane groups active; the second row is masked.
+        tile_tokens = 2
     batch = T.dynamic("batch") if B is None else B
     if type(dynamic_tokens) is not bool or dynamic_tokens and (B != 1 or compact_decode):
         raise ValueError("Dynamic token strides require single-request prefill")

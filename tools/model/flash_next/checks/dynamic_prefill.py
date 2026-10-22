@@ -5,6 +5,7 @@ multiple non-aligned lengths. This is execution equivalence, not quantization
 quality or a substitute for the Rust model's end-to-end performance gate.
 """
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import argparse
 from pathlib import Path
 
@@ -147,11 +148,19 @@ def main():
             function,
             out_idx=[],
             execution_backend="nvrtc",
-            target={"kind": "cuda", "arch": "sm_87"},
+            target=CUDA_TARGET,
             pass_configs=(
-                {"tl.disable_thread_storage_sync": True, "tl.disable_shared_memory_reuse": True}
-                if label == "gdn-prefetch"
-                else {}
+                {
+                    **COMPILER_PASSES,
+                    **(
+                        {
+                            "tl.disable_thread_storage_sync": True,
+                            "tl.disable_shared_memory_reuse": True,
+                        }
+                        if label == "gdn-prefetch"
+                        else {} or {}
+                    ),
+                }
             ),
         )
 

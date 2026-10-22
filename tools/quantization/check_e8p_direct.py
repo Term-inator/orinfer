@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from kernels.model.e8p_q4 import projection, unpack
 from tools.model.compile import primitive
-from tools.operators.common import configure, write_json
+from tools.operators.common import KernelResourceError, configure, write_json
 from tools.quantization.e8p import basis
 from tools.quantization.vq import e8p_decode, e8p_selector_table
 
@@ -318,20 +318,34 @@ def staged_tensor_checks(rng):
         (64, 64, 256, 1),
         (256, 64, 128, 1),
     ):
-        kernel = primitive(
-            projection,
-            4096,
-            n,
-            k,
-            block_m=bm,
-            block_n=bn,
-            block_k=bk,
-            stages=stages,
-            packed_k=128,
-            dynamic_rows=True,
-            output_dtype="float32",
-            output_stride=n + 3,
-        )
+        try:
+            kernel = primitive(
+                projection,
+                4096,
+                n,
+                k,
+                block_m=bm,
+                block_n=bn,
+                block_k=bk,
+                stages=stages,
+                packed_k=128,
+                dynamic_rows=True,
+                output_dtype="float32",
+                output_stride=n + 3,
+            )
+        except KernelResourceError as error:
+            records.append(
+                dict(
+                    kind="staged_tensor_resources",
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                    stages=stages,
+                    eligible=False,
+                    reason=str(error),
+                )
+            )
+            continue
         for rows in (1, 127, 128, 129, 513):
             x = torch.randint(-128, 128, (rows, k), device="cuda", dtype=torch.int8)
             scale = torch.full((rows,), 0.001, device="cuda", dtype=torch.float16)

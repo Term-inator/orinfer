@@ -633,7 +633,7 @@ mod tests {
             "grid":if gu && i==0 {[1,1,1]}else{[10,1,1]},"block":[128,1,1],"shared_memory_bytes":0,"cooperative":false,
             "args":args.iter().map(|name|serde_json::json!({"kind":"buffer","name":name})).collect::<Vec<_>>()
         })).unwrap()).collect();
-        let manifest=serde_json::from_value(serde_json::json!({"schema_version":1,"target":"sm_87","model":"test","chunk_tokens":4096,
+        let manifest=serde_json::from_value(serde_json::json!({"schema_version":1,"target":"sm_120","model":"test","chunk_tokens":4096,
             "max_context":262144,"vocab":16,"toolchain":{},"buffers":buffers,"reset_buffers":[],"input":"Input","token":"Token",
             "status":"Status","logits":"Logits","position":"Position","weight_bytes":0,"weight_parameters":0,"weight_scope":"test",
             "programs":{"decode":kernels.iter().map(|k|serde_json::json!({"kind":"kernel","name":k.name})).collect::<Vec<_>>()}

@@ -1,4 +1,4 @@
-"""Exact partitioned QSA selection on SM87.
+"""Exact partitioned QSA selection on SM120.
 
 Each CTA retains its local top-512 using the original nonnegative FP32 bits.
 A bounded union contains every global winner, including lower-ID ties. The

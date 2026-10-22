@@ -36,7 +36,7 @@ class ExecutionAssetsTests(unittest.TestCase):
             root = Path(temp)
             header = bytearray(20)
             header[:6] = b"\x7fELF\x02\x01"
-            header[16:20] = bytes((3, 0, 183, 0))
+            header[16:20] = bytes((3, 0, 62, 0))
             identity = dict(
                 abi_version=1,
                 package="orinfer-models",
@@ -67,7 +67,7 @@ class ExecutionAssetsTests(unittest.TestCase):
                         )
                     ),
                     compute_policy="int8_quality",
-                    target="sm_87",
+                    target="sm_120",
                     catalog=dict(
                         assets=[], definitions=[], dynamic=[], binding_signature=str(index) * 64
                     ),
@@ -95,9 +95,9 @@ class ExecutionAssetsTests(unittest.TestCase):
                 self.assertEqual(
                     names,
                     [
-                        "orinfer-exec-qwen35-2b-a8-sm87-v0.1.2.tar.xz",
-                        "orinfer-exec-flash-next-a8-sm87-v0.1.2.tar.xz",
-                        "orinfer-exec-qwen35-4b-a8-sm87-v0.1.2.tar.xz",
+                        "orinfer-exec-qwen35-2b-a8-sm120-v0.1.2.tar.xz",
+                        "orinfer-exec-flash-next-a8-sm120-v0.1.2.tar.xz",
+                        "orinfer-exec-qwen35-4b-a8-sm120-v0.1.2.tar.xz",
                     ],
                 )
                 self.assertNotIn("27b", names[1])
@@ -128,7 +128,7 @@ class ExecutionAssetsTests(unittest.TestCase):
                     execution_assets(archives, root / "bad-cache", Path("/bin/true"), "v0.1.2")
 
     def test_unknown_specification_and_unsafe_tag_are_rejected(self):
-        package = dict(architecture="qwen3_5", compute_policy="int8_quality", target="sm_87")
+        package = dict(architecture="qwen3_5", compute_policy="int8_quality", target="sm_120")
         with self.assertRaisesRegex(ValueError, "Register one"):
             execution_asset_identity(package, "v0.2.0")
         with self.assertRaisesRegex(ValueError, "Unsafe release tag"):

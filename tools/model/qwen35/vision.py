@@ -170,7 +170,7 @@ def build(b):
     b.emit(
         "begin/overlay",
         f"vision-overlay-{b.context}",
-        lambda: primitive(overlay, 4096, b.h, b.context, features, dynamic_rows=True),
+        lambda: primitive(overlay, b.capacity, b.h, b.context, features, dynamic_rows=True),
         dict(Embedding="Hidden", Features="Features", Index="FeatureIndex", Position="Step"),
     )
     b.vision = dict(

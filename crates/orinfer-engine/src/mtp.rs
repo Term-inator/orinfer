@@ -189,7 +189,7 @@ mod tests {
             );
         }
         serde_json::from_value(serde_json::json!({
-            "schema_version":1,"target":"sm_87","model":"test","chunk_tokens":8,
+            "schema_version":1,"target":"sm_120","model":"test","chunk_tokens":8,
             "max_context":32,"vocab":100,"toolchain":{},"buffers":buffers,"kernels":[],
             "programs":{"execute":[{"kind":"zero","destination":"Step","bytes":4}]},
             "reset_buffers":["Step","MtpStep"],"input":"Input","token":"Token",

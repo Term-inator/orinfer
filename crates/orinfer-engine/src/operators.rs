@@ -86,7 +86,7 @@ impl ExecutionPackage {
     fn validate_metadata(&self) -> Result<()> {
         if self.schema_version != 1
             || self.runtime_abi != RUNTIME_ABI
-            || self.target != "sm_87"
+            || self.target != orinfer_model_sdk::target::CUDA_ARCH
             || self.architecture.is_empty()
             || self.compute_policy.is_empty()
         {

@@ -22,7 +22,7 @@ class ExecutionReplacementTests(unittest.TestCase):
         self.library = self.root / "model.so"
         header = bytearray(20)
         header[:6] = b"\x7fELF\x02\x01"
-        header[16:20] = bytes((3, 0, 183, 0))
+        header[16:20] = bytes((3, 0, 62, 0))
         self.library.write_bytes(header)
         identity = patch(
             "tools.model.attach_execution.execution_identity",

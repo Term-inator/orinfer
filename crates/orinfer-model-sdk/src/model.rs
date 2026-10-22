@@ -391,11 +391,11 @@ impl Manifest {
     }
     pub fn validate<'a>(&'a self) -> Result<usize> {
         if self.schema_version != 2
-            || self.target != "sm_87"
+            || self.target != crate::target::CUDA_ARCH
             || self.model.is_empty()
             || self.toolchain.is_empty()
         {
-            return Err("Expected safetensors model schema 2 for SM87; prepare the AOT model directory first".into());
+            return Err("Expected safetensors model schema 2 for SM120; prepare the AOT model directory first".into());
         }
         if self.chunk_tokens == 0
             || self.chunk_tokens > self.max_context
@@ -947,7 +947,7 @@ mod branch_tests {
             .unwrap()
         })
         .collect();
-        let m = serde_json::from_value(serde_json::json!({"schema_version":1,"target":"sm_87","model":"test",
+        let m = serde_json::from_value(serde_json::json!({"schema_version":1,"target":"sm_120","model":"test",
             "chunk_tokens":512,"max_context":512,"vocab":16,"toolchain":{},"buffers":[],"reset_buffers":[],
             "input":"Input","token":"Token","status":"Status","logits":"Logits","position":"Position",
             "weight_bytes":0,"weight_parameters":0,"weight_scope":"test",

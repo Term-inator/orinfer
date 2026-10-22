@@ -4,6 +4,7 @@ Both instruction schedules, scalar-Q4 and W8 storage, FP16/FP32 epilogues and
 rounded gate/up fusion cover dynamic tails and changed-input graph replay.
 """
 
+from tools.build.target import COMPILER_PASSES
 import argparse
 from pathlib import Path
 
@@ -63,6 +64,7 @@ def main():
                         out_idx=[],
                         execution_backend="nvrtc",
                         target=TARGET,
+                        pass_configs=COMPILER_PASSES,
                     )
                 )
                 weights = [

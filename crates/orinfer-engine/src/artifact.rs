@@ -38,8 +38,8 @@ pub struct Validation {
 
 impl Manifest {
     pub fn validate(&self) -> Result<usize> {
-        if self.schema_version != 1 || self.target != "sm_87" {
-            return Err("Expected fixture schema 1 and sm_87".into());
+        if self.schema_version != 1 || self.target != orinfer_model_sdk::target::CUDA_ARCH {
+            return Err("Expected fixture schema 1 and sm_120".into());
         }
         if self.toolchain.is_empty() || self.buffers.is_empty() || self.kernels.is_empty() {
             return Err("Missing toolchain/buffers/kernels".into());
@@ -303,7 +303,7 @@ mod tests {
         );
     }
     fn sample() -> Manifest {
-        serde_json::from_value(serde_json::json!({"schema_version":1,"target":"sm_87","toolchain":{"tilelang":"test"},"buffers":[{"name":"A","dtype":"f16","shape":[1,4],"layout":"row_major","alignment":16,"access":"read","data":{"file":"a.bin","sha256":"0".repeat(64)}},{"name":"C","dtype":"f16","shape":[1,4],"layout":"row_major","alignment":16,"access":"write"}],"kernels":[{"name":"test","module":{"file":"k.cubin","sha256":"0".repeat(64)},"source":{"file":"k.cu","sha256":"0".repeat(64)},"host_abi":{"file":"host.txt","sha256":"0".repeat(64)},"symbol":"kernel","grid":[1,1,1],"block":[128,1,1],"shared_memory_bytes":0,"cooperative":false,"args":[{"kind":"buffer","name":"A"},{"kind":"buffer","name":"C"},{"kind":"i32","value":1}]}],"validation":{"output":"C","reference":{"file":"ref.bin","sha256":"0".repeat(64)},"relative_l2_tolerance":0.002,"zero_input":"A","repetitions":20}})).unwrap()
+        serde_json::from_value(serde_json::json!({"schema_version":1,"target":"sm_120","toolchain":{"tilelang":"test"},"buffers":[{"name":"A","dtype":"f16","shape":[1,4],"layout":"row_major","alignment":16,"access":"read","data":{"file":"a.bin","sha256":"0".repeat(64)}},{"name":"C","dtype":"f16","shape":[1,4],"layout":"row_major","alignment":16,"access":"write"}],"kernels":[{"name":"test","module":{"file":"k.cubin","sha256":"0".repeat(64)},"source":{"file":"k.cu","sha256":"0".repeat(64)},"host_abi":{"file":"host.txt","sha256":"0".repeat(64)},"symbol":"kernel","grid":[1,1,1],"block":[128,1,1],"shared_memory_bytes":0,"cooperative":false,"args":[{"kind":"buffer","name":"A"},{"kind":"buffer","name":"C"},{"kind":"i32","value":1}]}],"validation":{"output":"C","reference":{"file":"ref.bin","sha256":"0".repeat(64)},"relative_l2_tolerance":0.002,"zero_input":"A","repetitions":20}})).unwrap()
     }
     #[test]
     fn rejects_unsafe_launch_metadata() {

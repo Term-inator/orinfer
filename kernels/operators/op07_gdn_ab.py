@@ -16,7 +16,7 @@ N_AB = 96
 
 def _orin_jit(function):
     compiled = tilelang.jit(
-        out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"}
+        out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_120"}
     )(function)
 
     @wraps(function)

@@ -14,6 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 # Support direct script invocation before loading project modules.
 sys.path.insert(0, str(ROOT))
+from tools.build.target import ELF_MACHINE, TARGET  # noqa: E402
 from tools.model.package import execution_identity, install  # noqa: E402
 from tools.build.files import file_hash  # noqa: E402
 
@@ -153,15 +154,15 @@ def build(args):
     )
     binary = ROOT / "target/release/orinfer"
     elf = binary.read_bytes()[:20]
-    if elf[:4] != b"\x7fELF" or int.from_bytes(elf[18:20], "little") != 183:
-        raise ValueError("Binary must target Linux aarch64")
+    if elf[:4] != b"\x7fELF" or int.from_bytes(elf[18:20], "little") != ELF_MACHINE:
+        raise ValueError("Binary must target Linux x86_64")
     if command(str(binary), "--version") != f"orinfer {version}":
         raise ValueError("Binary version mismatch")
     if command("git", "rev-parse", "HEAD") != revision or command("git", "status", "--porcelain"):
         raise ValueError("Source changed during build")
     with tempfile.TemporaryDirectory(prefix="orinfer-release-") as temp:
         packages = execution_assets(args.operators, Path(temp) / "operator-cache", binary, tag)
-        bundle = Path(temp) / f"orinfer-{tag}-linux-aarch64"
+        bundle = Path(temp) / f"orinfer-{tag}-linux-{TARGET['host_arch']}"
         (bundle / "bin").mkdir(parents=True)
         shutil.copy2(binary, bundle / "bin/orinfer")
         for name in (

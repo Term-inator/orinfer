@@ -1,5 +1,6 @@
 """Offline owner-attention selection using the existing row computation."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import hashlib
 from pathlib import Path
 
@@ -56,6 +57,7 @@ def select(tuner, context, reference):
     from kernels.model.independent_rows import independent_rows
     from tools.model.qwen35.parallel import factory
     from tools.model.row_tuning import launch, ATTENTION_TARGET
+    from tools.operators.common import validate_kernel_resources
 
     qh, kvh = tuner.qh, tuner.kvh
     dimension = tuner.dimension
@@ -86,11 +88,14 @@ def select(tuner, context, reference):
             )
             compiled.append(
                 (
-                    tilelang.compile(
-                        fn,
-                        out_idx=[],
-                        execution_backend="nvrtc",
-                        target={"kind": "cuda", "arch": "sm_87"},
+                    validate_kernel_resources(
+                        tilelang.compile(
+                            fn,
+                            out_idx=[],
+                            execution_backend="nvrtc",
+                            target=CUDA_TARGET,
+                            pass_configs=COMPILER_PASSES,
+                        )
                     ),
                     names,
                 )

@@ -33,9 +33,9 @@ pub(crate) fn validate_library(image: &[u8]) -> Result<()> {
         || image[4] != 2
         || image[5] != 1
         || u16::from_le_bytes([image[16], image[17]]) != 3
-        || u16::from_le_bytes([image[18], image[19]]) != 183
+        || u16::from_le_bytes([image[18], image[19]]) != orinfer_model_sdk::target::ELF_MACHINE
     {
-        return Err("Model library must be an aarch64 ELF shared object".into());
+        return Err("Model library must be an x86_64 ELF shared object".into());
     }
     Ok(())
 }
@@ -166,7 +166,7 @@ impl ModelPackage {
         let description = model.describe()?;
         if description.package != spec.package
             || description.version != spec.version
-            || description.target != "sm_87"
+            || description.target != orinfer_model_sdk::target::CUDA_ARCH
             || description.runtime_abi != abi::RUNTIME_ABI
             || !description.architectures.contains(&request.architecture)
             || !description
@@ -793,7 +793,7 @@ impl Drop for ModelPackage {
     }
 }
 
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     fn fixture() -> (std::path::PathBuf, ExecutionLibrary, CreateRequest) {
@@ -832,7 +832,7 @@ mod tests {
             package: "test-model".into(),
             version: "1".into(),
         };
-        let metadata=serde_json::from_value(serde_json::json!({"schema_version":2,"target":"sm_87","model":"fixture",
+        let metadata=serde_json::from_value(serde_json::json!({"schema_version":2,"target":"sm_120","model":"fixture",
             "chunk_tokens":1,"max_context":8,"vocab":4,"toolchain":{},"buffers":[],"reset_buffers":[],
             "input":"Input","token":"Token","status":"Status","logits":"Logits","position":"Position",
             "weight_bytes":0,"weight_parameters":1,"weight_scope":"fixture"})).unwrap();
@@ -1113,14 +1113,14 @@ mod tests {
 #[cfg(test)]
 mod portable_tests {
     #[test]
-    fn non_aarch64_execution_library_is_rejected_before_loading() {
+    fn non_x86_64_execution_library_is_rejected_before_loading() {
         let mut image = [0u8; 20];
         image[..6].copy_from_slice(b"\x7fELF\x02\x01");
         image[16..18].copy_from_slice(&3u16.to_le_bytes());
-        image[18..20].copy_from_slice(&62u16.to_le_bytes());
+        image[18..20].copy_from_slice(&183u16.to_le_bytes());
         let error = super::ModelPackage::open(std::path::Path::new("unused.so"), &image)
             .err()
             .unwrap();
-        assert!(error.contains("aarch64 ELF shared object"));
+        assert!(error.contains("x86_64 ELF shared object"));
     }
 }

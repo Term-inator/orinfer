@@ -1,4 +1,4 @@
-"""Small SM87 instruction helpers shared by exact BF16 decode kernels."""
+"""Small SM120 instruction helpers shared by exact BF16 decode kernels."""
 
 SOURCE = r"""
 #include <tl_templates/cuda/instruction/mma.h>

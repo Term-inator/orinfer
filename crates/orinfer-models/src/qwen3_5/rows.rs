@@ -15,7 +15,6 @@ use orinfer_model_sdk::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-const CAPACITY: usize = 4096;
 const LANES: usize = 128;
 // Appended after the layer state table; tools/model/qwen35/packet.py shares this order.
 const PACKET_COLUMNS: &[&str] = &[
@@ -197,6 +196,7 @@ fn validate_weights(
     embedding_q4: bool,
 ) -> Result<()> {
     let t = config.text();
+    let capacity = m.chunk_tokens;
     let map: BTreeMap<_, _> = m.buffers.iter().map(|b| (b.name.as_str(), b)).collect();
     let gdn = m.gdn_execution.as_ref();
     if !config.standard && gdn.is_none() {
@@ -234,22 +234,22 @@ fn validate_weights(
             (
                 "GdnChunkW",
                 Dtype::F16,
-                vec![t.linear_num_value_heads, CAPACITY, 128],
+                vec![t.linear_num_value_heads, capacity, 128],
             ),
             (
                 "GdnChunkU",
                 Dtype::F16,
-                vec![t.linear_num_value_heads, CAPACITY, 128],
+                vec![t.linear_num_value_heads, capacity, 128],
             ),
             (
                 "GdnChunkD",
                 Dtype::F16,
-                vec![t.linear_num_value_heads, CAPACITY, 32],
+                vec![t.linear_num_value_heads, capacity, 32],
             ),
             (
                 "GdnChunkG",
                 Dtype::F32,
-                vec![t.linear_num_value_heads, CAPACITY, 2],
+                vec![t.linear_num_value_heads, capacity, 2],
             ),
         ] {
             if map.get(name).is_none_or(|b| {
@@ -317,14 +317,14 @@ fn validate_weights(
             (
                 "MoeLow",
                 Dtype::I8,
-                CAPACITY * t.num_experts_per_tok * t.hidden_size.max(t.moe_intermediate_size) / 2,
+                capacity * t.num_experts_per_tok * t.hidden_size.max(t.moe_intermediate_size) / 2,
             ),
             (
                 "MoeHigh",
                 Dtype::I8,
-                CAPACITY * t.num_experts_per_tok * t.hidden_size.max(t.moe_intermediate_size) / 2,
+                capacity * t.num_experts_per_tok * t.hidden_size.max(t.moe_intermediate_size) / 2,
             ),
-            ("MoeSum", Dtype::I32, CAPACITY * t.num_experts_per_tok),
+            ("MoeSum", Dtype::I32, capacity * t.num_experts_per_tok),
         ] {
             if map.get(name).is_none_or(|b| {
                 b.dtype != dtype
@@ -346,7 +346,7 @@ fn validate_weights(
         if t.num_experts == 0 || !map.contains_key("MoeLow") {
             return Err("Expert partition requires routed E8P planes".into());
         }
-        let slots = CAPACITY * t.num_experts_per_tok;
+        let slots = capacity * t.num_experts_per_tok;
         let expert = map
             .get("MoeColdTileExpert")
             .ok_or("Missing cold expert tiles")?;
@@ -575,6 +575,10 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     {
         return Err("Unsupported Qwen row precision policy".into());
     }
+    let capacity = request.metadata.chunk_tokens;
+    if !(128..=4096).contains(&capacity) {
+        return Err("Qwen prefill capacity must be in 128..4096".into());
+    }
     let quant = &request.config["quantization_config"];
     let e8p = match quant["quant_method"].as_str() {
         Some("orinfer_q4_int8") => false,
@@ -659,11 +663,11 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                 || t.linear_conv_kernel_dim != 4
                 || (t.vocab_size,) != (248320,)))
         || request.prefill_profiles.len() != 1
-        || request.prefill_profiles[0].tokens != CAPACITY
+        || request.prefill_profiles[0].tokens != capacity
         || request.prefill_profiles[0].min_tokens != 1
         || request.prefill_profiles[0].kind != "qwen_q4_rows"
     {
-        return Err("Expected dense Qwen compact 1..4096 row contract".into());
+        return Err("Expected dense Qwen compact prefill capacity contract".into());
     }
     let m = &mut request.metadata;
     validate_weights(m, &c, e8p, embedding_q4)?;
@@ -774,7 +778,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     decode.extend(m.programs["head"].clone());
     m.programs.insert("decode".into(), decode);
     m.prefill_plans = vec![PrefillPlan {
-        chunk_tokens: CAPACITY,
+        chunk_tokens: capacity,
         min_tokens: 1,
         prefill_program: "prefill".into(),
         head_program: "head".into(),
@@ -794,12 +798,12 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     m.batch_layout = Some(BatchLayout {
         layers: t.layer_types.clone(),
         row_strides: strides,
-        profiles: BTreeMap::from([(CAPACITY, "qwen_q4_rows".into())]),
+        profiles: BTreeMap::from([(capacity, "qwen_q4_rows".into())]),
         hidden: t.hidden_size,
         small_mixed_shapes: vec![],
-        segment_tokens: CAPACITY,
+        segment_tokens: capacity,
         state_columns,
-        preparation_programs: BTreeMap::from([(1, "decode".into()), (CAPACITY, "prefill".into())]),
+        preparation_programs: BTreeMap::from([(1, "decode".into()), (capacity, "prefill".into())]),
     });
     {
         let columns = &m.batch_layout.as_ref().unwrap().state_columns;
@@ -949,7 +953,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         capacity: m
             .vision
             .as_ref()
-            .map_or(CAPACITY, |v| CAPACITY.max(v.max_patches))
+            .map_or(capacity, |v| capacity.max(v.max_patches))
             .max(m.audio.as_ref().map_or(0, |a| a.max_features)),
         programs: programs.clone(),
         program_capacities: programs
@@ -960,7 +964,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                     match p.as_str() {
                         "audio_stem" => m.audio.as_ref().unwrap().stem_chunks,
                         "audio_encoder" => m.audio.as_ref().unwrap().max_features,
-                        "vision" => m.vision.as_ref().map_or(CAPACITY, |v| v.max_patches),
+                        "vision" => m.vision.as_ref().map_or(capacity, |v| v.max_patches),
                         "decode"
                         | "mtp_draft"
                         | "mtp_head"
@@ -977,7 +981,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                         name if name.starts_with("qwen_rows/verify/") => 8,
                         "qwen_rows/head" => head_capacity(m),
                         "qwen_rows/commit" => LANES,
-                        _ => CAPACITY,
+                        _ => capacity,
                     },
                 )
             })
@@ -1010,7 +1014,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         .ok_or("Missing Qwen dynamic rows")?;
     for kernel in &request.kernel_contracts {
         let Some((slot, mut choice)) =
-            orinfer_model_sdk::operators::rows::specialization(&kernel.name, CAPACITY)?
+            orinfer_model_sdk::operators::rows::specialization(&kernel.name, capacity)?
         else {
             continue;
         };
@@ -1035,7 +1039,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             "prefill".to_owned(),
             KvGrowth {
                 position: m.position.clone(),
-                tokens: CAPACITY,
+                tokens: capacity,
                 length: Some("SegmentLength".into()),
                 buffers: kv
                     .buffers
@@ -2062,7 +2066,7 @@ mod tests {
         serde_json::from_value(json!({"config":config,"expected_signature":signature,
             "architecture":"qwen3_5","compute_policy":"int8_quality",
             "prefill_profiles":[{"tokens":4096,"min_tokens":1,"kind":"qwen_q4_rows"}],
-            "metadata":{"gdn_execution":{"prefill":"sequential","decode":{"kind":"dense"}},"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":4096,"max_context":262144,
+            "metadata":{"gdn_execution":{"prefill":"sequential","decode":{"kind":"dense"}},"schema_version":2,"target":"sm_120","model":"test","chunk_tokens":4096,"max_context":262144,
                 "vocab":248320,"toolchain":{},"buffers":buffers,"reset_buffers":["Step"],"input":"Input","token":"Token",
                 "status":"TokenStatus","logits":"Logits","position":"Step","weight_bytes":0,"weight_parameters":0,"weight_scope":"test",
                 "batch_layout":{"layers":[],"row_strides":{},"profiles":{},"hidden":h,"state_columns":STATE_COLUMNS},
@@ -2751,5 +2755,48 @@ mod tests {
         let mut wrong = request();
         wrong.config["quantization_config"]["rotation"] = json!("none");
         assert!(create(wrong, Policy::Int8Quality).is_err());
+    }
+    #[test]
+    fn declared_prefill_capacity_controls_plans_and_packet_admission() {
+        let mut request = request();
+        request.metadata.chunk_tokens = 128;
+        request.prefill_profiles[0].tokens = 128;
+        for buffer in &mut request.metadata.buffers {
+            for dimension in &mut buffer.shape {
+                if *dimension == 4096 {
+                    *dimension = 128;
+                }
+            }
+        }
+        for launch in request.metadata.dynamic_batch_kernels.values_mut() {
+            if launch.capacity == 4096 {
+                launch.capacity = 128;
+            }
+        }
+        let (adapter, plan) = create(request, Policy::Int8Quality).unwrap();
+        assert_eq!(plan.metadata.chunk_tokens, 128);
+        assert_eq!(plan.metadata.row_execution.as_ref().unwrap().capacity, 128);
+        assert!(
+            adapter
+                .batch(
+                    &[BatchSegment {
+                        slot: 0,
+                        tokens: 128
+                    }],
+                    true
+                )
+                .is_ok()
+        );
+        assert!(
+            adapter
+                .batch(
+                    &[BatchSegment {
+                        slot: 0,
+                        tokens: 129
+                    }],
+                    true
+                )
+                .is_err()
+        );
     }
 }

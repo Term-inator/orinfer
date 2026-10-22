@@ -7,6 +7,7 @@ autotuner dependency enters the published Rust runtime.
 
 import json
 import math
+import time as clock
 from pathlib import Path
 
 from tools.build.files import atomic_json, source_hash
@@ -208,7 +209,7 @@ class ProjectionTuner:
         import tilelang
         import torch
         from tilelang.autotuner import AutoTuner
-        from tools.operators.common import SEED
+        from tools.operators.common import SEED, validate_kernel_resources
 
         if objective not in ("relative_geomean", "total_latency"):
             raise ValueError("Unknown dynamic tuning objective")
@@ -275,6 +276,7 @@ class ProjectionTuner:
         ]
         sources.extend((root / "kernels").rglob("*.py"))
         sources.extend((root / "tools/build").glob("*.py"))
+        sources.append(root / "configs/deployment-target.json")
         identity = dict(
             spec=spec,
             configs=configs,
@@ -288,7 +290,7 @@ class ProjectionTuner:
         )
         cached = record_path(self.cache, identity)
         key = cached.stem
-        passes = EXACT_PASSES if kind == "expert" else {}
+        passes = {**COMPILER_PASSES, **(EXACT_PASSES if kind == "expert" else {})}
         record = read_record(
             cached, identity, lambda r: r["config"] in configs and r["checked_rows"]
         )
@@ -298,7 +300,7 @@ class ProjectionTuner:
                 out_idx=[],
                 execution_backend="nvrtc",
                 target=TARGET,
-                pass_configs=passes,
+                pass_configs={**COMPILER_PASSES, **(passes or {})},
             )
         elif dynamic:
             candidates, legal, rejected = compile_candidates(
@@ -308,13 +310,18 @@ class ProjectionTuner:
                     out_idx=[],
                     execution_backend="nvrtc",
                     target=TARGET,
-                    pass_configs=passes,
+                    pass_configs={**COMPILER_PASSES, **(passes or {})},
                 ),
                 tolerate_failures=True,
             )
             invalid = set()
             timings = []
             for live in samples:
+                started = clock.monotonic()
+                print(
+                    f"TUNE {kind} {outputs}x{inputs} rows={live} candidates={len(candidates)}",
+                    flush=True,
+                )
                 supply, reset, check = self._inputs(spec, live, weights)
                 times = []
                 for index, candidate in enumerate(candidates):
@@ -350,6 +357,7 @@ class ProjectionTuner:
                     # than replaying the slowest fallback eight times per trial.
                     times.append(measure(run, budget_ms=1.0, max_repetitions=8))
                 timings.append(dict(rows=live, times_ms=times))
+                print(f"TUNED rows={live} seconds={clock.monotonic() - started:.3f}", flush=True)
             scores = candidate_scores(timings, invalid, objective)
             if len(invalid) == len(legal):
                 raise ValueError(f"All dynamic tile candidates failed numerical checks: {rejected}")
@@ -383,7 +391,7 @@ class ProjectionTuner:
             )
 
             def compile_candidate(**config):
-                return profile_stream(tuner._default_compile(**config))
+                return validate_kernel_resources(profile_stream(tuner._default_compile(**config)))
 
             tuner.jit_compile = compile_candidate
             result = tuner.run(warmup=3, rep=20, timeout=120)
@@ -415,7 +423,8 @@ class ProjectionTuner:
         candidates, rather than a hand-written batch threshold.
         """
         import tilelang
-        from tools.model.row_selection import choices, ranges
+        from tools.build.target import COMPILER_PASSES, CUDA_TARGET
+from tools.model.row_selection import choices, ranges
 
         if not kwargs.get("dynamic"):
             raise ValueError("Bounded choices require runtime row arguments")
@@ -444,6 +453,7 @@ class ProjectionTuner:
                     out_idx=[],
                     execution_backend="nvrtc",
                     target=TARGET,
+                    pass_configs=COMPILER_PASSES,
                 )
                 for live in record["checked_rows"]:
                     self._validate(kernel, spec, config, live, kwargs.get("weights"))

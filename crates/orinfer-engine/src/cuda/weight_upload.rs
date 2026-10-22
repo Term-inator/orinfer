@@ -507,7 +507,7 @@ mod gpu_tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires the serialized SM87 GPU"]
+    #[ignore = "requires the serialized SM120 GPU"]
     fn streamed_bytes_and_reader_error_cleanup() {
         let mut session = Session::new(super::super::Driver::load().unwrap());
         // SAFETY: This test owns all CUDA handles on this thread. Session owns

@@ -127,6 +127,7 @@ class BuildTests(unittest.TestCase):
             selections=[dict(min_rows=1, max_rows=7, implementation="1")],
         )
         builder = SimpleNamespace(
+            capacity=CAPACITY,
             lock=None,
             signs={6144: "Signs"},
             row_tuner=SimpleNamespace(rotation=lambda *a, **kw: selection),
@@ -175,6 +176,7 @@ class BuildTests(unittest.TestCase):
             buffers[name] = dict(dtype=dtype, shape=shape)
 
         builder = SimpleNamespace(
+            capacity=CAPACITY,
             weights=SimpleNamespace(buffers=buffers, fixed=fixed),
             h=2048,
             f=512,
@@ -321,6 +323,7 @@ class BuildTests(unittest.TestCase):
         )
         kernels = SimpleNamespace(**{name: quantize for name in names})
         builder = SimpleNamespace(
+            capacity=CAPACITY,
             weights=SimpleNamespace(combined=lambda name, weights: name),
             text=dict(num_experts=256, num_experts_per_tok=8),
             h=2048,
@@ -649,7 +652,7 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(
                 [(name, rows, dynamic) for name, rows, dynamic, _ in launches],
                 [("projection", CAPACITY, True)]
-                + [(f"projection/rows/{r}-{r}", r, False) for r in (1, 2, 3, 4, 8, 16, 32)]
+                + [(f"projection/rows/{r}-{r}", r, False) for r in (1,)]
                 + [("projection/rows/5-7", 128, True)],
             )
             output = "Out" if kind == "q4" else "Output"

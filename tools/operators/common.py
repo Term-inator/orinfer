@@ -12,7 +12,7 @@ from tools.build.files import file_hash, write_json as write_json
 import torch
 import tilelang
 
-from tools.build.target import COMPUTE_CAPABILITY, CUDA_TARGET
+from tools.build.target import COMPILER_PASSES, COMPUTE_CAPABILITY, CUDA_TARGET
 
 ROOT = Path(__file__).resolve().parents[2]
 SEED = 20261002
@@ -34,12 +34,12 @@ def orin_jit(function=None, *, pass_configs=None):
         out_idx=[],
         execution_backend="nvrtc",
         target=CUDA_TARGET,
-        pass_configs=pass_configs,
+        pass_configs={**COMPILER_PASSES, **(pass_configs or {})},
     )(function)
 
     @wraps(function)
     def build(*args, **kwargs):
-        kernel = compiled(*args, **kwargs)
+        kernel = validate_kernel_resources(compiled(*args, **kwargs))
         kernel.adapter.kernels = dict(kernel.adapter.kernels)
 
         def launch(*inputs, stream=None):
@@ -78,7 +78,26 @@ def error(actual, reference):
     }
 
 
+class KernelResourceError(ValueError):
+    """A compiled candidate exceeds the fixed deployment device's limits."""
+
+
+def validate_kernel_resources(kernel):
+    from tools.operators.abi import evaluate, parse_host
+
+    limit = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+    host = Path(kernel.adapter.lib_generator.pypath).read_text()
+    for launch in parse_host(host):
+        required = evaluate(launch["launch_expressions"]["sharedMemBytes"], {})
+        if required > limit:
+            raise KernelResourceError(
+                f"Kernel requires {required} shared bytes; device limit is {limit}"
+            )
+    return kernel
+
+
 def export_kernel(kernel, output):
+    validate_kernel_resources(kernel)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     (output / "kernel.cu").write_text(kernel.get_kernel_source())

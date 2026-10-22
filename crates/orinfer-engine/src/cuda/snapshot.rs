@@ -208,7 +208,11 @@ impl Executor {
                 sys::cuMemGetInfo_v2(&mut free, &mut total),
                 "snapshot memory",
             )?;
-            if bytes > free.saturating_sub(64 * 1024 * 1024) {
+            if bytes
+                > free
+                    .saturating_sub(self.cold_weight_reserve())
+                    .saturating_sub(64 * 1024 * 1024)
+            {
                 return Ok(None);
             }
             let status = sys::cuMemAlloc_v2(&mut address, bytes);
@@ -369,7 +373,11 @@ impl Executor {
                     "shared prefix memory",
                 )?;
             }
-            if bytes > free.saturating_sub(64 << 20) {
+            if bytes
+                > free
+                    .saturating_sub(self.cold_weight_reserve())
+                    .saturating_sub(64 << 20)
+            {
                 return Ok(None);
             }
             let reservation = super::virtual_memory::Reservation::reserve(&self.session, bytes, 1)?;

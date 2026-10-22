@@ -1,5 +1,6 @@
 """Shared host-ABI lowering and AOT emission for the native model builder."""
 
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 import copy
 import re
 
@@ -140,8 +141,8 @@ class Compiler:
                         fn,
                         out_idx=[],
                         execution_backend="nvrtc",
-                        target={"kind": "cuda", "arch": "sm_87"},
-                        pass_configs=passes,
+                        target=CUDA_TARGET,
+                        pass_configs={**COMPILER_PASSES, **(passes or {})},
                     )
                 folder = artifact or self.output / "aot" / key
                 if artifact is None:

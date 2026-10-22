@@ -5,6 +5,7 @@ arbitrary bare weights. Stateful/float/expert portfolios retain that certified
 contract; independent integer projections are constructed from typed operands.
 """
 
+from tools.build.target import COMPILER_PASSES
 import argparse
 import hashlib
 import json
@@ -118,7 +119,7 @@ def toolchain():
         torch=torch.__version__,
         cuda=torch.version.cuda,
         device=torch.cuda.get_device_name(),
-        capability=list(torch.cuda.get_device_capability()),
+        capability=".".join(map(str, torch.cuda.get_device_capability())),
     )
 
 
@@ -231,7 +232,7 @@ def rebuild(args):
                     out_idx=[],
                     execution_backend="nvrtc",
                     target=TARGET,
-                    pass_configs=EXACT_PASSES,
+                    pass_configs={**COMPILER_PASSES, **(EXACT_PASSES or {})},
                 )
                 for live in (1, 17, 512, 4096):
                     ProjectionTuner._validate(candidate, spec, config, live, actual)

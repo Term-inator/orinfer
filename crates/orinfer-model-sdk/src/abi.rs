@@ -648,7 +648,7 @@ mod tests {
             PackageInfo {
                 package: "fixture".into(),
                 version: "1".into(),
-                target: "sm_87".into(),
+                target: "sm_120".into(),
                 runtime_abi: RUNTIME_ABI,
                 architectures: vec!["fixture".into()],
                 compute_policies: vec!["fixture".into()],

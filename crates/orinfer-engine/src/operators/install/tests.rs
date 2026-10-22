@@ -7,7 +7,7 @@ fn fixture(root: &Path) -> PathBuf {
     fs::create_dir_all(package.join("lib")).unwrap();
     let mut library = vec![0; 20];
     library[..6].copy_from_slice(b"\x7fELF\x02\x01");
-    library[16..20].copy_from_slice(&[3, 0, 183, 0]);
+    library[16..20].copy_from_slice(&[3, 0, 62, 0]);
     fs::write(package.join("lib/model.so"), &library).unwrap();
     fs::write(package.join("kernel.cubin"), b"kernel").unwrap();
     let bundle = safetensors::serialize(
@@ -21,7 +21,7 @@ fn fixture(root: &Path) -> PathBuf {
     .unwrap();
     fs::write(package.join("assets.safetensors"), bundle).unwrap();
     let manifest = json!({
-        "schema_version":1, "runtime_abi":1, "target":"sm_87",
+        "schema_version":1, "runtime_abi":1, "target":"sm_120",
         "architecture":"test_family", "compute_policy":"test_policy",
         "config_signature":{}, "prefill_profiles":[], "buffer_contracts":[], "toolchain":{},
         "execution":{"abi_version":1, "package":"test-model", "version":"1",

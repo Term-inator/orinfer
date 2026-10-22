@@ -1,4 +1,4 @@
-"""SM87 last-row gather and zero-centered final RMSNorm.
+"""SM120 last-row gather and zero-centered final RMSNorm.
 
 Only B selected rows are read/normalized; no full-prompt norm intermediate.
 Outputs are caller-owned and immutable inputs make graph repetitions safe.

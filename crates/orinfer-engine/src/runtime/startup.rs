@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn common_profiles_and_smallest_fallback_keep_architecture_program_names() {
         let mut manifest: crate::model::Manifest = serde_json::from_value(json!({
-            "schema_version":1,"target":"sm_87","model":"unknown-family","chunk_tokens":4096,
+            "schema_version":1,"target":"sm_120","model":"unknown-family","chunk_tokens":4096,
             "max_context":262144,"vocab":32,"toolchain":{},"buffers":[],"reset_buffers":[],
             "input":"i","token":"t","status":"s","logits":"l","position":"p",
             "weight_bytes":0,"weight_parameters":1,"weight_scope":"test",

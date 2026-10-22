@@ -185,7 +185,7 @@ def main():
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     # Use the official Torch equations even when optional FLA/conv packages are
-    # installed. Their binary kernels may not support this Orin's SM87 target.
+    # installed. Their binary kernels may not support this Orin's SM120 target.
     config_raw = (a.checkpoint / "config.json").read_bytes()
     config_json = json.loads(config_raw)
     backend, full_type, text_type, class_prefix = (
