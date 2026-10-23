@@ -259,10 +259,7 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
     });
     m.row_execution.as_mut().unwrap().register_variants(
         &m.programs,
-        request
-            .kernel_contracts
-            .iter()
-            .map(|kernel| kernel.name.as_str()),
+        m.dynamic_batch_kernels.keys().map(String::as_str),
     )?;
     m.reranking.as_ref().unwrap().validate(&m)?;
     Ok((

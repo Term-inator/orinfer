@@ -118,3 +118,5 @@ python -m tools.bench.encoders --compare vllm-results.json native-results.json \
 默认每个 case 预热一次、测量五次，记录中位数时延、每秒完成项数、全部测量时延和完整响应。比较同时列出各 case 加速比、几何均值、整套工作量加速比及是否每项达到 2 倍；输出比较包含嵌入 cosine 或重排 top1 与概率误差。算子微测与某个 case 的结果各自说明，完整性能结论以相同配置和全部 workload 的真实结果为准。
 
 重排基线启动 vLLM 时使用 `--chat-template tools/bench/templates/qwen3_reranker.jinja`，保持 Qwen 官方 prefix/body/suffix 及末尾的两个换行。`check_kernels.py` 核对模板输出与原生前端参考的 token ID。比较工具要求两边报告实际输入 token 用量，并拒绝用量不一致的结果；模板、分词和截断策略在测量前保持一致。
+
+原生构建逐项比对最终 `plan-model` 的 `row_execution.variants` 与离线选中的行数变体，确认执行计划实际引用这些绑定。构建基准身份文件时，记录所用引擎文件的 SHA256、执行包 digest 和实际选择表数量。

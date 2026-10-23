@@ -272,6 +272,7 @@ class Builder(Projections):
             ),
         )
         subprocess.run([str(self.args.engine), "validate-model", str(self.root)], check=True)
+        self.validate_published_rows()
         write_json(
             self.args.output / "result.json",
             dict(

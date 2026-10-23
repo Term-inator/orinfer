@@ -10,6 +10,19 @@ from tools.model.tuning import compile_candidates, measure, read_record, record_
 
 
 class TuningTests(unittest.TestCase):
+    def test_native_publication_retains_the_measured_choices(self):
+        from tools.model.encoder import validate_row_choices
+
+        choice = "projection/rows/1-64"
+        # The binding can exist in a package while the registered row plan omits it.
+        plan = dict(kernels=[dict(name=choice)], row_execution={})
+        with self.assertRaisesRegex(ValueError, "lost measured row choices"):
+            validate_row_choices(plan, [choice])
+        plan["row_execution"]["variants"] = {"projection": [dict(kernels=[choice])]}
+        validate_row_choices(plan, [choice])
+        with self.assertRaisesRegex(ValueError, "lost measured row choices"):
+            validate_row_choices(plan, [])
+
     def test_encoder_subsets_remain_legal_for_short_and_large_packets(self):
         from tools.model.projection_policy import encoder_configs, e8p_q4_configs, w8_configs
 

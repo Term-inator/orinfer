@@ -80,6 +80,17 @@ def e8p_q4_configs(rows, *, direct=False):
             {"group_m": 1, "tail_m": 16},
         )
     ]
+    configs += [
+        dict(
+            algorithm="tensor_core",
+            block_m=m,
+            block_n=64,
+            block_k=128,
+            stages=1,
+            group_m=1,
+        )
+        for m in (32, 96, 192)
+    ]
     if direct:
         configs += [
             dict(algorithm="int4_direct", block_m=8, block_n=n, block_k=128, stages=2, split_k=s)
@@ -116,7 +127,17 @@ def encoder_configs(kind):
         ]
     if kind != "e8p_q4":
         raise ValueError("Unsupported encoder projection codec")
-    tiles = {(32, 64, 2), (64, 64, 2), (128, 64, 1), (128, 128, 1), (128, 128, 2), (256, 64, 1)}
+    tiles = {
+        (32, 64, 1),
+        (32, 64, 2),
+        (64, 64, 2),
+        (96, 64, 1),
+        (128, 64, 1),
+        (128, 128, 1),
+        (128, 128, 2),
+        (192, 64, 1),
+        (256, 64, 1),
+    }
     return [
         c
         for c in e8p_q4_configs(CAPACITY)

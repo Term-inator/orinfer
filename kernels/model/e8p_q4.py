@@ -176,7 +176,7 @@ def projection(
     if algorithm != "int4_direct" and split_k != 1:
         raise ValueError("K partition requires direct INT4")
     if algorithm == "tensor_core":
-        if block_m not in (8, 16, 32, 64, 128, 256) or block_n not in (32, 64, 128):
+        if block_m not in (8, 16, 32, 64, 96, 128, 192, 256) or block_n not in (32, 64, 128):
             raise ValueError("Invalid E8P-Q4 Tensor Core tile")
         if block_k <= 0 or block_k % 128 or K % block_k or stages not in (1, 2):
             raise ValueError("Invalid E8P-Q4 K tile or pipeline")

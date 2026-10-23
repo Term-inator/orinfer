@@ -5,8 +5,36 @@ from tools.model.compile import primitive
 from tools.model.projection_policy import encoder_configs
 
 
+def validate_row_choices(plan, expected):
+    actual = {
+        name
+        for choices in (plan.get("row_execution") or {}).get("variants", {}).values()
+        for choice in choices
+        for name in choice["kernels"]
+    }
+    if actual != set(expected):
+        raise ValueError(
+            "Native plan lost measured row choices; rebuild the model library and execution package"
+        )
+
+
 class Projections:
     norm_epsilon = 1e-5
+
+    def validate_published_rows(self):
+        import json
+        import subprocess
+
+        result = subprocess.run(
+            [str(self.args.engine), "plan-model", str(self.root)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        plan = json.loads(result.stdout)["manifest"]
+        selected = [k["name"] for k in self.aot.kernels if "/rows/" in k["name"]]
+        validate_row_choices(plan, selected)
+        write_json(self.args.output / "published-rows.json", plan["row_execution"])
 
     def emit(self, name, key, build, args, *, vision=False, divisor=1, dynamic=True):
         rows = (self.patches if vision else self.capacity) // divisor
@@ -112,7 +140,10 @@ class Projections:
                     weights=actual,
                     weight_identity=identity,
                     measure_rows=sorted(
-                        {min(capacity, rows) for rows in (32, 128, 512, 2048, 8192, capacity)}
+                        {
+                            min(capacity, rows)
+                            for rows in (32, 96, 128, 192, 512, 2048, 8192, capacity)
+                        }
                     ),
                     objective="total_latency",
                     output_stride=stride,
@@ -122,10 +153,20 @@ class Projections:
                 kernel, config = tuner.compile(kind, capacity, n, k, "float16", **options)
                 choices = []
                 if not vision:
+                    # Short packets cross tile-count boundaries between the coarse
+                    # fallback samples. Measure each aligned packet through 512
+                    # rows without changing the global fallback objective.
+                    local_options = dict(
+                        options,
+                        measure_rows=sorted(
+                            set(options["measure_rows"])
+                            | set(range(32, min(capacity, 512) + 1, 32))
+                        ),
+                    )
                     choices = [
                         (suffix, choice, compiled)
                         for suffix, choice, compiled in tuner.compile_choices(
-                            kind, capacity, n, k, "float16", **options
+                            kind, capacity, n, k, "float16", **local_options
                         )
                         if choice != config
                     ]
