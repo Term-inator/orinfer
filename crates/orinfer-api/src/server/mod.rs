@@ -61,7 +61,7 @@ struct Service {
 }
 struct Job {
     _slot: Arc<tokio::sync::OwnedSemaphorePermit>,
-    _memory: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    _memory: Option<Arc<preparation::Lease>>,
     limits: Limits,
     prepared: Prepared,
     events: mpsc::Sender<ModelEvent>,
@@ -336,7 +336,13 @@ async fn completions(
         }
     };
     let preparation::Ingress { slot, body } = admission;
-    let memory_mib = preparation::request_memory_mib(&request, state.context);
+    let estimate = preparation::request_memory(
+        &request,
+        state.context,
+        state.vision.as_ref(),
+        state.limits.memory_mib,
+    );
+    let memory_mib = estimate.mib;
     if memory_mib as usize > state.limits.memory_mib {
         return error(
             StatusCode::BAD_REQUEST,
@@ -369,7 +375,7 @@ async fn completions(
         // Admission and memory belong to actual work, including after handler cancellation.
         let _cpu = cpu;
         let _body = body;
-        let mut preparation = preparation::Context::new(flag, memory_mib as usize * 1024 * 1024);
+        let mut preparation = estimate.context(flag);
         preparation.checkpoint(0)?;
         let prepared =
             codec.prepare(request, &model, context, vision.as_ref(), &mut preparation)?;
@@ -377,7 +383,7 @@ async fn completions(
         if !prepared.audios.is_empty() || !prepared.images.is_empty() {
             preparation.release_media_scratch(&mut memory);
         }
-        Ok::<_, String>((prepared, slot, memory))
+        Ok::<_, String>((prepared, slot, preparation.lease(memory)))
     })
     .await
     {
@@ -449,10 +455,7 @@ async fn completions(
         error(StatusCode::INTERNAL_SERVER_ERROR, "GPU worker disconnected")
     }
 }
-fn retain_output_memory(
-    response: Response,
-    memory: Arc<tokio::sync::OwnedSemaphorePermit>,
-) -> Response {
+fn retain_output_memory(response: Response, memory: Arc<preparation::Lease>) -> Response {
     let (parts, body) = response.into_parts();
     let stream = futures_util::stream::unfold(
         (body.into_data_stream(), memory),
@@ -517,7 +520,8 @@ mod stream_tests {
     async fn output_memory_is_held_until_http_body_finishes_or_is_dropped() {
         for consume in [false, true] {
             let permits = Arc::new(tokio::sync::Semaphore::new(1));
-            let memory = Arc::new(Arc::clone(&permits).try_acquire_owned().unwrap());
+            let context = preparation::Context::new(Arc::new(AtomicBool::new(false)), 1 << 20);
+            let memory = Arc::new(context.lease(Arc::clone(&permits).try_acquire_owned().unwrap()));
             let response = retain_output_memory(Json(json!({"ok":true})).into_response(), memory);
             assert_eq!(permits.available_permits(), 0);
             if consume {

@@ -603,7 +603,7 @@ pub(super) fn worker(
                     }
                 }
                 let job = &waiting[i];
-                let input = GenerationInput {
+                let mut input = GenerationInput {
                     input_tokens: job.prepared.input.clone(),
                     images: job.prepared.images.clone(),
                     audios: job.prepared.audios.clone(),
@@ -617,12 +617,19 @@ pub(super) fn worker(
                         if memory_guard.as_ref() == Some(&job.id) {
                             memory_guard = None;
                         }
+                        // Admission probes may inspect a copy, then transfer the original
+                        // pixels to encoding. The queued job need not retain another bank.
+                        input.images = std::mem::take(&mut job.prepared.images);
+                        let has_images = !input.images.is_empty();
                         let text_only = input.images.is_empty() && input.audios.is_empty();
                         let prompt_tokens = input.input_tokens.len();
                         match model.start_request(input, || {
                             job.events.is_closed() || shutdown.load(Ordering::Relaxed)
                         }) {
                             Ok(mut request) => {
+                                if has_images && let Some(memory) = &job._memory {
+                                    memory.release_images();
+                                }
                                 if let Some(shared) = job.shared_prefix {
                                     request.retain_shared_prefixes_only(shared >= prompt_tokens);
                                 }

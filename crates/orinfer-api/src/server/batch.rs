@@ -111,7 +111,7 @@ struct Completed {
     value: Value,
     bytes: usize,
     // Keep preprocessing/output memory charged until the journal accepts it.
-    _memory: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    _memory: Option<Arc<preparation::Lease>>,
 }
 fn failure(id: &str, code: &str, message: String) -> Value {
     json!({"id":format!("batch-{id}"),"custom_id":id,"response":null,
@@ -141,17 +141,20 @@ async fn submit(
     let mut memory = None;
     let result = async {
         let request = request(record.body?, &state.model, defaults)?;
-        let memory_mib = preparation::request_memory_mib(&request, state.context);
+        let estimate = preparation::request_memory(
+            &request,
+            state.context,
+            state.vision.as_ref(),
+            state.limits.memory_mib,
+        );
+        let memory_mib = estimate.mib;
         if memory_mib as usize > state.limits.memory_mib {
             return Err("Request exceeds preprocessing memory budget".into());
         }
-        let reserved = Arc::new(
-            Arc::clone(&state.preparation.memory)
-                .acquire_many_owned(memory_mib)
-                .await
-                .map_err(|e| e.to_string())?,
-        );
-        memory = Some(Arc::clone(&reserved));
+        let reserved = Arc::clone(&state.preparation.memory)
+            .acquire_many_owned(memory_mib)
+            .await
+            .map_err(|e| e.to_string())?;
         let cpu = Arc::clone(&state.preparation.workers)
             .acquire_owned()
             .await
@@ -170,9 +173,8 @@ async fn submit(
         let flag = cancellation.flag();
         let prefix_hint = record.prefix_hint;
         let prepared = tokio::task::spawn_blocking(move || {
-            let (_cpu, memory) = (cpu, reserved);
-            let mut context_budget =
-                preparation::Context::new(flag, memory_mib as usize * 1024 * 1024);
+            let (_cpu, mut memory) = (cpu, reserved);
+            let mut context_budget = estimate.context(flag);
             let mut prepared = codec.prepare(
                 request,
                 &model,
@@ -189,11 +191,16 @@ async fn submit(
                 prepared.prefix_hints.dedup();
             }
             context_budget.checkpoint(0)?;
-            Ok::<_, String>((prepared, slot, memory))
+            if !prepared.images.is_empty() || !prepared.audios.is_empty() {
+                context_budget.release_media_scratch(&mut memory);
+            }
+            Ok::<_, String>((prepared, slot, Arc::new(context_budget.lease(memory))))
         })
         .await
         .map_err(|e| e.to_string())??;
-        let (prepared, slot, memory) = prepared;
+        let (prepared, slot, reserved) = prepared;
+        memory = Some(Arc::clone(&reserved));
+        let memory = reserved;
         if !state.activity.lifecycle.is_ready() {
             return Err("GPU worker unavailable".into());
         }

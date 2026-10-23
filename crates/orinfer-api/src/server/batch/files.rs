@@ -311,7 +311,7 @@ impl Journal {
 
 struct WriteEntry {
     bytes: Vec<u8>,
-    _memory: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    _memory: Option<Arc<crate::server::preparation::Lease>>,
 }
 /// One ordered writer overlaps serialization/durable I/O with further requests.
 /// Its bounded queue retains each response's memory charge until the write.

@@ -277,3 +277,5 @@ HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU
 `run-model MODEL_DIR REQUESTS.json` 接收 token-ID 请求，用于固定块、普通 decode 的诊断基准，逐请求重置状态。输入长度须能由声明的 prefill 计划整除；该入口用于固定长度执行诊断；任意长度、多请求、MTP 和缓存生成通过 Chat API 或 Rust `Model::generate` 验收。
 
 `score-model` 对冻结 token 历史评分，服务的固定场景检查见[API 验证](../tools/api/README.md)，BF16/FP8 质量对照见[质量评测](../tools/eval/README.md)。
+
+多图请求的预处理预算按模型声明的 patch、时间帧与总特征容量预留累计 FP32 图片张量及 worker 待交接副本，仍受 `--preprocess-memory-mib` 的共享上限约束。解码和两阶段缩放完成后立即释放源图与中间图；准备结束后归还未使用的预留，仅保留正文、实际图片张量和交接副本的计费。图片编码写入请求私有特征后，释放 CPU 像素及其预算，HTTP 正文和概率输出仍保持计费。超出请求预算的错误包含所需、预留及已准备媒体的 MiB 数。

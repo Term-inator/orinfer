@@ -159,6 +159,8 @@ pub fn preprocess(
         height as u32,
         FilterType::CatmullRom,
     );
+    drop(horizontal);
+    drop(decoded);
     let (gh, gw) = (height / v.patch_size, width / v.patch_size);
     let mut pixels = Vec::with_capacity(gh * gw * v.patch_values()?);
     // Merge blocks are contiguous. Channels precede duplicated temporal planes,
@@ -184,6 +186,7 @@ pub fn preprocess(
             }
         }
     }
+    drop(rgb);
     preparation.retain(pixels.len() * std::mem::size_of::<f32>())?;
     let input = ImageInput {
         grid_height: gh,
@@ -286,6 +289,51 @@ mod tests {
             );
             assert!(relative < 0.02 && maximum < 0.05);
         }
+    }
+    #[test]
+    #[ignore = "Allocates a real 576 MiB multi-image request; run with sufficient host RAM"]
+    fn many_images_share_the_configured_preprocessing_pool() {
+        let spec: VisionSpec = serde_json::from_value(json!({"hidden":5120,"patch_size":16,
+            "temporal_patch_size":2,"merge_size":2,"max_patches":32768,"max_features":32768,
+            "pixels":"p","grid":"g","length":"l","output":"o","features":"f","feature_index":"i",
+            "mrope_positions":"r","plans":[{"patches":32768,"program":"v"}],"image_token_id":10,
+            "vision_start_token_id":11,"vision_end_token_id":12}))
+        .unwrap();
+        let image = image::RgbImage::from_pixel(2048, 1024, image::Rgb([32, 128, 224]));
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let url = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(encoded.get_ref())
+        );
+        let request: super::super::ChatRequest = serde_json::from_value(json!({"model":"test","messages":[
+            {"role":"user","content":(0..12).map(|_|json!({"type":"image_url","image_url":{"url":url}})).collect::<Vec<_>>()}]})).unwrap();
+        let estimate =
+            crate::server::preparation::request_memory(&request, 262144, Some(&spec), 2048);
+        let mut context = estimate.context(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let (_, images) = messages(request.messages, Some(&spec), &mut context).unwrap();
+        assert_eq!(images.len(), 12);
+        assert_eq!(
+            images.iter().map(|i| i.pixels.len() * 4).sum::<usize>(),
+            576 << 20
+        );
+        assert_eq!(
+            images
+                .iter()
+                .map(|i| spec.feature_count(i).unwrap())
+                .sum::<usize>(),
+            24576
+        );
+        assert!(
+            images
+                .iter()
+                .all(|i| i.pixels.iter().all(|p| p.is_finite()))
+        );
+        context.checkpoint(0).unwrap();
     }
     #[test]
     fn patch_order_temporal_duplication_and_image_parts() {

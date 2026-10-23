@@ -31,6 +31,7 @@ pub(super) struct Context {
     cancelled: Arc<AtomicBool>,
     budget: usize,
     retained: usize,
+    base: Option<usize>,
 }
 impl Context {
     pub fn new(cancelled: Arc<AtomicBool>, budget: usize) -> Self {
@@ -38,6 +39,7 @@ impl Context {
             cancelled,
             budget,
             retained: 0,
+            base: None,
         }
     }
     #[cfg(test)]
@@ -48,19 +50,32 @@ impl Context {
         if self.cancelled.load(Ordering::Acquire) {
             return Err("Request cancelled during preprocessing".into());
         }
-        if self
+        let retained = self
             .retained
-            .checked_add(temporary)
-            .is_none_or(|n| n > self.budget)
-        {
-            return Err("Request preprocessing memory budget exceeded".into());
+            .checked_mul(if self.base.is_some() { 2 } else { 1 });
+        let required = retained
+            .and_then(|n| n.checked_add(self.base.unwrap_or(0)))
+            .and_then(|n| n.checked_add(temporary));
+        if required.is_none_or(|n| n > self.budget) {
+            return Err(format!(
+                "Request preprocessing memory budget exceeded (required {} MiB, reserved {} MiB; prepared media {} MiB)",
+                required.unwrap_or(usize::MAX).div_ceil(1 << 20),
+                self.budget / (1 << 20),
+                self.retained.div_ceil(1 << 20)
+            ));
         }
         Ok(())
     }
     pub fn retain(&mut self, bytes: usize) -> Result<()> {
-        self.checkpoint(bytes)?;
+        self.checkpoint(bytes.saturating_mul(if self.base.is_some() { 2 } else { 1 }))?;
         self.retained += bytes;
         Ok(())
+    }
+    pub fn lease(&self, permit: tokio::sync::OwnedSemaphorePermit) -> Lease {
+        Lease {
+            permit: std::sync::Mutex::new(permit),
+            base_mib: self.base.unwrap_or(self.budget).div_ceil(1 << 20),
+        }
     }
     pub fn release_media_scratch(&self, permit: &mut tokio::sync::OwnedSemaphorePermit) {
         // Prepared media and the worker's pending copy stay charged. Decoded
@@ -70,10 +85,93 @@ impl Context {
             .saturating_mul(2)
             .div_ceil(1 << 20)
             .saturating_add(16);
-        let release = 512usize.saturating_sub(live_mib).min(permit.num_permits());
+        let base_mib = self
+            .base
+            .unwrap_or_else(|| self.budget.saturating_sub(512 << 20))
+            .div_ceil(1 << 20);
+        let release = permit
+            .num_permits()
+            .saturating_sub(base_mib.saturating_add(live_mib));
         drop(permit.split(release));
     }
 }
+/// Shared by the GPU job and HTTP delivery, with independently releasable media.
+pub(super) struct Lease {
+    permit: std::sync::Mutex<tokio::sync::OwnedSemaphorePermit>,
+    base_mib: usize,
+}
+impl Lease {
+    pub fn release_images(&self) {
+        let mut permit = self.permit.lock().unwrap_or_else(|e| e.into_inner());
+        let release = permit.num_permits().saturating_sub(self.base_mib);
+        drop(permit.split(release));
+    }
+}
+
+/// Reserve the shared pool for aggregate image tensors as well as decoder scratch.
+/// The configured ceiling bounds each request; actual retained bytes release
+/// unused reservation as soon as blocking preparation finishes.
+#[derive(Clone, Copy)]
+pub(super) struct Memory {
+    pub mib: u32,
+    base_mib: usize,
+}
+impl Memory {
+    pub fn context(self, cancelled: Arc<AtomicBool>) -> Context {
+        let mut context = Context::new(cancelled, self.mib as usize * (1 << 20));
+        context.base = Some(self.base_mib * (1 << 20));
+        context
+    }
+}
+pub(super) fn request_memory(
+    request: &ChatRequest,
+    context: usize,
+    vision: Option<&orinfer_engine::vision::VisionSpec>,
+    limit_mib: usize,
+) -> Memory {
+    let minimum = request_memory_mib(request, context) as usize;
+    let images = request
+        .messages
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .filter(|part| part["type"] == "image_url")
+        .count();
+    let media = request
+        .messages
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .any(|part| {
+            matches!(
+                part["type"].as_str(),
+                Some("image_url" | "input_audio" | "audio")
+            )
+        });
+    let extra = vision.filter(|_| images > 1).map_or(0, |v| {
+        let patches = images.saturating_mul(v.max_patches).min(
+            v.max_features
+                .saturating_mul(v.merge_size)
+                .saturating_mul(v.merge_size),
+        );
+        patches
+            .saturating_mul(v.patch_size)
+            .saturating_mul(v.patch_size)
+            .saturating_mul(v.temporal_patch_size)
+            .saturating_mul(3 * 4 * 2)
+            .div_ceil(1 << 20)
+    });
+    let mib = if minimum > limit_mib {
+        minimum
+    } else {
+        minimum.saturating_add(extra).min(limit_mib)
+    };
+    Memory {
+        mib: u32::try_from(mib).unwrap_or(u32::MAX),
+        base_mib: minimum.saturating_sub(if media { 512 } else { 0 }),
+    }
+}
+
 pub(super) fn request_memory_mib(request: &ChatRequest, context: usize) -> u32 {
     let bytes = serde_json::to_vec(&request.messages)
         .map(|v| v.len())
@@ -135,6 +233,89 @@ mod tests {
         assert_eq!(pool.available_permits(), 1024 - permit.num_permits());
         drop(permit);
         assert_eq!(pool.available_permits(), 1024);
+    }
+    fn vision() -> orinfer_engine::vision::VisionSpec {
+        serde_json::from_value(
+            json!({"hidden":5120,"patch_size":16,"temporal_patch_size":2,
+            "merge_size":2,"max_patches":32768,"max_features":32768,"pixels":"p","grid":"g",
+            "length":"l","output":"o","features":"f","feature_index":"i","mrope_positions":"r",
+            "plans":[{"patches":32768,"program":"vision"}],"image_token_id":10,
+            "vision_start_token_id":11,"vision_end_token_id":12}),
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn many_images_use_aggregate_bounded_memory_and_return_decoder_scratch() {
+        let request: ChatRequest = serde_json::from_value(json!({"model":"test",
+            "messages":[{"role":"user","content":(0..12).map(|_|json!({"type":"image_url",
+                "image_url":{"url":"https://example.com/image.png"}})).collect::<Vec<_>>()}]}))
+        .unwrap();
+        let estimate = request_memory(&request, 262144, Some(&vision()), 2048);
+        assert_eq!(estimate.mib, 2048);
+        let mut old = Context::new(
+            Arc::new(AtomicBool::new(false)),
+            request_memory_mib(&request, 262144) as usize * (1 << 20),
+        );
+        assert!(old.retain(576 << 20).is_err());
+        let pool = Arc::new(tokio::sync::Semaphore::new(2048));
+        let mut permit = Arc::clone(&pool)
+            .acquire_many_owned(estimate.mib)
+            .await
+            .unwrap();
+        let mut context = estimate.context(Arc::new(AtomicBool::new(false)));
+        for _ in 0..12 {
+            context.checkpoint(80 << 20).unwrap();
+            context.retain(48 << 20).unwrap();
+        }
+        context.release_media_scratch(&mut permit);
+        assert_eq!(permit.num_permits(), estimate.base_mib + 2 * 576 + 16);
+        assert_eq!(pool.available_permits(), 2048 - permit.num_permits());
+        assert!(Arc::clone(&pool).try_acquire_many_owned(512).is_ok());
+        assert!(context.checkpoint(1024 << 20).is_err());
+        drop(permit);
+        assert_eq!(pool.available_permits(), 2048);
+        let limited = request_memory(&request, 262144, Some(&vision()), 1024);
+        assert_eq!(limited.mib, 1024);
+        let mut context = limited.context(Arc::new(AtomicBool::new(false)));
+        assert!(
+            context
+                .retain(576 << 20)
+                .unwrap_err()
+                .contains("reserved 1024 MiB")
+        );
+    }
+    #[tokio::test]
+    async fn encoded_images_return_budget_while_http_delivery_keeps_its_baseline() {
+        let pool = Arc::new(tokio::sync::Semaphore::new(2048));
+        let permit = Arc::clone(&pool).acquire_many_owned(1200).await.unwrap();
+        let mut context = Context::new(Arc::new(AtomicBool::new(false)), 1200 << 20);
+        context.base = Some(8 << 20);
+        let worker = Arc::new(context.lease(permit));
+        let response = Arc::clone(&worker);
+        worker.release_images();
+        assert_eq!(pool.available_permits(), 2048 - 8);
+        worker.release_images();
+        assert_eq!(pool.available_permits(), 2048 - 8);
+        drop(worker);
+        assert_eq!(pool.available_permits(), 2048 - 8);
+        drop(response);
+        assert_eq!(pool.available_permits(), 2048);
+    }
+    #[test]
+    fn single_image_and_text_admission_keep_their_original_bounds() {
+        let mut request: ChatRequest = serde_json::from_value(json!({"model":"test","messages":[
+            {"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}]})).unwrap();
+        assert_eq!(
+            request_memory(&request, 1024, Some(&vision()), 2048).mib,
+            request_memory_mib(&request, 1024)
+        );
+        request.messages = vec![json!({"role":"user","content":"hello"})];
+        assert_eq!(
+            request_memory(&request, 1024, Some(&vision()), 2048).mib,
+            request_memory_mib(&request, 1024)
+        );
+        request.messages = vec![json!({"role":"user","content":"large text".repeat(1024*1024)})];
+        assert!(request_memory(&request, 1024, Some(&vision()), 16).mib > 16);
     }
     #[test]
     fn probability_budget_counts_completion_limit_and_streaming_retention() {
