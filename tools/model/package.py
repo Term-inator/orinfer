@@ -99,6 +99,10 @@ def verify_execution(package, directory):
 
 
 def config_signature(config):
+    if config.get("model_type") == "mistral3":
+        from tools.model.nemotron_embed.config import signature
+
+        return signature(config)
     text = config.get("text_config", config)
     family = "qwen3_asr" if config.get("model_type") == "qwen3_asr" else "qwen3_5"
     return {
@@ -200,10 +204,12 @@ def pin_assets(directory):
     directory = directory.resolve(strict=True)
     path = directory / "cache/model.json"
     descriptor = json.loads(path.read_text())
-    identities = {
-        name: file_hash(source_path(directory, name))
-        for name in ("tokenizer.json", "chat_template.jinja", "generation_config.json")
-    }
+    names = (
+        ("tokenizer.json", "tokenizer_config.json", "processor_config.json", "chat_template.jinja")
+        if descriptor["metadata"].get("embedding")
+        else ("tokenizer.json", "chat_template.jinja", "generation_config.json")
+    )
+    identities = {name: file_hash(source_path(directory, name)) for name in names}
     descriptor["frontend_assets"] = identities
     fd, temporary = tempfile.mkstemp(prefix=".model-", suffix=".json", dir=path.parent)
     try:

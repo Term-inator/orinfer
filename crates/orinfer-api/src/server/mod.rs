@@ -8,7 +8,7 @@ mod image;
 mod lifecycle;
 mod output;
 mod preparation;
-mod startup;
+pub(crate) mod startup;
 mod thinking;
 
 use axum::{
@@ -91,6 +91,13 @@ fn stream_payload(event: Option<ModelEvent>) -> (String, bool) {
 
 pub fn run(settings: Settings) -> Result<()> {
     settings.validate()?;
+    let descriptor: Value = serde_json::from_slice(
+        &std::fs::read(settings.model_dir.join("cache/model.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    if !descriptor["metadata"]["embedding"].is_null() {
+        return crate::embeddings::serve(settings);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

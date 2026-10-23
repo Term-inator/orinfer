@@ -23,6 +23,7 @@ class Aot:
             ROOT / "kernels",
             ROOT / "tools/model/qwen35",
             ROOT / "tools/model/qwen_asr",
+            ROOT / "tools/model/nemotron_embed",
             ROOT / "tools/build",
         ]:
             for file in sorted(directory.rglob("*.py")):

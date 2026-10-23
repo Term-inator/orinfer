@@ -82,6 +82,9 @@ impl ModelRuntime {
                 crate::execution::ResidentExperts::Full
             ),
         )?;
+        if prepared.plan.embedding.is_some() {
+            return Err("This model provides embeddings; use embed-model or /v1/embeddings".into());
+        }
         let request_hidden_ring = prepared
             .plan
             .mtp

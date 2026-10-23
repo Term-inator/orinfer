@@ -108,6 +108,8 @@ enum Command {
     ValidateModel { model_dir: PathBuf },
     /// Run requests through the native model package.
     RunModel(ModelArgs),
+    /// Compute normalized text or image document embeddings with a native package.
+    EmbedModel(ModelArgs),
     /// Score frozen token histories through real prefill/decode kernels.
     ScoreModel(ModelArgs),
     /// Start the model service; an optional directory serves one model directly.
@@ -580,6 +582,16 @@ fn execute(command: Command, data_dir: &std::path::Path) -> Result<(), String> {
         Command::ValidateModel { model_dir } => {
             print_json(orinfer_engine::model::validate_model(&model_dir)?)
         }
+        Command::EmbedModel(args) => print_json(orinfer_api::embeddings::run_model(
+            &args.model_dir,
+            &args.requests,
+            LoadOptions {
+                cuda_graph: args.load.cuda_graph,
+                verify_weights: args.load.verify_weights,
+                load_workers: args.load.load_workers,
+                ..Default::default()
+            },
+        )?),
         Command::RunModel(args) => print_json(orinfer_engine::model::run_with_options(
             &args.model_dir,
             &args.requests,

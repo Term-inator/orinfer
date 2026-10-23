@@ -27,6 +27,10 @@ from tools.build.gpu import gpu_lock
 
 
 def rotated_w8_layers(config):
+    if config["model_type"] == "mistral3":
+        from tools.model.nemotron_embed.config import ROTATED_W8_LAYERS
+
+        return list(ROTATED_W8_LAYERS)
     if config["model_type"] != "qwen3_asr":
         return []
     contract = json.loads(
@@ -53,15 +57,29 @@ def policy(name, info, *, protected_layers=()):
     ):
         return "original"
     if name.startswith("mtp.") or name.endswith(
-        ("linear_attn.out_proj.weight", "self_attn.o_proj.weight")
+        (
+            "linear_attn.out_proj.weight",
+            "self_attn.o_proj.weight",
+            ".attention.o_proj.weight",
+            "multi_modal_projector.linear_2.weight",
+        )
     ):
         return "w8"
-    if any(name.startswith(f"model.language_model.layers.{layer}.") for layer in protected_layers):
+    if any(
+        name.startswith(
+            (f"model.language_model.layers.{layer}.", f"language_model.layers.{layer}.")
+        )
+        for layer in protected_layers
+    ):
         return "w8-rotated"
     return "e8p-q4"
 
 
 def text_configuration(config):
+    if config.get("model_type") == "mistral3":
+        from tools.model.nemotron_embed.config import configuration
+
+        return configuration(config)
     if config.get("model_type") not in ("qwen3_5", "qwen3_5_moe", "qwen3_asr") or config.get(
         "quantization_config"
     ):
@@ -135,6 +153,11 @@ def encode(args):
     config = json.loads((source_dir / "config.json").read_text())
     t = text_configuration(config)
     protected_layers = rotated_w8_layers(config)
+    model_policy = (
+        "nemotron35-embed-e8p-q4a8-v1"
+        if config["model_type"] == "mistral3"
+        else "qwen35-dense-e8p-q4a8-v2"
+    )
     origin = json.loads((source_dir / "source.json").read_text())
     source = Source(source_dir / "model.safetensors.index.json", directory=source_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -161,7 +184,7 @@ def encode(args):
             coefficients=[4, 1],
             search="beam8",
             rows=args.rows,
-            policy="qwen35-dense-e8p-q4a8-v2",
+            policy=model_policy,
             **(dict(rotated_w8_layers=protected_layers) if protected_layers else {}),
         ),
         sort_keys=True,
@@ -190,6 +213,7 @@ def encode(args):
                 t["hidden_size"],
                 t["intermediate_size"],
                 2 * t["hidden_size"],
+                t.get("num_attention_heads", 0) * t.get("head_dim", 0),
                 vision.get("hidden_size", 0),
                 vision.get("intermediate_size", 0),
                 4 * vision.get("hidden_size", 0),
@@ -422,6 +446,9 @@ def encode(args):
                 "processor_config.json",
                 "LICENSE",
                 "README.md",
+                "config_sentence_transformers.json",
+                "sentence_bert_config.json",
+                "modules.json",
             )
         ):
             shutil.copyfile(path, out / path.name)
@@ -434,14 +461,11 @@ def encode(args):
         compute_dtype="int8_quality",
         basis_tensor="orinfer.e8p_q4.basis",
         layout="u32-low-coarse-high-residual",
-        policy="qwen35-dense-e8p-q4a8-v2",
+        policy=model_policy,
         embedding="e8p_q4",
         vision=None if config["model_type"] == "qwen3_asr" else "e8p_q4",
-        **(
-            dict(audio="float16", rotated_w8_layers=protected_layers)
-            if config["model_type"] == "qwen3_asr"
-            else {}
-        ),
+        **(dict(audio="float16") if config["model_type"] == "qwen3_asr" else {}),
+        **(dict(rotated_w8_layers=protected_layers) if protected_layers else {}),
         source=origin["repo"],
         source_revision=origin["revision"],
     )

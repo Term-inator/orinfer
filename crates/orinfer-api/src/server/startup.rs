@@ -214,7 +214,7 @@ fn load_frontend(settings: &Settings) -> Result<Arc<ChatCodec>> {
 
 /// Only the frontend crosses threads; model construction and destruction stay
 /// on the caller's CUDA owner, including frontend errors and panics.
-fn load_parallel<T: Send, U>(
+pub(crate) fn load_parallel<T: Send, U>(
     frontend: impl FnOnce() -> Result<T> + Send,
     model: impl FnOnce() -> Result<U>,
 ) -> Result<(T, U)> {

@@ -8,6 +8,7 @@ Python 用于权重准备、TileLang 编译、调优和验证；在线加载、�
 | --- | --- | --- |
 | Qwen3.8-27B | 完成量化的自有码表 Q4A8 checkpoint | [qwen35/build.py](qwen35/README.md) |
 | Qwen3-ASR-1.7B | 文本 E8P Q4A8、音频 FP16 checkpoint | [qwen35/build.py](../../docs/audio.md)，`--context 65536` |
+| Nemotron-3.5-Embed-1B | 文本和视觉 E8P Q4A8 checkpoint | [nemotron_embed/build.py](../../docs/embeddings.md) |
 | Qwen3.8-Flash-Next | 当前 schema-1 模型及其匹配执行包 | [flash_next/build.py](flash_next/README.md) |
 
 27B 的当前部署方案为两级整数 E8P Q4A8。Flash Next 使用 E8P Q2A8 专家及质量优先的混合精度。量化组件与存储约定见[量化说明](../quantization/README.md)。

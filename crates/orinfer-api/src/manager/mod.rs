@@ -94,8 +94,8 @@ struct Manager {
     stopping: AtomicBool,
 }
 
-fn locked_file(path: &std::path::Path) -> Result<File> {
-    if let Some(parent) = path.parent() {
+pub(crate) fn locked_file(path: &std::path::Path) -> Result<File> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let file = fs::OpenOptions::new()

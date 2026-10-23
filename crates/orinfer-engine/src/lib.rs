@@ -5,6 +5,7 @@
 pub mod architecture;
 pub mod artifact;
 mod cuda;
+pub mod embedding;
 pub mod error;
 pub mod execution;
 mod loader;

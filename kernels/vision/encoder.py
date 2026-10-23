@@ -293,8 +293,12 @@ def attention(
     dtype: str = "float16",
     window: int = 0,
     windowed_lengths: bool = False,
+    kv_heads: int | None = None,
 ):
     dim = hidden // heads
+    kv_heads = heads if kv_heads is None else kv_heads
+    if hidden % heads or heads % kv_heads:
+        raise ValueError("Invalid grouped-query attention geometry")
     padded = ((dim + 15) // 16) * 16
     rows = T.dynamic("rows")
     length_count = T.ceildiv(rows, window) if windowed_lengths else 1
@@ -302,8 +306,8 @@ def attention(
     @T.prim_func
     def kernel(
         Q: T.Tensor((rows, hidden), dtype),
-        K: T.Tensor((rows, hidden), dtype),
-        V: T.Tensor((rows, hidden), dtype),
+        K: T.Tensor((rows, kv_heads * dim), dtype),
+        V: T.Tensor((rows, kv_heads * dim), dtype),
         Length: T.Tensor((length_count,), T.int32),
         Y: T.Tensor((rows, hidden), dtype),
     ):
@@ -341,12 +345,12 @@ def attention(
                 for j, d in T.Parallel(bn, padded):
                     k[j, d] = T.if_then_else(
                         base + kb * bn + j < end and d < dim,
-                        K[base + kb * bn + j, head * dim + d],
+                        K[base + kb * bn + j, (head // (heads // kv_heads)) * dim + d],
                         0,
                     )
                     v[j, d] = T.if_then_else(
                         base + kb * bn + j < end and d < dim,
-                        V[base + kb * bn + j, head * dim + d],
+                        V[base + kb * bn + j, (head // (heads // kv_heads)) * dim + d],
                         0,
                     )
                 T.sync_threads()

@@ -73,6 +73,8 @@ pub struct Manifest {
     pub vision: Option<crate::vision::VisionSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<crate::audio::AudioSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<crate::embedding::Spec>,
     #[serde(default)]
     pub mtp: Option<crate::mtp::Spec>,
     #[serde(default)]
@@ -557,6 +559,9 @@ impl Manifest {
         if let Some(audio) = &self.audio {
             audio.validate(self)?;
         }
+        if let Some(embedding) = &self.embedding {
+            embedding.validate(self)?;
+        }
         if let Some(vision) = &self.vision {
             vision.validate(self)?;
         }
@@ -583,14 +588,15 @@ impl Manifest {
             }
         }
         let logits = lookup(&self.logits)?;
-        if !matches!(
-            logits.dtype,
-            crate::artifact::Dtype::F16 | crate::artifact::Dtype::F32
-        ) || logits.bytes()?
-            != self
-                .vocab
-                .checked_mul(logits.dtype.bytes())
-                .ok_or("Logits size overflow")?
+        if self.embedding.is_none()
+            && (!matches!(
+                logits.dtype,
+                crate::artifact::Dtype::F16 | crate::artifact::Dtype::F32
+            ) || logits.bytes()?
+                != self
+                    .vocab
+                    .checked_mul(logits.dtype.bytes())
+                    .ok_or("Logits size overflow")?)
         {
             return Err("Invalid full-vocabulary logits buffer".into());
         }
@@ -639,29 +645,37 @@ impl Manifest {
                 }
             }
         }
-        for required in ["prefill", "head", "decode"] {
-            if self.programs.get(required).is_none_or(Vec::is_empty) {
+        for required in if self.embedding.is_some() {
+            &[][..]
+        } else {
+            &["prefill", "head", "decode"][..]
+        } {
+            if self.programs.get(*required).is_none_or(Vec::is_empty) {
                 return Err(format!("Missing program {required}"));
             }
         }
         if let Some(rows) = &self.row_execution {
             for program in &rows.programs {
                 let allocation = self
-                    .vision
+                    .embedding
                     .as_ref()
-                    .and_then(|v| v.plans.iter().find(|p| &p.program == program))
-                    .map_or_else(
-                        || {
-                            self.audio.as_ref().map_or(self.chunk_tokens, |a| {
-                                match program.as_str() {
-                                    "audio_stem" => a.stem_chunks,
-                                    "audio_encoder" => a.max_features,
-                                    _ => self.chunk_tokens,
-                                }
+                    .filter(|e| &e.vision_program == program)
+                    .map(|e| e.max_patches)
+                    .or_else(|| {
+                        self.vision
+                            .as_ref()
+                            .and_then(|v| v.plans.iter().find(|p| &p.program == program))
+                            .map(|p| p.patches)
+                    })
+                    .unwrap_or_else(|| {
+                        self.audio
+                            .as_ref()
+                            .map_or(self.chunk_tokens, |a| match program.as_str() {
+                                "audio_stem" => a.stem_chunks,
+                                "audio_encoder" => a.max_features,
+                                _ => self.chunk_tokens,
                             })
-                        },
-                        |p| p.patches,
-                    );
+                    });
                 if rows.program_capacity(program) > allocation {
                     return Err("Row execution exceeds the input allocation contract".into());
                 }
@@ -769,7 +783,7 @@ impl Manifest {
                 }
             }
         }
-        if !self.reset_buffers.contains(&self.position) {
+        if self.embedding.is_none() && !self.reset_buffers.contains(&self.position) {
             return Err("Position must reset between requests".into());
         }
         for name in &self.reset_buffers {

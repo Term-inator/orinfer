@@ -236,6 +236,21 @@ fn validate_scopes(model: &Manifest, scopes: &BTreeMap<String, BufferScope>) -> 
             }
         }
     }
+    if model.embedding.is_some() {
+        if !model.reset_buffers.is_empty()
+            || model.state_pointer_table.is_some()
+            || model.sampling.is_some()
+            || model.buffers.iter().any(|b| {
+                b.access != Access::Read && scopes.get(&b.name) != Some(&BufferScope::Workspace)
+            })
+        {
+            return Err(
+                "Independent embeddings require shared workspace and no persistent sequence state"
+                    .into(),
+            );
+        }
+        return Ok(());
+    }
     for name in model.reset_buffers.iter().chain([
         &model.input,
         &model.token,
@@ -270,7 +285,7 @@ fn validate_dynamic_contracts(model: &Manifest, exhaustive_rows: bool) -> Result
         }
     }
     if !model.dynamic_batch_kernels.is_empty()
-        && (!model.batch_profiles.contains(&128)
+        && ((!model.batch_profiles.contains(&128) && model.row_execution.is_none())
             || kernels
                 .keys()
                 .filter(|name| {
@@ -304,6 +319,20 @@ mod tests {
                 "arguments":[{"index":0,"value":{"op":"rows"}}]}}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn independent_row_templates_do_not_declare_autoregressive_batch_profiles() {
+        let mut manifest = dynamic_fixture();
+        manifest.batch_profiles.clear();
+        assert!(validate_dynamic_contracts(&manifest, true).is_err());
+        manifest.row_execution = Some(orinfer_model_sdk::operators::rows::RowExecution {
+            capacity: 128,
+            programs: std::collections::BTreeSet::from(["embed".into()]),
+            program_capacities: Default::default(),
+            variants: Default::default(),
+        });
+        validate_dynamic_contracts(&manifest, true).unwrap();
     }
 
     #[test]
@@ -439,11 +468,20 @@ mod tests {
 }
 
 fn validate_frontend_assets(root: &Path, expected: &BTreeMap<String, String>) -> Result<()> {
-    let names = [
-        "tokenizer.json",
-        "chat_template.jinja",
-        "generation_config.json",
-    ];
+    let names: &[&str] = if expected.contains_key("processor_config.json") {
+        &[
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "processor_config.json",
+            "chat_template.jinja",
+        ]
+    } else {
+        &[
+            "tokenizer.json",
+            "chat_template.jinja",
+            "generation_config.json",
+        ]
+    };
     if expected.len() != names.len() {
         return Err(
             "Prepared model requires all frontend asset identities; run package.py pin-assets"
@@ -452,7 +490,7 @@ fn validate_frontend_assets(root: &Path, expected: &BTreeMap<String, String>) ->
     }
     for name in names {
         let bytes = fs::read(resolve_file(root, name)?).map_err(|e| e.to_string())?;
-        if expected.get(name) != Some(&sha256(&bytes)) {
+        if expected.get(*name) != Some(&sha256(&bytes)) {
             return Err(format!("Frontend asset identity mismatch: {name}"));
         }
     }

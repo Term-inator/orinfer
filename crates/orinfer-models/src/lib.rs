@@ -4,6 +4,7 @@ pub use orinfer_model_sdk::{artifact, execution, model, operators};
 mod adapter;
 mod bindings;
 mod flash_next;
+mod nemotron_embed;
 mod packet;
 mod policy;
 mod prefill;
@@ -182,7 +183,10 @@ mod tests {
         unsafe { (API.free_bytes)(bytes) };
         assert_eq!(info.package, "orinfer-models");
         assert_eq!(info.runtime_abi, 1);
-        assert_eq!(info.architectures, ["qwen3_asr", "flash_next", "qwen3_5"]);
+        assert_eq!(
+            info.architectures,
+            ["nemotron_embed", "qwen3_asr", "flash_next", "qwen3_5"]
+        );
         assert_eq!(info.compute_policies, ["int8_quality"]);
     }
 }
