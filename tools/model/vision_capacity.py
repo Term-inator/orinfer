@@ -127,7 +127,10 @@ def rebuild_overlays(data, package, manifest, compiler, capacity):
             old, name, pointers, rows, build=build, key=key, symbolic=symbolic
         )
         # The published row/grid/scalar contract remains identical.
-        if item["grid"] != old["grid"] or item["args"] != old["args"]:
+        if any(
+            item[field] != old[field]
+            for field in ("grid", "block", "shared_memory_bytes", "cooperative", "args")
+        ):
             raise ValueError(f"Visual capacity changed row/ABI contract: {name}")
         if dynamic is not None and launch != dynamic:
             raise ValueError(f"Visual capacity changed dynamic contract: {name}")
