@@ -1,13 +1,14 @@
 """Scoring must reject mismatched histories and retain actual execution modes."""
 
 import copy
+import hashlib
 import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from tools.eval.offline_quality import add_queries, compare, prepare
-from tools.eval.scoring_common import SEED, context_hash
+from tools.eval.scoring_common import SEED, context_hash, image_patches
 
 
 def reports():
@@ -45,6 +46,38 @@ def reports():
 
 
 class OfflineQualityTests(unittest.TestCase):
+    def test_rgb_scoring_identity_and_patch_bytes_match_rust(self):
+        image = dict(grid_height=2, grid_width=4, rgb=[n * 37 % 256 for n in range(32 * 64 * 3)])
+        self.assertEqual(
+            context_hash([1, 2], [image]),
+            "8b1eeb5f09290823371a0fec3be54f5ceaf1a7e7e1ef7f1e19dea0d9d77e2ce2",
+        )
+        patches = image_patches(image)
+        self.assertEqual(patches.shape, (8, 1536))
+        self.assertEqual(
+            hashlib.sha256(patches.tobytes()).hexdigest(),
+            "9d0d0fdf119bd16c9a3ebf528dd1be1153bfa805736b4dbfe176ef302e71eaa2",
+        )
+        self.assertEqual(
+            image_patches(
+                dict(grid_height=2, grid_width=4, pixels=patches.flatten().tolist())
+            ).tolist(),
+            patches.tolist(),
+        )
+        changed = copy.deepcopy(image)
+        changed["rgb"][0] ^= 255
+        self.assertNotEqual(context_hash([1, 2], [image]), context_hash([1, 2], [changed]))
+        self.assertNotEqual(
+            context_hash([1, 2], [image, changed]), context_hash([1, 2], [changed, image])
+        )
+        for invalid in (
+            dict(image, rgb=image["rgb"][:-1]),
+            dict(image, pixels=[0.0]),
+            dict(image, rgb=[True] * len(image["rgb"])),
+        ):
+            with self.assertRaises(ValueError):
+                image_patches(invalid)
+
     def test_image_hash_and_pairing_reject_changed_pixels_and_image_order(self):
         image = dict(grid_height=2, grid_width=2, pixels=[0.0] * 6144)
         self.assertEqual(

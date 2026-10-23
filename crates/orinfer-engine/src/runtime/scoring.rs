@@ -277,6 +277,36 @@ mod tests {
         );
     }
     #[test]
+    fn rgb_context_and_patch_bytes_match_python() {
+        let image = crate::vision::ImageInput {
+            grid_height: 2,
+            grid_width: 4,
+            rgb: (0..32 * 64 * 3).map(|n| (n * 37 % 256) as u8).collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            scoring_context_hash(&[1, 2], std::slice::from_ref(&image), &[]).unwrap(),
+            "8b1eeb5f09290823371a0fec3be54f5ceaf1a7e7e1ef7f1e19dea0d9d77e2ce2"
+        );
+        let v: crate::vision::VisionSpec = serde_json::from_value(serde_json::json!({"hidden":8,
+            "patch_size":16,"temporal_patch_size":2,"merge_size":2,"max_patches":64,"max_features":16,
+            "pixels":"p","grid":"g","length":"l","output":"o","features":"f","feature_index":"i",
+            "mrope_positions":"r","plans":[{"patches":64,"program":"v"}],"image_token_id":10,
+            "vision_start_token_id":11,"vision_end_token_id":12})).unwrap();
+        v.feature_count(&image).unwrap();
+        let raw: Vec<_> = image.normalized(&v).flat_map(f32::to_le_bytes).collect();
+        assert_eq!(
+            crate::artifact::sha256(&raw),
+            "9d0d0fdf119bd16c9a3ebf528dd1be1153bfa805736b4dbfe176ef302e71eaa2"
+        );
+        let mut changed = image.clone();
+        changed.rgb[0] ^= 255;
+        assert_ne!(
+            scoring_context_hash(&[1, 2], &[image.clone(), changed.clone()], &[]).unwrap(),
+            scoring_context_hash(&[1, 2], &[changed, image], &[]).unwrap()
+        );
+    }
+    #[test]
     fn audio_changes_scoring_identity() {
         let mut audio = crate::audio::AudioInput {
             frames: 50,

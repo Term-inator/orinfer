@@ -33,25 +33,51 @@ def execution_identity(output):
 def image_fingerprints(images):
     identities = []
     for image in images:
-        if set(image) != {"grid_height", "grid_width", "pixels"}:
-            raise ValueError("Image scoring requires an explicit normalized patch tensor")
-        h, w, pixels = image["grid_height"], image["grid_width"], image["pixels"]
-        if (
-            type(h) is not int
-            or type(w) is not int
-            or h <= 0
-            or w <= 0
-            or h % 2
-            or w % 2
-            or len(pixels) != h * w * 1536
-            or any(not math.isfinite(x) or not -1.001 <= x <= 1.001 for x in pixels)
+        if not {"grid_height", "grid_width"} <= set(image) or set(image) - {
+            "grid_height",
+            "grid_width",
+            "pixels",
+            "rgb",
+        }:
+            raise ValueError("Image scoring requires normalized patches or explicit RGB8")
+        h, w = image["grid_height"], image["grid_width"]
+        pixels, rgb = image.get("pixels", []), image.get("rgb", [])
+        if type(h) is not int or type(w) is not int or h <= 0 or w <= 0 or h % 2 or w % 2:
+            raise ValueError("Invalid normalized image grid or pixel payload")
+        if not isinstance(pixels, list) or not isinstance(rgb, list):
+            raise ValueError("Invalid image storage")
+        if rgb:
+            if (
+                pixels
+                or len(rgb) != h * w * 16 * 16 * 3
+                or any(type(x) is not int or not 0 <= x <= 255 for x in rgb)
+            ):
+                raise ValueError("Invalid RGB8 image payload")
+        elif len(pixels) != h * w * 1536 or any(
+            type(x) not in (float, int) or not math.isfinite(x) or not -1.001 <= x <= 1.001
+            for x in pixels
         ):
             raise ValueError("Invalid normalized image grid or pixel payload")
         raw = struct.pack(f"<{len(pixels)}f", *pixels)
-        identities.append(
-            dict(grid_height=h, grid_width=w, pixels_sha256=hashlib.sha256(raw).hexdigest())
-        )
+        identity = dict(grid_height=h, grid_width=w, pixels_sha256=hashlib.sha256(raw).hexdigest())
+        if rgb:
+            identity["rgb_sha256"] = hashlib.sha256(bytes(rgb)).hexdigest()
+        identities.append(identity)
     return identities
+
+
+def image_patches(image):
+    """Expand compact RGB with the same FP32 normalization and Qwen patch order."""
+    import numpy as np
+
+    image_fingerprints([image])
+    h, w = image["grid_height"], image["grid_width"]
+    if not image.get("rgb"):
+        return np.asarray(image["pixels"], dtype=np.float32).reshape(h * w, 1536)
+    rgb = np.frombuffer(bytes(image["rgb"]), dtype=np.uint8)
+    grouped = rgb.reshape(h // 2, 2, 16, w // 2, 2, 16, 3).transpose(0, 3, 1, 4, 6, 2, 5)
+    normalized = grouped.astype(np.float32) / np.float32(127.5) - np.float32(1.0)
+    return np.repeat(normalized[..., None, :, :], 2, axis=-3).reshape(h * w, 1536)
 
 
 def context_hash(token_ids, images=()):
