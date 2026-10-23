@@ -613,7 +613,7 @@ impl ModelRuntime {
     }
     pub(crate) fn start_request(
         &mut self,
-        input: GenerationInput,
+        mut input: GenerationInput,
         cancelled: &impl Fn() -> bool,
     ) -> Result<RequestState> {
         self.reap_abandoned()?;
@@ -637,9 +637,14 @@ impl ModelRuntime {
         let result = (|| {
             self.execution
                 .reset_sequence_reusing_pages(&self.manifest.reset_buffers)?;
-            self.prepare_visual_capacity(&input.input_tokens, &input.images, context, cancelled)?;
-            self.prepare_audio_metadata(&input.input_tokens, &input.audios, context)?;
             let media = self.prefix_media(&input.input_tokens, &input.images, &input.audios)?;
+            self.prepare_owned_visual_capacity(
+                &input.input_tokens,
+                &mut input.images,
+                context,
+                cancelled,
+            )?;
+            self.prepare_audio_metadata(&input.input_tokens, &input.audios, context)?;
             let mut prefix = super::prefix::Context::default();
             let (offset, mut warm) =
                 self.restore_prefix(&input.input_tokens, &media, &mut prefix)?;

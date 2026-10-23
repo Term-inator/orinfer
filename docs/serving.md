@@ -278,6 +278,29 @@ HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU
 
 `score-model` 对冻结 token 历史评分，服务的固定场景检查见[API 验证](../tools/api/README.md)，BF16/FP8 质量对照见[质量评测](../tools/eval/README.md)。
 
-多图请求的预处理预算按模型声明的 patch、时间帧与总特征容量预留累计 FP32 图片张量及 worker 待交接副本，仍受 `--preprocess-memory-mib` 的共享上限约束。解码和两阶段缩放完成后立即释放源图与中间图；准备结束后归还未使用的预留，仅保留正文、实际图片张量和交接副本的计费。图片编码写入请求私有特征后，释放 CPU 像素及其预算，HTTP 正文和概率输出仍保持计费。超出请求预算的错误包含所需、预留及已准备媒体的 MiB 数。
 
-多图 `image_url.detail="auto"` 按整批图片共享模型包的图片特征总容量：先按原规则准备显式 `high` / `low` 图片，再将剩余容量平均分给 `auto` 图片，通过原有 32 像素对齐缩放调整分辨率。图片和消息顺序保持原样，单图自动模式维持原分辨率规则。显式高细节或最低分辨率仍超出总容量时，错误给出特征用量、模型上限及减少图片或使用自动/低细节的说明。
+图片预处理可通过 Chat 请求的 `image_processing` 配置：
+
+```json
+{
+  "image_processing": {
+    "max_pixels": 1048576,
+    "max_tokens": 16384,
+    "max_images": 20,
+    "auto_resize": false
+  }
+}
+```
+
+这些字段均可省略。`max_pixels` 限制每张图缩放后的像素数（至少 65536，尺寸按 patch/merge 对齐）；`max_tokens` 限制所有图片合计的视觉 token；`max_images` 限制图片数量。总容量同时受执行包的 `max_features` 和完整文本上下文限制，主机预处理仍受服务的共享内存预算限制。默认按每张图的实际尺寸处理，超出总容量会返回所需和可用视觉 token 数。`auto_resize: true` 在超限时缩小 `detail: auto` 的图片；小图保留实际需求，将空余份额分配给大图，`high`/`low` 保留各自明确的分辨率语义。
+
+排队期间仅保留缩放后的 RGB8。GPU worker 逐图生成 checkpoint 要求的 FP16/BF16 patch 输入，完成上传后释放该图的 CPU 数据。单图上传 scratch 与队列数据一起计费；请求的图片顺序、MRoPE、prefix 身份和私有特征空间保持绑定。原有离线 FP32 图片夹具继续支持。
+
+新构建的 Qwen3.5 执行包按上下文声明图片总特征容量，单图 patch 容量和文本 packet 行数保持原有契约。特征 bank 启动时仅分配一行，每个请求按实际视觉 token 数租用；提高上限不会预先分配完整 bank。已有 Qwen3.5／Flash Next 执行包可离线升级总容量：
+
+```bash
+bash tools/operators/run.sh tools/model/vision_capacity.py artifacts/vision-capacity-build \
+  --model /path/to/model --model-output /path/to/upgraded-model
+```
+
+该命令默认把总容量提高到模型上下文上限，也接受 `--features N`。它保留权重字节，重编译普通、MTP 和地址表 packet 的视觉覆盖入口，验证原有行数与 ABI 契约后原子发布新执行包。通过 `package install` 安装新包后使用升级模型目录。未升级的执行包继续遵守原容量上限。

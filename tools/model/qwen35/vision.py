@@ -5,13 +5,13 @@ from tools.model.compile import primitive
 from tools.vision.config import validate_vision
 
 PATCHES = 32768
-FEATURES = 32768
 
 
 def build(b):
     from kernels.vision import encoder as e
     from kernels.vision.features import overlay
 
+    features = b.context
     v = b.config["vision_config"]
     validate_vision(v, b.h)
     w = b.weights
@@ -33,7 +33,7 @@ def build(b):
         ("VOutput", [PATCHES // 4, out], "f16"),
     ]:
         w.fixed(name, dtype, shape)
-    w.fixed("Features", "f16", [FEATURES, out], "sequence")
+    w.fixed("Features", "f16", [features, out], "sequence")
     w.fixed("FeatureIndex", "i32", [b.context], "sequence")
 
     if b.config["quantization_config"].get("vision") == "e8p_q4":
@@ -170,7 +170,7 @@ def build(b):
     b.emit(
         "begin/overlay",
         f"vision-overlay-{b.context}",
-        lambda: primitive(overlay, 4096, b.h, b.context, FEATURES, dynamic_rows=True),
+        lambda: primitive(overlay, 4096, b.h, b.context, features, dynamic_rows=True),
         dict(Embedding="Hidden", Features="Features", Index="FeatureIndex", Position="Step"),
     )
     b.vision = dict(
@@ -180,7 +180,7 @@ def build(b):
         temporal_patch_size=v["temporal_patch_size"],
         merge_size=v["spatial_merge_size"],
         max_patches=PATCHES,
-        max_features=FEATURES,
+        max_features=features,
         pixels="VPixels",
         grid="VGrid",
         length="VLength",

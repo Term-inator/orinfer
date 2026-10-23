@@ -127,7 +127,8 @@ impl Model {
                 .grid_height
                 .checked_mul(image.grid_width)
                 .ok_or("Image grid overflow")?;
-            if image.grid_height == 0
+            if !image.rgb.is_empty()
+                || image.grid_height == 0
                 || image.grid_width == 0
                 || image.grid_height % self.spec.merge_size != 0
                 || image.grid_width % self.spec.merge_size != 0

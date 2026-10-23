@@ -45,7 +45,12 @@ impl ModelRuntime {
             let mut hash = Sha256::new();
             hash.update((image.grid_height as u64).to_le_bytes());
             hash.update((image.grid_width as u64).to_le_bytes());
-            hash_floats(&mut hash, &image.pixels);
+            if image.rgb.is_empty() {
+                hash_floats(&mut hash, &image.pixels);
+            } else {
+                hash.update(b"rgb8");
+                hash.update(&image.rgb);
+            }
             media.push((start, hash.finalize().into()));
             cursor = start
                 .checked_add(v.feature_count(image)?)

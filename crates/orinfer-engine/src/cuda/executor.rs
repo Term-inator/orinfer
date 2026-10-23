@@ -216,6 +216,22 @@ fn deferred_workspace(
         && buffer.bytes()? >= 64 * 1024)
 }
 
+fn initial_buffer_bytes(
+    manifest: &crate::model::Manifest,
+    buffer: &crate::artifact::Buffer<crate::weights::TensorIdentity>,
+    scope: crate::loader::BufferScope,
+) -> Result<usize> {
+    // The bootstrap sequence has no images. Its first real lease selects an
+    // arena sized to the actual request, including the complete feature bank.
+    if scope == crate::loader::BufferScope::Sequence
+        && let Some(vision) = &manifest.vision
+        && buffer.name == vision.features
+    {
+        return Ok(vision.hidden * 2);
+    }
+    buffer.bytes()
+}
+
 impl Executor {
     pub(crate) fn load(
         prepared: &crate::loader::PreparedModel,
@@ -333,8 +349,16 @@ impl Executor {
             })
             .ok_or_else(|| "Workspace sum overflow".to_string())
         })?;
-        let buffer_bytes =
-            capacity_bytes - lazy_bytes - unused_weights - paged_bytes - deferred_workspace_bytes;
+        let buffer_bytes = capacity_bytes
+            - lazy_bytes
+            - unused_weights
+            - paged_bytes
+            - deferred_workspace_bytes
+            - manifest.buffers.iter().try_fold(0usize, |sum, b| {
+                Ok::<_, String>(
+                    sum + b.bytes()? - initial_buffer_bytes(manifest, b, scopes[&b.name])?,
+                )
+            })?;
         let init_started = Instant::now();
         let mut s = Session::new(Driver::load()?);
         let mut pointers = BTreeMap::new();
@@ -445,7 +469,7 @@ impl Executor {
             {
                 continue;
             }
-            let bytes = b.bytes()?;
+            let bytes = initial_buffer_bytes(manifest, b, scopes[&b.name])?;
             let mut address = 0;
             let paged = expert_plan
                 .as_ref()

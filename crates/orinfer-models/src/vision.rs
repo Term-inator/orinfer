@@ -105,6 +105,7 @@ mod tests {
     }
     fn image(h: usize, w: usize) -> ImageInput {
         ImageInput {
+            rgb: Vec::new(),
             grid_height: h,
             grid_width: w,
             pixels: vec![0.; h * w * 1536],

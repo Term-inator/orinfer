@@ -61,8 +61,10 @@ pub(super) fn scoring_context_hash(
             .iter()
             .map(|image| {
                 let bytes: Vec<_> = image.pixels.iter().flat_map(|v| v.to_le_bytes()).collect();
-                serde_json::json!({"grid_height":image.grid_height,"grid_width":image.grid_width,
-                    "pixels_sha256":crate::artifact::sha256(&bytes)})
+                let mut identity = serde_json::json!({"grid_height":image.grid_height,"grid_width":image.grid_width,
+                    "pixels_sha256":crate::artifact::sha256(&bytes)});
+                if !image.rgb.is_empty() { identity["rgb_sha256"] = crate::artifact::sha256(&image.rgb).into(); }
+                identity
             })
             .collect();
         context["images"] = serde_json::json!(identities);
@@ -253,6 +255,7 @@ mod tests {
     #[test]
     fn image_context_matches_python_and_preserves_image_order() {
         let image = crate::vision::ImageInput {
+            rgb: Vec::new(),
             grid_height: 2,
             grid_width: 2,
             pixels: vec![0.; 6144],

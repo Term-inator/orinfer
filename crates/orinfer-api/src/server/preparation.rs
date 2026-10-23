@@ -31,6 +31,7 @@ pub(super) struct Context {
     cancelled: Arc<AtomicBool>,
     budget: usize,
     retained: usize,
+    worker_scratch: usize,
     base: Option<usize>,
 }
 impl Context {
@@ -39,6 +40,7 @@ impl Context {
             cancelled,
             budget,
             retained: 0,
+            worker_scratch: 0,
             base: None,
         }
     }
@@ -55,7 +57,7 @@ impl Context {
             .checked_mul(if self.base.is_some() { 2 } else { 1 });
         let required = retained
             .and_then(|n| n.checked_add(self.base.unwrap_or(0)))
-            .and_then(|n| n.checked_add(temporary));
+            .and_then(|n| n.checked_add(temporary.max(self.worker_scratch)));
         if required.is_none_or(|n| n > self.budget) {
             return Err(format!(
                 "Request preprocessing memory budget exceeded (required {} MiB, reserved {} MiB; prepared media {} MiB)",
@@ -71,6 +73,16 @@ impl Context {
         self.retained += bytes;
         Ok(())
     }
+    pub fn release(&mut self, bytes: usize) {
+        self.retained = self
+            .retained
+            .checked_sub(bytes)
+            .expect("preparation accounting");
+    }
+    pub fn worker_scratch(&mut self, bytes: usize) -> Result<()> {
+        self.worker_scratch = self.worker_scratch.max(bytes);
+        self.checkpoint(0)
+    }
     pub fn lease(&self, permit: tokio::sync::OwnedSemaphorePermit) -> Lease {
         Lease {
             permit: std::sync::Mutex::new(permit),
@@ -83,6 +95,7 @@ impl Context {
         let live_mib = self
             .retained
             .saturating_mul(2)
+            .saturating_add(self.worker_scratch)
             .div_ceil(1 << 20)
             .saturating_add(16);
         let base_mib = self
@@ -149,16 +162,28 @@ pub(super) fn request_memory(
             )
         });
     let extra = vision.filter(|_| images > 1).map_or(0, |v| {
-        let patches = images.saturating_mul(v.max_patches).min(
-            v.max_features
+        let per_image = request
+            .image_processing
+            .max_pixels
+            .map_or(v.max_patches, |n| {
+                (n / v.patch_size / v.patch_size).min(v.max_patches)
+            });
+        let features = request
+            .image_processing
+            .max_tokens
+            .unwrap_or(v.max_features)
+            .min(v.max_features);
+        let patches = images.saturating_mul(per_image).min(
+            features
                 .saturating_mul(v.merge_size)
                 .saturating_mul(v.merge_size),
         );
         patches
             .saturating_mul(v.patch_size)
             .saturating_mul(v.patch_size)
-            .saturating_mul(v.temporal_patch_size)
-            .saturating_mul(3 * 4 * 2)
+            // Keep RGB8 across the queue; expand one image directly to the
+            // encoder's 16-bit input while its 512 MiB scratch is still held.
+            .saturating_mul(3 * 2)
             .div_ceil(1 << 20)
     });
     let mib = if minimum > limit_mib {
@@ -251,7 +276,10 @@ mod tests {
                 "image_url":{"url":"https://example.com/image.png"}})).collect::<Vec<_>>()}]}))
         .unwrap();
         let estimate = request_memory(&request, 262144, Some(&vision()), 2048);
-        assert_eq!(estimate.mib, 2048);
+        assert_eq!(
+            estimate.mib as usize,
+            request_memory_mib(&request, 262144) as usize + 192
+        );
         let mut old = Context::new(
             Arc::new(AtomicBool::new(false)),
             request_memory_mib(&request, 262144) as usize * (1 << 20),
@@ -265,23 +293,24 @@ mod tests {
         let mut context = estimate.context(Arc::new(AtomicBool::new(false)));
         for _ in 0..12 {
             context.checkpoint(80 << 20).unwrap();
-            context.retain(48 << 20).unwrap();
+            context.retain(6 << 20).unwrap();
+            context.worker_scratch(24 << 20).unwrap();
         }
         context.release_media_scratch(&mut permit);
-        assert_eq!(permit.num_permits(), estimate.base_mib + 2 * 576 + 16);
+        assert_eq!(permit.num_permits(), estimate.base_mib + 2 * 72 + 24 + 16);
         assert_eq!(pool.available_permits(), 2048 - permit.num_permits());
         assert!(Arc::clone(&pool).try_acquire_many_owned(512).is_ok());
         assert!(context.checkpoint(1024 << 20).is_err());
         drop(permit);
         assert_eq!(pool.available_permits(), 2048);
-        let limited = request_memory(&request, 262144, Some(&vision()), 1024);
-        assert_eq!(limited.mib, 1024);
+        let limited = request_memory(&request, 262144, Some(&vision()), 600);
+        assert_eq!(limited.mib, 600);
         let mut context = limited.context(Arc::new(AtomicBool::new(false)));
         assert!(
             context
                 .retain(576 << 20)
                 .unwrap_err()
-                .contains("reserved 1024 MiB")
+                .contains("reserved 600 MiB")
         );
     }
     #[tokio::test]

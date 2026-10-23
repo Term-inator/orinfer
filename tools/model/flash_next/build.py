@@ -349,6 +349,13 @@ def rebuild(args):
             from tools.model.auxiliary_tuning import publish as publish_auxiliary
 
             publish_auxiliary(data, package, manifest, compiler, args.output / "auxiliary")
+            if (
+                data["metadata"].get("vision")
+                and data["metadata"]["vision"]["max_features"] < data["metadata"]["max_context"]
+            ):
+                from tools.model.vision_capacity import rebuild_overlays
+
+                rebuild_overlays(data, package, manifest, compiler, data["metadata"]["max_context"])
         coalesce_adjacent_selections(package)
         digest = compact_package(root, package, staging / "cache/packages")
         shutil.rmtree(root)

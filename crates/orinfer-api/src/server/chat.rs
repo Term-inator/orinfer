@@ -86,6 +86,8 @@ pub struct ChatRequest {
     pub response_format: Option<Value>,
     pub enable_thinking: Option<bool>,
     pub asr_language: Option<String>,
+    #[serde(default)]
+    pub image_processing: super::image::ImageProcessing,
     pub reasoning_effort: Option<String>,
     pub thinking_token_budget: Option<usize>,
     pub prompt_cache_key: Option<String>,
@@ -452,8 +454,12 @@ impl ChatCodec {
         };
         let (messages_with_audio, audios) =
             super::audio::messages(request.messages, self.audio.as_ref(), preparation)?;
-        let (raw_messages, images) =
-            super::image::messages(messages_with_audio, vision, preparation)?;
+        let (raw_messages, images) = super::image::messages_with_options(
+            messages_with_audio,
+            vision,
+            &request.image_processing,
+            preparation,
+        )?;
         let mut messages = normalize_messages(raw_messages)?;
         if self.audio.is_some() {
             for message in &mut messages {

@@ -238,6 +238,7 @@ fn preprocess(bytes: &[u8], max_patches: usize) -> Result<ImageInput> {
         }
     }
     Ok(ImageInput {
+        rgb: Vec::new(),
         grid_height: gh,
         grid_width: gw,
         pixels,

@@ -940,6 +940,7 @@ fn profile_vision_stages() {
                 .collect::<Vec<_>>();
             // Materialize real pixels, grid, length and buffers before timing.
             // Every replay starts at patch embedding and replaces its outputs.
+            model.execution.prepare_reference_sequence().unwrap();
             model.prepare_visual(&tokens, &[image], &|| false).unwrap();
             let program = vision
                 .plans

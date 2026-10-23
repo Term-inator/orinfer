@@ -44,12 +44,23 @@ pub fn inspect(name: &str, path: &Path, options: WorkerOptions) -> Result<ModelR
                     || kv.prefill_workspace.contains_key(&buffer.name))
         });
         if !demand {
+            // Cold loading creates an image-free bootstrap sequence. The GPU
+            // worker admits the actual request's feature bank separately.
+            let bytes = plan
+                .manifest
+                .vision
+                .as_ref()
+                .filter(|v| {
+                    v.features == buffer.name
+                        && raw_descriptor["buffer_scopes"][&buffer.name] == "sequence"
+                })
+                .map_or_else(|| buffer.bytes(), |v| Ok(v.hidden * 2))?;
             load_bytes = load_bytes
-                .checked_add(buffer.bytes()?)
+                .checked_add(bytes)
                 .ok_or("Model memory estimate overflow")?;
             if raw_descriptor["buffer_scopes"][&buffer.name] == "sequence" {
                 sequence_bytes = sequence_bytes
-                    .checked_add(buffer.bytes()?)
+                    .checked_add(bytes)
                     .ok_or("Sequence memory estimate overflow")?;
             }
         }
