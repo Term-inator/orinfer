@@ -296,13 +296,28 @@ def attention(
     kv_heads: int | None = None,
     causal: bool = False,
     segmented: bool = False,
+    head_group: int = 1,
+    stages: int = 0,
+    base2: bool = False,
+    full_row: bool = False,
 ):
     if segmented and (window or windowed_lengths):
         raise ValueError("Segmented attention uses independent complete sequences")
     dim = hidden // heads
     kv_heads = heads if kv_heads is None else kv_heads
-    if hidden % heads or heads % kv_heads:
+    if (
+        hidden % heads
+        or heads % kv_heads
+        or head_group < 1
+        or (heads // kv_heads) % head_group
+        or stages not in (0, 1)
+    ):
         raise ValueError("Invalid grouped-query attention geometry")
+    if segmented and (bm > 32 or 32 % bm):
+        raise ValueError("Segmented query tiles must divide the packet alignment")
+    head_stride = 1 << (head_group - 1).bit_length()
+    query_rows = bm * head_stride
+    policy = T.GemmWarpPolicy.FullRow if full_row else T.GemmWarpPolicy.Square
     padded = ((dim + 15) // 16) * 16
     rows = T.dynamic("rows")
     length_count = T.ceildiv(rows, window) if windowed_lengths else 1
@@ -317,10 +332,10 @@ def attention(
     ):
         with T.Kernel(
             T.ceildiv(window, bm) if window else T.ceildiv(rows, bm),
-            heads,
+            heads // head_group,
             T.ceildiv(rows, window) if window else 1,
             threads=128,
-        ) as (qb, head, segment):
+        ) as (qb, work_head, segment):
             base = Length[qb * bm, 0] if segmented else segment * window
             query = qb * bm if segmented else base + qb * bm
             end = (
@@ -332,70 +347,113 @@ def attention(
                     else (T.min(Length[0], base + window) if window else Length[0])
                 )
             )
-            q = T.alloc_shared((bm, padded), dtype)
+            q = T.alloc_shared((query_rows, padded), dtype)
             k = T.alloc_shared((bn, padded), dtype)
             v = T.alloc_shared((bn, padded), dtype)
-            p = T.alloc_shared((bm, bn), dtype)
-            score = T.alloc_fragment((bm, bn), T.float32)
-            out = T.alloc_fragment((bm, padded), T.float32)
-            maximum = T.alloc_fragment((bm,), T.float32)
-            previous = T.alloc_fragment((bm,), T.float32)
-            denom = T.alloc_fragment((bm,), T.float32)
-            correction = T.alloc_fragment((bm,), T.float32)
-            rowsum = T.alloc_fragment((bm,), T.float32)
+            p = T.alloc_shared((query_rows, bn), dtype)
+            score = T.alloc_fragment((query_rows, bn), T.float32)
+            out = T.alloc_fragment((query_rows, padded), T.float32)
+            maximum = T.alloc_fragment((query_rows,), T.float32)
+            previous = T.alloc_fragment((query_rows,), T.float32)
+            denom = T.alloc_fragment((query_rows,), T.float32)
+            correction = T.alloc_fragment((query_rows,), T.float32)
+            rowsum = T.alloc_fragment((query_rows,), T.float32)
             T.fill(maximum, -1e30)
             T.clear(denom)
             T.clear(out)
-            for i, d in T.Parallel(bm, padded):
+            for i, d in T.Parallel(query_rows, padded):
+                token = query + i // head_stride
+                head = work_head * head_group + i % head_stride
                 q[i, d] = T.if_then_else(
-                    query + i < end and d < dim, Q[query + i, head * dim + d], 0
+                    token < end and i % head_stride < head_group and d < dim,
+                    Q[token, head * dim + d],
+                    0,
                 )
-            for kb in T.serial(
-                T.ceildiv(T.min(end - base, query - base + bm) if causal else end - base, bn)
+            if stages:
+                live_k = T.decl_buffer((end, kv_heads * dim), dtype, data=K.data)
+                live_v = T.decl_buffer((end, kv_heads * dim), dtype, data=V.data)
+            for kb in T.Pipelined(
+                T.ceildiv(T.min(end - base, query - base + bm) if causal else end - base, bn),
+                num_stages=stages,
             ):
-                for j, d in T.Parallel(bn, padded):
-                    k[j, d] = T.if_then_else(
-                        base + kb * bn + j < end and d < dim,
-                        K[base + kb * bn + j, (head // (heads // kv_heads)) * dim + d],
-                        0,
+                if stages:
+                    T.copy(
+                        live_k[
+                            base + kb * bn, (work_head // (heads // kv_heads // head_group)) * dim
+                        ],
+                        k,
                     )
-                    v[j, d] = T.if_then_else(
-                        base + kb * bn + j < end and d < dim,
-                        V[base + kb * bn + j, (head // (heads // kv_heads)) * dim + d],
-                        0,
+                    T.copy(
+                        live_v[
+                            base + kb * bn, (work_head // (heads // kv_heads // head_group)) * dim
+                        ],
+                        v,
                     )
+                else:
+                    for j, d in T.Parallel(bn, padded):
+                        k[j, d] = T.if_then_else(
+                            base + kb * bn + j < end and d < dim,
+                            K[
+                                base + kb * bn + j,
+                                (work_head // (heads // kv_heads // head_group)) * dim + d,
+                            ],
+                            0,
+                        )
+                        v[j, d] = T.if_then_else(
+                            base + kb * bn + j < end and d < dim,
+                            V[
+                                base + kb * bn + j,
+                                (work_head // (heads // kv_heads // head_group)) * dim + d,
+                            ],
+                            0,
+                        )
                 T.sync_threads()
                 T.clear(score)
-                T.gemm(q, k, score, transpose_B=True)
-                for i in T.Parallel(bm):
+                T.gemm(q, k, score, transpose_B=True, policy=policy)
+                for i in T.Parallel(query_rows):
                     previous[i] = maximum[i]
-                for i, j in T.Parallel(bm, bn):
+                for i, j in T.Parallel(query_rows, bn):
                     score[i, j] = T.if_then_else(
                         base + kb * bn + j < end
-                        and (not causal or base + kb * bn + j <= query + i),
+                        and (not causal or base + kb * bn + j <= query + i // head_stride),
                         score[i, j] * math.sqrt(1.0 / dim),
                         -1e30,
                     )
                 T.reduce_max(score, maximum, dim=1, clear=False)
-                for i, j in T.Parallel(bm, bn):
+                for i, j in T.Parallel(query_rows, bn):
                     score[i, j] = T.if_then_else(
                         base + kb * bn + j < end
-                        and (not causal or base + kb * bn + j <= query + i),
-                        T.exp(score[i, j] - maximum[i]),
+                        and (not causal or base + kb * bn + j <= query + i // head_stride),
+                        (
+                            T.exp2((score[i, j] - maximum[i]) * 1.4426950408889634)
+                            if base2
+                            else T.exp(score[i, j] - maximum[i])
+                        ),
                         0,
                     )
                     p[i, j] = score[i, j]
                 T.reduce_sum(score, rowsum, dim=1)
-                for i in T.Parallel(bm):
-                    correction[i] = T.exp(previous[i] - maximum[i])
+                for i in T.Parallel(query_rows):
+                    correction[i] = (
+                        T.exp2((previous[i] - maximum[i]) * 1.4426950408889634)
+                        if base2
+                        else T.exp(previous[i] - maximum[i])
+                    )
                     denom[i] = denom[i] * correction[i] + rowsum[i]
-                for i, d in T.Parallel(bm, padded):
+                for i, d in T.Parallel(query_rows, padded):
                     out[i, d] *= correction[i]
-                T.gemm(p, v, out)
-            for i, d in T.Parallel(bm, padded):
-                if query + i < rows and (not window or qb * bm + i < window) and d < dim:
-                    Y[query + i, head * dim + d] = T.if_then_else(
-                        query + i < end, out[i, d] / T.max(denom[i], 1e-30), 0
+                T.gemm(p, v, out, policy=policy)
+            for i, d in T.Parallel(query_rows, padded):
+                token = query + i // head_stride
+                head = work_head * head_group + i % head_stride
+                if (
+                    token < rows
+                    and (not window or qb * bm + i // head_stride < window)
+                    and d < dim
+                    and i % head_stride < head_group
+                ):
+                    Y[token, head * dim + d] = T.if_then_else(
+                        token < end, out[i, d] / T.max(denom[i], 1e-30), 0
                     )
 
     return kernel

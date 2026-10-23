@@ -355,6 +355,13 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
         ]),
         variants: Default::default(),
     });
+    m.row_execution.as_mut().unwrap().register_variants(
+        &m.programs,
+        request
+            .kernel_contracts
+            .iter()
+            .map(|kernel| kernel.name.as_str()),
+    )?;
     m.embedding.as_ref().unwrap().validate(&m)?;
     Ok((
         Box::new(Embedding),

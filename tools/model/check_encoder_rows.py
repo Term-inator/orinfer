@@ -19,14 +19,31 @@ def run():
     torch.manual_seed(20261002)
     device = dict(device="cuda")
     records = []
-    for causal in [False, True]:
+    layouts = [(True, 16, 1), (True, 16, 2), (False, 24, 1), (False, 24, 3)]
+    for causal, heads, group, bn, stages, base2, full_row in [
+        (*layout, *tile)
+        for layout in layouts
+        for tile in [(32, 0, False, False), (32, 0, False, True), (64, 1, True, True)]
+    ]:
         rows = 224
-        q = torch.randn(rows, 2048, **device).half() * 0.2
+        q = torch.randn(rows, heads * 128, **device).half() * 0.2
         k = torch.randn(rows, 1024, **device).half() * 0.2
         v = torch.randn_like(k)
         out = torch.empty_like(q)
         ranges = torch.zeros(rows, 2, dtype=torch.int32, **device)
-        kernel = primitive(attention, 2048, 16, kv_heads=8, causal=causal, segmented=True)
+        kernel = primitive(
+            attention,
+            heads * 128,
+            heads,
+            bn=bn,
+            head_group=group,
+            stages=stages,
+            base2=base2,
+            full_row=full_row,
+            kv_heads=8,
+            causal=causal,
+            segmented=True,
+        )
 
         def boundaries(lengths):
             ranges.zero_()
@@ -48,21 +65,48 @@ def run():
         for lengths in [[1, 33, 65, 31], [31, 65, 33, 1], [97, 65], [224]]:
             spans = boundaries(lengths)
             q.neg_()
+            out.fill_(91)
             graph.replay()
             for start, end in spans:
                 n = end - start
-                qs = q[start:end].view(n, 16, 128).transpose(0, 1)[None]
+                qs = q[start:end].view(n, heads, 128).transpose(0, 1)[None]
                 ks, vs = [
-                    x[start:end].view(n, 8, 128).transpose(0, 1).repeat_interleave(2, 0)[None]
+                    x[start:end]
+                    .view(n, 8, 128)
+                    .transpose(0, 1)
+                    .repeat_interleave(heads // 8, 0)[None]
                     for x in (k, v)
                 ]
                 expected = (
                     F.scaled_dot_product_attention(qs, ks, vs, is_causal=causal)[0]
                     .transpose(0, 1)
-                    .reshape(n, 2048)
+                    .reshape(n, heads * 128)
                 )
                 torch.testing.assert_close(out[start:end], expected, atol=0.003, rtol=0.003)
-            records.append(dict(causal=causal, lengths=lengths, graph=True))
+            padding = torch.ones(rows, device="cuda", dtype=torch.bool)
+            for start, end in spans:
+                padding[start:end] = False
+            assert bool(torch.all(out[padding] == 0))
+            records.append(
+                dict(
+                    causal=causal,
+                    heads=heads,
+                    head_group=group,
+                    bn=bn,
+                    stages=stages,
+                    base2=base2,
+                    full_row=full_row,
+                    lengths=lengths,
+                    graph=True,
+                    padding_zero=True,
+                )
+            )
+        if causal:
+            saved = out[:-1].clone()
+            k[-1].neg_()
+            v[-1].add_(10)
+            graph.replay()
+            torch.testing.assert_close(out[:-1], saved, atol=0, rtol=0)
         # Changed neighboring owners and poisoned padding cannot affect owner zero.
         spans = boundaries([1, 33, 65, 31])
         graph.replay()

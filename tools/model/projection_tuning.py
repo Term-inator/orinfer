@@ -410,9 +410,9 @@ class ProjectionTuner:
     def compile_choices(self, *args, fixed=(), **kwargs):
         """Bounded AOT row choices from the same dynamic projection body.
 
-        These specialize small packets without replacing the one prefill
-        fallback. Every emitted interval comes from measured, numerically
-        checked candidates, rather than a hand-written batch threshold.
+        The caller supplies the bounded allocation and retains its fallback.
+        Every emitted interval comes from measured, numerically checked
+        candidates, rather than a hand-written batch threshold.
         """
         import tilelang
         from tools.model.row_selection import choices, ranges

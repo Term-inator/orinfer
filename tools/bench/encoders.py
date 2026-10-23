@@ -54,6 +54,15 @@ def outputs(task, backend, response, size):
     return vectors
 
 
+def prompt_tokens(response):
+    count = response.get("usage", {}).get("prompt_tokens")
+    if count is None:
+        count = response.get("meta", {}).get("billed_units", {}).get("input_tokens")
+    if type(count) is not int or count < 1:
+        raise ValueError("Encoder benchmark requires actual input token usage")
+    return count
+
+
 def measure(args):
     raw = args.requests.read_bytes()
     cases = json.loads(raw)["cases"]
@@ -77,6 +86,7 @@ def measure(args):
             raise ValueError("Use full batches of 1..128 items without top_n")
         wire = json.dumps(body, ensure_ascii=False).encode()
         durations = []
+        tokens = None
         for iteration in range(args.warmups + args.repetitions):
             started = time.perf_counter()
             req = urllib.request.Request(
@@ -89,6 +99,10 @@ def measure(args):
             # Include JSON decoding and complete output validation in latency.
             response = json.loads(payload)
             values = outputs(args.task, args.backend, response, size)
+            actual_tokens = prompt_tokens(response)
+            if tokens is not None and actual_tokens != tokens:
+                raise ValueError("Repeated encoder requests changed input token count")
+            tokens = actual_tokens
             elapsed = time.perf_counter() - started
             if iteration >= args.warmups:
                 durations.append(elapsed)
@@ -97,6 +111,7 @@ def measure(args):
             dict(
                 id=case["id"],
                 items=size,
+                prompt_tokens=tokens,
                 durations_s=durations,
                 median_s=median,
                 items_per_s=size / median,
@@ -123,6 +138,13 @@ def compare(baseline, candidate):
         after = other[name]
         if before["items"] != after["items"]:
             raise ValueError("Benchmark batch size changed")
+        before_tokens = prompt_tokens(before.get("response", {}))
+        after_tokens = prompt_tokens(after.get("response", {}))
+        if before_tokens != after_tokens:
+            raise ValueError(
+                f"Input token count differs for {name}: {before_tokens} vs {after_tokens}; "
+                "align templates and truncation before comparing"
+            )
         speedup = before["median_s"] / after["median_s"]
         quality = {}
         if baseline["task"] == "embedding":
@@ -139,7 +161,15 @@ def compare(baseline, candidate):
             quality["mean_probability_error"] = statistics.mean(
                 abs(x - y) for x, y in zip(a, b, strict=True)
             )
-        comparisons.append(dict(id=name, speedup=speedup, reaches_2x=speedup >= 2, quality=quality))
+        comparisons.append(
+            dict(
+                id=name,
+                prompt_tokens=before_tokens,
+                speedup=speedup,
+                reaches_2x=speedup >= 2,
+                quality=quality,
+            )
+        )
     return dict(
         task=baseline["task"],
         baseline_identity=baseline["identity"],

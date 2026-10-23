@@ -64,6 +64,56 @@ pub struct RowExecution {
 }
 
 impl RowExecution {
+    /// Register measured local choices against each program's actual allocation.
+    pub fn register_variants<'a>(
+        &mut self,
+        programs: &BTreeMap<String, Vec<Operation>>,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        let mut slots = BTreeMap::<&str, usize>::new();
+        for program in &self.programs {
+            let capacity = self.program_capacity(program);
+            for operation in programs
+                .get(program)
+                .ok_or("Missing row execution template")?
+            {
+                if let Operation::Kernel { name } = operation {
+                    slots
+                        .entry(name)
+                        .and_modify(|bound| *bound = (*bound).max(capacity))
+                        .or_insert(capacity);
+                }
+            }
+        }
+        let mut variants = BTreeMap::<String, Vec<KernelVariant>>::new();
+        for name in names {
+            let Some((slot, choice)) = specialization(name, self.capacity)? else {
+                continue;
+            };
+            let capacity = slots
+                .get(slot)
+                .ok_or("Local row choice has no computation slot")?;
+            if choice.max_rows > *capacity {
+                return Err("Local row choice exceeds its program allocation".into());
+            }
+            variants.entry(slot.into()).or_default().push(choice);
+        }
+        for choices in variants.values_mut() {
+            choices.sort_by_key(|choice| choice.min_rows);
+            if choices
+                .windows(2)
+                .any(|pair| pair[0].max_rows >= pair[1].min_rows)
+            {
+                return Err("Overlapping local row choices".into());
+            }
+        }
+        if !self.variants.is_empty() {
+            return Err("Local row choices were already registered".into());
+        }
+        self.variants = variants;
+        Ok(())
+    }
+
     pub fn validate(
         &self,
         programs: &BTreeMap<String, Vec<Operation>>,
@@ -268,6 +318,43 @@ mod tests {
             BTreeMap::from([("prefill".into(), program)]),
             dynamic,
         )
+    }
+
+    #[test]
+    fn measured_choices_cover_large_packets_and_respect_each_program() {
+        let (mut rows, programs, mut dynamic) = fixture();
+        rows.capacity = 32768;
+        rows.variants.clear();
+        for launch in dynamic.values_mut() {
+            launch.capacity = 32768;
+        }
+        let selected = "projection/rows/2049-32768";
+        rows.register_variants(&programs, ["projection", selected])
+            .unwrap();
+        let mut launch = dynamic["projection"].clone();
+        launch.capacity = 32768;
+        dynamic.insert("projection".into(), launch.clone());
+        launch.name = selected.into();
+        dynamic.insert(selected.into(), launch);
+        for (extent, expected) in [(2048, "projection"), (2049, selected), (32768, selected)] {
+            let calls = rows
+                .specialize("prefill", &programs["prefill"], &dynamic, extent)
+                .unwrap();
+            assert!(matches!(&calls[0].operation, Operation::Kernel { name } if name == expected));
+            assert_eq!(calls[0].launch.as_ref().unwrap().grid[0], extent as u32);
+        }
+        rows.variants.clear();
+        assert!(
+            rows.register_variants(&programs, ["unknown/rows/1-2"])
+                .is_err()
+        );
+        assert!(
+            rows.register_variants(&programs, ["projection/rows/1-8", "projection/rows/8-16"])
+                .is_err()
+        );
+        rows.program_capacities.insert("prefill".into(), 1024);
+        assert!(rows.register_variants(&programs, [selected]).is_err());
+        assert!(rows.variants.is_empty());
     }
 
     #[test]

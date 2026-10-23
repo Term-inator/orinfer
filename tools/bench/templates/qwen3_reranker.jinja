@@ -1,0 +1,8 @@
+{# Qwen3-Reranker prefix/body/suffix; explicit strings preserve final newlines. #}
+{%- set instruction = instruction | default("Given a web search query, retrieve relevant passages that answer the query", true) -%}
+{{- "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n" -}}
+{{- '<Instruct>: ' + instruction + '\n<Query>: ' -}}
+{{- messages | selectattr('role', 'eq', 'query') | map(attribute='content') | first -}}
+{{- '\n<Document>: ' -}}
+{{- messages | selectattr('role', 'eq', 'document') | map(attribute='content') | first -}}
+{{- "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n" -}}

@@ -6,7 +6,9 @@ from kernels.model.rows import row_count
 
 
 @orin_jit
-def qk_rope(capacity, dynamic_rows=True):
+def qk_rope(capacity, dynamic_rows=True, head_group=1):
+    if head_group not in (1, 2, 4, 8, 16, 32):
+        raise ValueError("Invalid Qwen3 head group")
     m = row_count(capacity, dynamic_rows)
 
     @T.prim_func
@@ -21,24 +23,26 @@ def qk_rope(capacity, dynamic_rows=True):
         K: T.Tensor((m, 1024), T.float16),
         V: T.Tensor((m, 1024), T.float16),
     ):
-        with T.Kernel(m, 32, threads=128) as (row, head):
-            values = T.alloc_fragment((128,), T.float32)
-            squares = T.alloc_fragment((128,), T.float32)
-            total = T.alloc_fragment((1,), T.float32)
-            normalized = T.alloc_shared((128,), T.float16)
-            for d in T.Parallel(128):
-                values[d] = T.cast(X[row, head * 128 + d], T.float32)
-                squares[d] = values[d] * values[d]
-            if head < 24:
-                T.reduce_sum(squares, total, dim=0)
-                for d in T.Parallel(128):
-                    v = T.cast(values[d] * T.rsqrt(total[0] / 128 + 1e-6), T.float16)
-                    normalized[d] = v * T.if_then_else(head < 16, QNorm[d], KNorm[d])
-                T.sync_threads()
-                for d in T.Parallel(128):
-                    a = T.cast(normalized[d] * Cos[row - Ranges[row, 0], d], T.float16)
+        with T.Kernel(m, 32 // head_group, threads=128) as (row, group):
+            values = T.alloc_fragment((head_group, 128), T.float32)
+            squares = T.alloc_fragment((head_group, 128), T.float32)
+            total = T.alloc_fragment((head_group,), T.float32)
+            normalized = T.alloc_shared((head_group, 128), T.float16)
+            for h, d in T.Parallel(head_group, 128):
+                values[h, d] = T.cast(X[row, (group * head_group + h) * 128 + d], T.float32)
+                squares[h, d] = values[h, d] * values[h, d]
+            T.reduce_sum(squares, total, dim=1)
+            for h, d in T.Parallel(head_group, 128):
+                head = group * head_group + h
+                v = T.cast(values[h, d] * T.rsqrt(total[h] / 128 + 1e-6), T.float16)
+                normalized[h, d] = v * T.if_then_else(head < 16, QNorm[d], KNorm[d])
+            T.sync_threads()
+            for h, d in T.Parallel(head_group, 128):
+                head = group * head_group + h
+                if head < 24:
+                    a = T.cast(normalized[h, d] * Cos[row - Ranges[row, 0], d], T.float16)
                     b = T.cast(
-                        normalized[(d + 64) % 128]
+                        normalized[h, (d + 64) % 128]
                         * T.if_then_else(
                             d < 64, -Sin[row - Ranges[row, 0], d], Sin[row - Ranges[row, 0], d]
                         ),
@@ -49,8 +53,7 @@ def qk_rope(capacity, dynamic_rows=True):
                         Q[row, head * 128 + d] = value
                     else:
                         K[row, (head - 16) * 128 + d] = value
-            else:
-                for d in T.Parallel(128):
+                else:
                     V[row, (head - 24) * 128 + d] = X[row, head * 128 + d]
 
     return main

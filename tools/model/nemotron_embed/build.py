@@ -118,7 +118,6 @@ class Builder(Projections):
 
     def transformer(self, *, vision=False):
         from kernels.model import embedding as e
-        from kernels.vision.encoder import attention
 
         p, root, layers, h, f, q, kv, heads, kv_heads = (
             ("V", "vision_tower.transformer.layers", 24, 1024, 4096, 1024, 1024, 16, 16)
@@ -145,11 +144,11 @@ class Builder(Projections):
             self.projection(base + "/qkv", fused, q + 2 * kv, h, p + "QKV", vision=vision)
             self.emit(
                 base + "/rope",
-                f"rope-{vision}",
+                f"rope-{vision}-grouped",
                 lambda: (
                     primitive(e.vision_rope, self.capacity)
                     if vision
-                    else primitive(e.text_rope, self.capacity)
+                    else primitive(e.text_rope, self.capacity, head_group=8)
                 ),
                 dict(
                     X=p + "QKV",
@@ -166,10 +165,11 @@ class Builder(Projections):
                 ),
                 vision=vision,
             )
-            self.emit(
+            self.attention(
                 base + "/attention",
-                f"attention-{q}-{heads}-{kv_heads}",
-                lambda: primitive(attention, q, heads, kv_heads=kv_heads, segmented=not vision),
+                q,
+                heads,
+                kv_heads,
                 dict(
                     Q=p + "Q",
                     K=p + "K",
@@ -185,8 +185,8 @@ class Builder(Projections):
             self.projection(base + "/o", attn + "o_proj.weight", h, q, p + "Product", vision=vision)
             self.emit(
                 base + "/add1",
-                f"add-{h}",
-                lambda: primitive(e.add, self.capacity, h),
+                f"add-{h}-tile1024",
+                lambda: primitive(e.add, self.capacity, h, block_size=1024),
                 dict(X=p + "Product", Residual=p + "Hidden", Y=p + "Hidden"),
                 vision=vision,
             )
@@ -206,8 +206,8 @@ class Builder(Projections):
             self.projection(base + "/gate_up", fused, 2 * f, h, p + "GateUp", vision=vision)
             self.emit(
                 base + "/swiglu",
-                f"swiglu-{f}",
-                lambda: primitive(e.activation, self.capacity, f),
+                f"swiglu-{f}-tile1024",
+                lambda: primitive(e.activation, self.capacity, f, block_size=1024),
                 dict(X=p + "GateUp", Y=p + "FFN"),
                 vision=vision,
             )
@@ -217,8 +217,8 @@ class Builder(Projections):
             )
             self.emit(
                 base + "/add2",
-                f"add-{h}",
-                lambda: primitive(e.add, self.capacity, h),
+                f"add-{h}-tile1024",
+                lambda: primitive(e.add, self.capacity, h, block_size=1024),
                 dict(X=p + "Product", Residual=p + "Hidden", Y=p + "Hidden"),
                 vision=vision,
             )

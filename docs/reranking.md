@@ -67,3 +67,5 @@ ORINFER_CHECKPOINT_DIR="$PWD/artifacts/reranker-build/model" \
 GPU 验证覆盖因果 GQA 非对齐尾部、未来 token 隔离、Q/K norm＋RoPE、最后位置二分类头及改变输入后的 Graph replay。完整请求对照原始 BF16 的二分类概率、KL 和排序，覆盖中英文、代码检索、自定义指令、较长文档、重复与反向输入、Graph/direct 一致性。这些用例用于接入验收，目标语料上的完整重排质量需另行评测。
 
 模型权重采用 Apache-2.0，保留官方来源及声明；引擎与 kernel 实现采用 LGPL-3.0-or-later。
+
+构建器用真实权重离线测量短 packet 和最大容量，按实际行数发布所选整数投影；在线直接读取选择表。文本 attention 合并共享 K/V 的查询头，使用有界异步读取，各输入保留独立的真实边界。旋转量化复用寄存器实现，权重保持单份压缩表示。完整请求性能使用[嵌入与重排基准工具](../tools/bench/README.md)对照相同输入的 vLLM BF16；模型包、行容量和各档加速比分别记录。

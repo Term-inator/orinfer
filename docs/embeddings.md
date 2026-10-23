@@ -93,3 +93,5 @@ ORINFER_CHECKPOINT_DIR="$PWD/artifacts/nemotron-build/model" \
 模型权重遵循 [OpenMDW-1.1](https://openmdw.ai/)，Ministral 基座遵循 Apache-2.0；保留 checkpoint 的 README 和来源 revision。引擎及 kernel 实现遵循本仓库 LGPL-3.0-or-later。
 
 同一请求内的多条输入可共享文本主干投影。各输入按 32 行对齐，保持独立的双向 attention、RoPE 位置和平均池化边界，填充不计入输入或池化；图片特征按 owner 写入各自的文本位置。Q/K/V 与 gate/up 使用无损拼接后的单份权重 bank。超过 packet 容量时按完整输入分包，输出顺序保持不变。新构建器的 `--context` 使用 512–32768 内的 32 倍数，旧执行包继续使用逐输入执行。
+
+构建器用真实权重离线测量短 packet 和最大容量，按实际行数发布所选整数投影；在线直接读取选择表。文本 attention 合并共享 K/V 的查询头，使用有界异步读取，各输入保留独立的真实边界。旋转量化复用寄存器实现，权重保持单份压缩表示。完整请求性能使用[嵌入与重排基准工具](../tools/bench/README.md)对照相同输入的 vLLM BF16；模型包、行容量和各档加速比分别记录。

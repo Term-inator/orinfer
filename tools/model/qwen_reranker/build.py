@@ -94,7 +94,6 @@ class Builder(Projections):
 
     def text(self):
         from kernels.model import e8p_q4, embedding as e, reranking as r, encoder_rows
-        from kernels.vision.encoder import attention
 
         self.emit(
             "embedding",
@@ -122,8 +121,8 @@ class Builder(Projections):
             self.projection(base + "/qkv", fused, 4096, 1024, "TQKV")
             self.emit(
                 base + "/qk_rope",
-                "qk-rope",
-                lambda: primitive(r.qk_rope, self.capacity),
+                "qk-rope-heads16",
+                lambda: primitive(r.qk_rope, self.capacity, head_group=16),
                 dict(
                     X="TQKV",
                     Ranges="RowRanges",
@@ -136,18 +135,20 @@ class Builder(Projections):
                     V="TValue",
                 ),
             )
-            self.emit(
+            self.attention(
                 base + "/attention",
-                "causal-gqa",
-                lambda: primitive(attention, 2048, 16, kv_heads=8, causal=True, segmented=True),
+                2048,
+                16,
+                8,
                 dict(Q="TQ", K="TK", V="TValue", Length="RowRanges", Y="TAttention"),
+                causal=True,
             )
             self.activation_input(base + "/quantize_o", "TAttention", 2048, compressed=False)
             self.projection(base + "/o", attn + "o_proj.weight", 1024, 2048, "TProduct")
             self.emit(
                 base + "/add1",
-                "add-1024",
-                lambda: primitive(e.add, self.capacity, 1024),
+                "add-1024-tile1024",
+                lambda: primitive(e.add, self.capacity, 1024, block_size=1024),
                 dict(X="TProduct", Residual="THidden", Y="THidden"),
             )
             self.norm(
@@ -161,16 +162,16 @@ class Builder(Projections):
             self.projection(base + "/gate_up", fused, 6144, 1024, "TGateUp")
             self.emit(
                 base + "/swiglu",
-                "swiglu-3072",
-                lambda: primitive(e.activation, self.capacity, 3072),
+                "swiglu-3072-tile1024",
+                lambda: primitive(e.activation, self.capacity, 3072, block_size=1024),
                 dict(X="TGateUp", Y="TFFN"),
             )
             self.activation_input(base + "/rotate_down", "TFFN", 3072)
             self.projection(base + "/down", mlp + "down_proj.weight", 1024, 3072, "TProduct")
             self.emit(
                 base + "/add2",
-                "add-1024",
-                lambda: primitive(e.add, self.capacity, 1024),
+                "add-1024-tile1024",
+                lambda: primitive(e.add, self.capacity, 1024, block_size=1024),
                 dict(X="TProduct", Residual="THidden", Y="THidden"),
             )
         self.norm("final_norm", "THidden", "TNorm", "model.norm.weight", 1024)

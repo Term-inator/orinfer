@@ -60,7 +60,9 @@ def rms_norm(capacity, hidden, epsilon=1e-5, dynamic_rows=True):
 
 
 @orin_jit
-def add(capacity, hidden, dynamic_rows=True):
+def add(capacity, hidden, dynamic_rows=True, block_size=256):
+    if block_size not in (128, 256, 512, 1024):
+        raise ValueError("Invalid encoder elementwise tile")
     m = row_count(capacity, dynamic_rows)
 
     @T.prim_func
@@ -69,9 +71,9 @@ def add(capacity, hidden, dynamic_rows=True):
         Residual: T.Tensor((m, hidden), T.float16),
         Y: T.Tensor((m, hidden), T.float16),
     ):
-        with T.Kernel(m, T.ceildiv(hidden, 256), threads=128) as (row, block):
-            for d in T.Parallel(256):
-                col = block * 256 + d
+        with T.Kernel(m, T.ceildiv(hidden, block_size), threads=128) as (row, block):
+            for d in T.Parallel(block_size):
+                col = block * block_size + d
                 if col < hidden:
                     Y[row, col] = T.cast(X[row, col], T.float32) + T.cast(
                         Residual[row, col], T.float32
@@ -81,7 +83,9 @@ def add(capacity, hidden, dynamic_rows=True):
 
 
 @orin_jit
-def activation(capacity, hidden, kind="swiglu", dynamic_rows=True):
+def activation(capacity, hidden, kind="swiglu", dynamic_rows=True, block_size=256):
+    if block_size not in (128, 256, 512, 1024):
+        raise ValueError("Invalid encoder elementwise tile")
     if kind not in ("swiglu", "gelu"):
         raise ValueError("Invalid embedding activation")
     m = row_count(capacity, dynamic_rows)
@@ -91,9 +95,9 @@ def activation(capacity, hidden, kind="swiglu", dynamic_rows=True):
         X: T.Tensor((m, hidden * (2 if kind == "swiglu" else 1)), T.float16),
         Y: T.Tensor((m, hidden), T.float16),
     ):
-        with T.Kernel(m, T.ceildiv(hidden, 256), threads=128) as (row, block):
-            for d in T.Parallel(256):
-                col = block * 256 + d
+        with T.Kernel(m, T.ceildiv(hidden, block_size), threads=128) as (row, block):
+            for d in T.Parallel(block_size):
+                col = block * block_size + d
                 if col < hidden:
                     value = T.cast(X[row, col], T.float32)
                     if kind == "swiglu":
@@ -113,7 +117,9 @@ def activation(capacity, hidden, kind="swiglu", dynamic_rows=True):
 
 
 @orin_jit
-def text_rope(capacity, heads=24, kv_heads=8, dim=128, dynamic_rows=True):
+def text_rope(capacity, heads=24, kv_heads=8, dim=128, dynamic_rows=True, head_group=1):
+    if head_group not in (1, 2, 4, 8):
+        raise ValueError("Invalid encoder RoPE head group")
     m = row_count(capacity, dynamic_rows)
     width = (heads + 2 * kv_heads) * dim
 
@@ -128,8 +134,9 @@ def text_rope(capacity, heads=24, kv_heads=8, dim=128, dynamic_rows=True):
         K: T.Tensor((m, kv_heads * dim), T.float16),
         V: T.Tensor((m, kv_heads * dim), T.float16),
     ):
-        with T.Kernel(m, heads + 2 * kv_heads, threads=128) as (row, head):
-            for d in T.Parallel(dim):
+        with T.Kernel(m, T.ceildiv(heads + 2 * kv_heads, head_group), threads=128) as (row, group):
+            for h, d in T.Parallel(head_group, dim):
+                head = group * head_group + h
                 if head < heads + kv_heads:
                     other = (d + dim // 2) % dim
                     # HF materializes both products in the activation dtype.
@@ -148,7 +155,7 @@ def text_rope(capacity, heads=24, kv_heads=8, dim=128, dynamic_rows=True):
                         Q[row, head * dim + d] = value * QScale[row - Ranges[row, 0]]
                     else:
                         K[row, (head - heads) * dim + d] = value
-                else:
+                elif head < heads + 2 * kv_heads:
                     V[row, (head - heads - kv_heads) * dim + d] = X[row, head * dim + d]
 
     return main

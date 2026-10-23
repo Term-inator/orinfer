@@ -74,18 +74,19 @@ def run(original):
             return [q.transpose(0, 1).reshape(n, 2048), k.transpose(0, 1).reshape(n, 1024), v]
 
         ranges = torch.zeros(n, 2, device="cuda", dtype=torch.int32)
-        kernel = primitive(r.qk_rope, 32768, dynamic_rows=True)
-        launch(kernel, ranges, x, qnorm, knorm, cos, sin, *outputs, n)
-        for a, b in zip(outputs, reference_rope()):
-            torch.testing.assert_close(a, b, atol=0.002, rtol=0.002)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        for group in [1, 4, 16, 32]:
+            kernel = primitive(r.qk_rope, 32768, dynamic_rows=True, head_group=group)
             launch(kernel, ranges, x, qnorm, knorm, cos, sin, *outputs, n)
-        x.neg_()
-        graph.replay()
-        for a, b in zip(outputs, reference_rope()):
-            torch.testing.assert_close(a, b, atol=0.002, rtol=0.002)
-        records.append(dict(kind="qk_rms_rope", rows=n, graph=True))
+            for a, b in zip(outputs, reference_rope()):
+                torch.testing.assert_close(a, b, atol=0.002, rtol=0.002)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch(kernel, ranges, x, qnorm, knorm, cos, sin, *outputs, n)
+            x.neg_()
+            graph.replay()
+            for a, b in zip(outputs, reference_rope()):
+                torch.testing.assert_close(a, b, atol=0.002, rtol=0.002)
+            records.append(dict(kind="qk_rms_rope", rows=n, head_group=group, graph=True))
     x = torch.randn(33, 1024, device="cuda", dtype=torch.float16)
     w = torch.randn(2, 1024, device="cuda", dtype=torch.float16)
     out = torch.empty(2, device="cuda")
@@ -98,6 +99,36 @@ def run(original):
     body = f"<Instruct>: {INSTRUCTION}\n<Query>: What is the capital of China?\n<Document>: The capital of China is Beijing."
     tokens = sum(
         [tokenizer.encode(s, add_special_tokens=False) for s in [PREFIX, body, SUFFIX]], []
+    )
+    template = (
+        Path(__file__).resolve().parents[2] / "bench/templates/qwen3_reranker.jinja"
+    ).read_text()
+    rendered = tokenizer.apply_chat_template(
+        [
+            dict(role="query", content="What is the capital of China?"),
+            dict(role="document", content="The capital of China is Beijing."),
+        ],
+        chat_template=template,
+        tokenize=False,
+    )
+    assert tokenizer.encode(rendered, add_special_tokens=False) == tokens
+    custom = "Check the complete document."
+    query, document = "Question?\n", "First line.\nSecond line.\n"
+    rendered = tokenizer.apply_chat_template(
+        [dict(role="document", content=document), dict(role="query", content=query)],
+        chat_template=template,
+        tokenize=False,
+        instruction=custom,
+    )
+    expected = PREFIX + f"<Instruct>: {custom}\n<Query>: {query}\n<Document>: {document}" + SUFFIX
+    assert rendered == expected
+    records.append(
+        dict(
+            kind="benchmark_template",
+            exact_token_ids=True,
+            custom_instruction=True,
+            preserves_final_newlines=True,
+        )
     )
     return dict(
         passed=True,

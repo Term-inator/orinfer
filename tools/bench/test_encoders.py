@@ -3,7 +3,7 @@
 import copy
 import unittest
 
-from encoders import compare, outputs, request
+from encoders import compare, outputs, prompt_tokens, request
 
 
 class EncoderBenchTests(unittest.TestCase):
@@ -13,8 +13,20 @@ class EncoderBenchTests(unittest.TestCase):
             requests_sha256="same",
             identity={},
             cases=[
-                dict(id="single", items=1, median_s=4, outputs=[0.9]),
-                dict(id="batch", items=2, median_s=4, outputs=[0.9, 0.1]),
+                dict(
+                    id="single",
+                    items=1,
+                    median_s=4,
+                    outputs=[0.9],
+                    response=dict(usage=dict(prompt_tokens=170)),
+                ),
+                dict(
+                    id="batch",
+                    items=2,
+                    median_s=4,
+                    outputs=[0.9, 0.1],
+                    response=dict(usage=dict(prompt_tokens=340)),
+                ),
             ],
         )
         candidate = copy.deepcopy(baseline)
@@ -26,6 +38,20 @@ class EncoderBenchTests(unittest.TestCase):
         candidate["requests_sha256"] = "changed"
         with self.assertRaises(ValueError):
             compare(baseline, candidate)
+
+    def test_template_or_truncation_mismatch_rejects_a_speedup(self):
+        case = dict(
+            id="a", items=1, median_s=1, outputs=[0.9], response=dict(usage=dict(prompt_tokens=170))
+        )
+        baseline = dict(task="rerank", requests_sha256="same", identity={}, cases=[case])
+        candidate = copy.deepcopy(baseline)
+        candidate["cases"][0]["response"]["usage"]["prompt_tokens"] = 99
+        with self.assertRaisesRegex(ValueError, "Input token count differs"):
+            compare(baseline, candidate)
+        self.assertEqual(prompt_tokens(dict(meta=dict(billed_units=dict(input_tokens=89)))), 89)
+        for response in [{}, dict(usage=dict(prompt_tokens=0))]:
+            with self.assertRaises(ValueError):
+                prompt_tokens(response)
 
     def test_missing_case_or_document_cannot_inflate_throughput(self):
         with self.assertRaises(ValueError):

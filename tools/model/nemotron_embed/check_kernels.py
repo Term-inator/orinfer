@@ -67,6 +67,39 @@ def run():
 
     error = check(kernel, [x, w, out, n], out, reference, x.neg_, 0.01)
     records.append(dict(kind="rms", max_abs=error, graph=True))
+    for hidden in [1009, 3073]:
+        x = torch.randn(7, hidden * 2, device="cuda", dtype=torch.float16)
+        residual = torch.randn(7, hidden, device="cuda", dtype=torch.float16)
+        out = torch.empty_like(residual)
+        for block_size in [256, 512, 1024]:
+            for kind in ["add", "swiglu"]:
+                kernel = primitive(
+                    e.add if kind == "add" else e.activation,
+                    32768,
+                    hidden,
+                    dynamic_rows=True,
+                    block_size=block_size,
+                )
+                source = x[:, :hidden].contiguous() if kind == "add" else x
+                inputs = [source, residual, out, 7] if kind == "add" else [source, out, 7]
+
+                def reference():
+                    if kind == "add":
+                        return (source.float() + residual.float()).half()
+                    return F.silu(source[:, :hidden]).half() * source[:, hidden:]
+
+                check(kernel, inputs, out, reference, source.neg_, 0)
+                torch.testing.assert_close(out, reference(), atol=0, rtol=0)
+                records.append(
+                    dict(
+                        kind=kind,
+                        hidden=hidden,
+                        block_size=block_size,
+                        nonaligned=True,
+                        bit_exact=True,
+                        graph=True,
+                    )
+                )
     grid = torch.tensor([6, 10], device="cuda", dtype=torch.int32)
     x = torch.randn(60, 1024, device="cuda", dtype=torch.float16)
     out = torch.empty(15, 4096, device="cuda", dtype=torch.float16)
@@ -142,18 +175,21 @@ def run():
             ]
 
         ranges = torch.zeros(n, 2, device="cuda", dtype=torch.int32)
-        kernel = primitive(e.text_rope, n, dynamic_rows=True)
-        launch(kernel, ranges, x, cos, sin, scale, *output, n)
-        for actual, expected in zip(output, expected_text_rope()):
-            torch.testing.assert_close(actual, expected, atol=0.0005, rtol=0.002)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        for group in [1, 4, 8]:
+            kernel = primitive(e.text_rope, n, dynamic_rows=True, head_group=group)
             launch(kernel, ranges, x, cos, sin, scale, *output, n)
-        x.neg_()
-        graph.replay()
-        for actual, expected in zip(output, expected_text_rope()):
-            torch.testing.assert_close(actual, expected, atol=0.0005, rtol=0.002)
-        records.append(dict(kind="text_yarn_and_attention_scale", rows=n, graph=True))
+            for actual, expected in zip(output, expected_text_rope()):
+                torch.testing.assert_close(actual, expected, atol=0.0005, rtol=0.002)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch(kernel, ranges, x, cos, sin, scale, *output, n)
+            x.neg_()
+            graph.replay()
+            for actual, expected in zip(output, expected_text_rope()):
+                torch.testing.assert_close(actual, expected, atol=0.0005, rtol=0.002)
+            records.append(
+                dict(kind="text_yarn_and_attention_scale", rows=n, head_group=group, graph=True)
+            )
     x = torch.randn(65, 2048, device="cuda", dtype=torch.float16)
     mean = torch.empty(2048, device="cuda", dtype=torch.float32)
     out = torch.empty_like(mean)
