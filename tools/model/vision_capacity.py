@@ -63,7 +63,9 @@ def rebuild_overlays(data, package, manifest, compiler, capacity):
         pointers = compiler.pointers(old)
         dynamic = dynamics.get(name)
         rows = dynamic["capacity"] if dynamic else old["grid"][0]
-        symbolic = bool(dynamic)
+        # Legacy verification entries may publish a constant launch template
+        # without a row scalar. Preserve that ABI as well as truly dynamic ones.
+        symbolic = any(arg["kind"] == "i32" for arg in old["args"])
         if set(pointers) == {"Embedding", "Features", "Index", "Position"}:
 
             def build(rows=rows, symbolic=symbolic):

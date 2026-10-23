@@ -184,6 +184,15 @@ fn validate_visual_capacity_and_compact_inputs() {
             launch,
             views: BTreeMap::new(),
         }];
+        // Each operation has one registered plan per membership/row shape.
+        // Keep target and draft captures in their actual runtime roles.
+        let operation = if kernel.name.contains("/mtp/") || kernel.name.contains("/warm/") {
+            orinfer_model_sdk::abi::BatchOperation::Warm
+        } else if kernel.name.contains("mtp_verify/") {
+            orinfer_model_sdk::abi::BatchOperation::Verification
+        } else {
+            orinfer_model_sdk::abi::BatchOperation::Ordinary
+        };
         for replay in 0..3 {
             let values = [0.25 + replay as f32 * 0.125, -0.5];
             let bytes: Vec<_> = values
@@ -203,20 +212,16 @@ fn validate_visual_capacity_and_compact_inputs() {
             model.upload_ids(&position, &[0]).unwrap();
             model
                 .execution
-                .execute_batch_operation(
-                    orinfer_model_sdk::abi::BatchOperation::Ordinary,
-                    vec![(slot, rows)],
-                    &plan,
-                    false,
-                    true,
-                )
+                .execute_batch_operation(operation, vec![(slot, rows)], &plan, false, true)
                 .unwrap();
             let n = rows.min(2) * v.hidden * 2;
-            assert_eq!(
-                model.execution.download_bytes(&output, n).unwrap(),
-                bytes[..n],
-                "{} replay={replay}",
-                kernel.name
+            let actual = model.execution.download_bytes(&output, n).unwrap();
+            assert!(
+                actual == bytes[..n],
+                "{} replay={replay}: expected {:?}, got {:?}",
+                kernel.name,
+                &bytes[..16],
+                &actual[..16]
             );
         }
         checked.push(kernel.name);
