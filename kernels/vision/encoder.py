@@ -295,7 +295,10 @@ def attention(
     windowed_lengths: bool = False,
     kv_heads: int | None = None,
     causal: bool = False,
+    segmented: bool = False,
 ):
+    if segmented and (window or windowed_lengths):
+        raise ValueError("Segmented attention uses independent complete sequences")
     dim = hidden // heads
     kv_heads = heads if kv_heads is None else kv_heads
     if hidden % heads or heads % kv_heads:
@@ -309,7 +312,7 @@ def attention(
         Q: T.Tensor((rows, hidden), dtype),
         K: T.Tensor((rows, kv_heads * dim), dtype),
         V: T.Tensor((rows, kv_heads * dim), dtype),
-        Length: T.Tensor((length_count,), T.int32),
+        Length: T.Tensor((rows, 2) if segmented else (length_count,), T.int32),
         Y: T.Tensor((rows, hidden), dtype),
     ):
         with T.Kernel(
@@ -318,11 +321,16 @@ def attention(
             T.ceildiv(rows, window) if window else 1,
             threads=128,
         ) as (qb, head, segment):
-            base = segment * window
+            base = Length[qb * bm, 0] if segmented else segment * window
+            query = qb * bm if segmented else base + qb * bm
             end = (
-                base + T.min(Length[segment], window)
-                if windowed_lengths
-                else (T.min(Length[0], base + window) if window else Length[0])
+                Length[qb * bm, 1]
+                if segmented
+                else (
+                    base + T.min(Length[segment], window)
+                    if windowed_lengths
+                    else (T.min(Length[0], base + window) if window else Length[0])
+                )
             )
             q = T.alloc_shared((bm, padded), dtype)
             k = T.alloc_shared((bn, padded), dtype)
@@ -340,10 +348,10 @@ def attention(
             T.clear(out)
             for i, d in T.Parallel(bm, padded):
                 q[i, d] = T.if_then_else(
-                    base + qb * bm + i < end and d < dim, Q[base + qb * bm + i, head * dim + d], 0
+                    query + i < end and d < dim, Q[query + i, head * dim + d], 0
                 )
             for kb in T.serial(
-                T.ceildiv(T.min(end - base, (qb + 1) * bm) if causal else end - base, bn)
+                T.ceildiv(T.min(end - base, query - base + bm) if causal else end - base, bn)
             ):
                 for j, d in T.Parallel(bn, padded):
                     k[j, d] = T.if_then_else(
@@ -363,14 +371,16 @@ def attention(
                     previous[i] = maximum[i]
                 for i, j in T.Parallel(bm, bn):
                     score[i, j] = T.if_then_else(
-                        base + kb * bn + j < end and (not causal or kb * bn + j <= qb * bm + i),
+                        base + kb * bn + j < end
+                        and (not causal or base + kb * bn + j <= query + i),
                         score[i, j] * math.sqrt(1.0 / dim),
                         -1e30,
                     )
                 T.reduce_max(score, maximum, dim=1, clear=False)
                 for i, j in T.Parallel(bm, bn):
                     score[i, j] = T.if_then_else(
-                        base + kb * bn + j < end and (not causal or kb * bn + j <= qb * bm + i),
+                        base + kb * bn + j < end
+                        and (not causal or base + kb * bn + j <= query + i),
                         T.exp(score[i, j] - maximum[i]),
                         0,
                     )
@@ -383,9 +393,9 @@ def attention(
                     out[i, d] *= correction[i]
                 T.gemm(p, v, out)
             for i, d in T.Parallel(bm, padded):
-                if base + qb * bm + i < rows and (not window or qb * bm + i < window) and d < dim:
-                    Y[base + qb * bm + i, head * dim + d] = T.if_then_else(
-                        base + qb * bm + i < end, out[i, d] / T.max(denom[i], 1e-30), 0
+                if query + i < rows and (not window or qb * bm + i < window) and d < dim:
+                    Y[query + i, head * dim + d] = T.if_then_else(
+                        query + i < end, out[i, d] / T.max(denom[i], 1e-30), 0
                     )
 
     return kernel

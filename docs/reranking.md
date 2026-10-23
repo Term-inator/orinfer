@@ -25,7 +25,7 @@ operator wrapper 持有公共 GPU 锁，转换器的内部锁使用独立路径�
 
 已有完整 E8P 转换可用 `python -m tools.quantization.qwen_reranker --source-dir 原始BF16目录 --upgrade-from 已转换目录 --output 新目录` 按行块提升敏感矩阵精度，其余压缩值和二分类头保持原始字节，校验来源后原子发布。
 
-每个查询与文档对独立执行完整因果序列，复用共享行模板、整数投影、动态 GPU workspace 和 Graph，无跨请求 KV 状态。默认容量为 32768 token；`--context` 可设置 512–32768 的容量。模型配置、原始 yes/no ID 和前端资源固定并校验。
+每个查询与文档对保持独立的完整因果序列。同一请求内的多个文档共享投影执行，Q/K/V 与 gate/up 权重按输出行无损拼接。各序列按 32 行对齐，attention、RoPE 和最后位置输出使用各自的真实边界，填充不计入输入；改变边界后可复用同一容量的 Graph。超过单个 packet 行容量时按文档边界分包，结果保持输入索引。默认容量为 32768 token；`--context` 可设置 512–32768 内的 32 倍数。旧执行包仍可逐序列运行。模型配置、原始 yes/no ID 和前端资源固定并校验。
 
 ## 使用
 
@@ -61,6 +61,8 @@ ORINFER_CHECKPOINT_DIR="$PWD/artifacts/reranker-build/model" \
   artifacts/reranker-quality --original "$PWD/artifacts/reranker-source" \
   --model "$PWD/artifacts/reranker-build/model" --engine "$PWD/target/release/orinfer"
 ```
+
+共享独立行 kernel 可通过 `bash tools/operators/run.sh tools/model/check_encoder_rows.py artifacts/encoder-rows-check` 验证不同 owner、填充与改变边界后的 Graph replay。
 
 GPU 验证覆盖因果 GQA 非对齐尾部、未来 token 隔离、Q/K norm＋RoPE、最后位置二分类头及改变输入后的 Graph replay。完整请求对照原始 BF16 的二分类概率、KL 和排序，覆盖中英文、代码检索、自定义指令、较长文档、重复与反向输入、Graph/direct 一致性。这些用例用于接入验收，目标语料上的完整重排质量需另行评测。
 

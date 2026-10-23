@@ -19,29 +19,50 @@ fn operation(name: impl Into<String>) -> Operation {
         name: format!("nemotron/{}", name.into()),
     }
 }
-fn transformer(section: &str, layers: usize) -> Vec<Operation> {
+fn transformer(section: &str, layers: usize, packed_rows: bool) -> Vec<Operation> {
     let mut ops = Vec::new();
     for layer in 0..layers {
-        for role in [
-            "norm1",
-            "rotate_qkv",
-            "q",
-            "k",
-            "v",
-            "rope",
-            "attention",
-            "quantize_o",
-            "o",
-            "add1",
-            "norm2",
-            "rotate_gateup",
-            "gate",
-            "up",
-            "swiglu",
-            "rotate_down",
-            "down",
-            "add2",
-        ] {
+        let roles = if packed_rows {
+            vec![
+                "norm1",
+                "rotate_qkv",
+                "qkv",
+                "rope",
+                "attention",
+                "quantize_o",
+                "o",
+                "add1",
+                "norm2",
+                "rotate_gateup",
+                "gate_up",
+                "swiglu",
+                "rotate_down",
+                "down",
+                "add2",
+            ]
+        } else {
+            vec![
+                "norm1",
+                "rotate_qkv",
+                "q",
+                "k",
+                "v",
+                "rope",
+                "attention",
+                "quantize_o",
+                "o",
+                "add1",
+                "norm2",
+                "rotate_gateup",
+                "gate",
+                "up",
+                "swiglu",
+                "rotate_down",
+                "down",
+                "add2",
+            ]
+        };
+        for role in roles {
             ops.push(operation(format!("{section}/layer{layer}/{role}")));
         }
     }
@@ -233,6 +254,7 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
             "native_contiguous",
         )
     };
+    let packed_rows = spec.rows.is_some();
     matrix("language_model.embed_tokens.weight", 131072, 2048, false)?;
     for (root, layers, h, f, q, kv, vision) in [
         ("language_model.layers", 16, 2048, 6144, 3072, 1024, false),
@@ -251,12 +273,17 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
             let prefix = format!("{root}.{layer}");
             let attn = if vision { "attention" } else { "self_attn" };
             let mlp = if vision { "feed_forward" } else { "mlp" };
-            for (role, n, k, w8) in [
-                ("q", q, h, false),
-                ("k", kv, h, false),
-                ("v", kv, h, false),
-                ("o", h, q, true),
-            ] {
+            let attention = if packed_rows {
+                vec![("qkv", q + 2 * kv, h, false), ("o", h, q, true)]
+            } else {
+                vec![
+                    ("q", q, h, false),
+                    ("k", kv, h, false),
+                    ("v", kv, h, false),
+                    ("o", h, q, true),
+                ]
+            };
+            for (role, n, k, w8) in attention {
                 matrix(
                     &format!("{prefix}.{attn}.{role}_proj.weight"),
                     n,
@@ -264,7 +291,12 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
                     w8 || rotated_w8,
                 )?;
             }
-            for (role, n, k) in [("gate", f, h), ("up", f, h), ("down", h, f)] {
+            let ffn = if packed_rows {
+                vec![("gate_up", 2 * f, h), ("down", h, f)]
+            } else {
+                vec![("gate", f, h), ("up", f, h), ("down", h, f)]
+            };
+            for (role, n, k) in ffn {
                 matrix(
                     &format!("{prefix}.{mlp}.{role}_proj.weight"),
                     n,
@@ -294,10 +326,10 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
         matrix(&format!("multi_modal_projector.{role}.weight"), n, k, w8)?;
     }
     let mut text = vec![operation("text/embedding"), operation("text/overlay")];
-    text.extend(transformer("text", 16));
+    text.extend(transformer("text", 16, packed_rows));
     text.extend(["final_norm", "pool", "normalize"].map(|r| operation(format!("text/{r}"))));
     let mut vision = vec![operation("vision/patch"), operation("vision/pre_norm")];
-    vision.extend(transformer("vision", 24));
+    vision.extend(transformer("vision", 24, packed_rows));
     vision.extend(
         [
             "projector_norm",

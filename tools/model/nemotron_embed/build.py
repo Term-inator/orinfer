@@ -57,6 +57,7 @@ class Builder(Projections):
         if not np.array_equal(original_basis, basis()):
             raise ValueError("Encoded E8P basis differs from the kernel codebook")
         self.book = self.w.constant("E8PBook", e8p_selector_table(original_basis))
+        self.row_workspace()
         self.workspace()
         self.text()
         self.vision()
@@ -68,8 +69,8 @@ class Builder(Projections):
             ("Length", "i32", [1]),
             ("Control", "i32", [1]),
             ("FeatureIndex", "i32", [self.capacity]),
-            ("Mean", "f32", [2048]),
-            ("Embedding", "f32", [2048]),
+            ("Mean", "f32", [128, 2048]),
+            ("Embedding", "f32", [128, 2048]),
             ("Pixels", "f16", [self.patches, 588]),
             ("Grid", "i32", [2]),
             ("VisionLength", "i32", [1]),
@@ -138,17 +139,10 @@ class Builder(Projections):
                 vision=vision,
             )
             self.activation_input(base + "/rotate_qkv", p + "Norm", h, vision=vision)
-            for role, n, offset in [("q", q, 0), ("k", kv, q), ("v", kv, q + kv)]:
-                self.projection(
-                    base + "/" + role,
-                    attn + role + "_proj.weight",
-                    n,
-                    h,
-                    p + "QKV",
-                    vision=vision,
-                    stride=q + 2 * kv,
-                    offset=offset,
-                )
+            fused = self.w.combined_projection(
+                attn + "qkv_proj.weight", [attn + role + "_proj.weight" for role in ("q", "k", "v")]
+            )
+            self.projection(base + "/qkv", fused, q + 2 * kv, h, p + "QKV", vision=vision)
             self.emit(
                 base + "/rope",
                 f"rope-{vision}",
@@ -165,7 +159,9 @@ class Builder(Projections):
                     **(
                         dict(Grid="Grid")
                         if vision
-                        else dict(Cos="TextCos", Sin="TextSin", QScale="QueryScale")
+                        else dict(
+                            Cos="TextCos", Sin="TextSin", QScale="QueryScale", Ranges="RowRanges"
+                        )
                     ),
                 ),
                 vision=vision,
@@ -173,12 +169,12 @@ class Builder(Projections):
             self.emit(
                 base + "/attention",
                 f"attention-{q}-{heads}-{kv_heads}",
-                lambda: primitive(attention, q, heads, kv_heads=kv_heads),
+                lambda: primitive(attention, q, heads, kv_heads=kv_heads, segmented=not vision),
                 dict(
                     Q=p + "Q",
                     K=p + "K",
                     V=p + "Value",
-                    Length="VisionLength" if vision else "Length",
+                    Length="VisionLength" if vision else "RowRanges",
                     Y=p + "Attention",
                 ),
                 vision=vision,
@@ -203,17 +199,11 @@ class Builder(Projections):
                 vision=vision,
             )
             self.activation_input(base + "/rotate_gateup", p + "Norm", h, vision=vision)
-            for role, offset in [("gate", 0), ("up", f)]:
-                self.projection(
-                    base + "/" + role,
-                    mlp + role + "_proj.weight",
-                    f,
-                    h,
-                    p + "GateUp",
-                    stride=2 * f,
-                    offset=offset,
-                    vision=vision,
-                )
+            fused = self.w.combined_projection(
+                mlp + "gate_up_proj.weight",
+                [mlp + role + "_proj.weight" for role in ("gate", "up")],
+            )
+            self.projection(base + "/gate_up", fused, 2 * f, h, p + "GateUp", vision=vision)
             self.emit(
                 base + "/swiglu",
                 f"swiglu-{f}",
@@ -234,7 +224,7 @@ class Builder(Projections):
             )
 
     def text(self):
-        from kernels.model import e8p_q4, embedding as e
+        from kernels.model import e8p_q4, embedding as e, encoder_rows
 
         weight = "language_model.embed_tokens.weight"
         self.emit(
@@ -261,14 +251,14 @@ class Builder(Projections):
         self.emit(
             "text/pool",
             "pool",
-            lambda: primitive(e.pool, self.capacity, 2048),
-            dict(X="TNorm", Mean="Mean"),
+            lambda: primitive(encoder_rows.pool, 2048),
+            dict(X="TNorm", Mean="Mean", Segments="Segments", Count="SequenceCount"),
         )
         self.emit(
             "text/normalize",
             "normalize",
-            lambda: primitive(e.normalize, 2048),
-            dict(Mean="Mean", Output="Embedding"),
+            lambda: primitive(encoder_rows.normalize, 2048),
+            dict(Mean="Mean", Output="Embedding", Count="SequenceCount"),
             dynamic=False,
         )
 
@@ -363,6 +353,7 @@ class Builder(Projections):
 
         prepare_tokenizer(self.args.source, self.root / "tokenizer.json")
         spec = dict(
+            rows=self.row_spec(),
             dimension=2048,
             output="Embedding",
             program="embed",
@@ -463,10 +454,13 @@ def main():
     args = p.parse_args()
     if (
         not 512 <= args.context <= 32768
+        or args.context % 32
         or not 4 <= args.max_patches <= 12100
         or args.max_patches % 4
     ):
-        p.error("Context must be 512..32768 and vision capacity a multiple of four in 4..12100")
+        p.error(
+            "Context must be a multiple of 32 in 512..32768 and vision capacity a multiple of four in 4..12100"
+        )
     args.engine = args.engine.resolve(strict=True)
     with atomic_model(args.model_output) as root:
         Builder(args, root).publish()

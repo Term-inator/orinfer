@@ -32,3 +32,5 @@ pub const STATUS: &str = "Rust/TileLang resident image/text inference with OpenA
 pub const BENCHMARK_PLAN: &str = include_str!("../../../configs/benchmark.json");
 
 pub mod audio;
+
+mod encoder_rows;

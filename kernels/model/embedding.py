@@ -119,6 +119,7 @@ def text_rope(capacity, heads=24, kv_heads=8, dim=128, dynamic_rows=True):
 
     @T.prim_func
     def main(
+        Ranges: T.Tensor((m, 2), T.int32),
         X: T.Tensor((m, width), T.float16),
         Cos: T.Tensor((capacity, dim), T.float16),
         Sin: T.Tensor((capacity, dim), T.float16),
@@ -132,15 +133,19 @@ def text_rope(capacity, heads=24, kv_heads=8, dim=128, dynamic_rows=True):
                 if head < heads + kv_heads:
                     other = (d + dim // 2) % dim
                     # HF materializes both products in the activation dtype.
-                    a = T.cast(X[row, head * dim + d] * Cos[row, d], T.float16)
+                    a = T.cast(X[row, head * dim + d] * Cos[row - Ranges[row, 0], d], T.float16)
                     b = T.cast(
                         X[row, head * dim + other]
-                        * T.if_then_else(d < dim // 2, -Sin[row, d], Sin[row, d]),
+                        * T.if_then_else(
+                            d < dim // 2,
+                            -Sin[row - Ranges[row, 0], d],
+                            Sin[row - Ranges[row, 0], d],
+                        ),
                         T.float16,
                     )
                     value = T.cast(T.cast(a, T.float32) + T.cast(b, T.float32), T.float16)
                     if head < heads:
-                        Q[row, head * dim + d] = value * QScale[row]
+                        Q[row, head * dim + d] = value * QScale[row - Ranges[row, 0]]
                     else:
                         K[row, (head - heads) * dim + d] = value
                 else:

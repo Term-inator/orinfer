@@ -57,6 +57,7 @@ class Builder(Projections):
         if not np.array_equal(original, basis()):
             raise ValueError("Unexpected E8P basis")
         self.book = self.w.constant("E8PBook", e8p_selector_table(original))
+        self.row_workspace()
         self.workspace()
         self.text()
 
@@ -65,7 +66,7 @@ class Builder(Projections):
             ("Input", "i32", [self.capacity]),
             ("Length", "i32", [1]),
             ("Control", "i32", [1]),
-            ("ClassLogits", "f32", [2]),
+            ("ClassLogits", "f32", [128, 2]),
             ("THidden", "f16", [self.capacity, 1024]),
             ("TNorm", "f16", [self.capacity, 1024]),
             ("TQKV", "f16", [self.capacity, 4096]),
@@ -92,7 +93,7 @@ class Builder(Projections):
             self.w.constant(name, data[0].numpy())
 
     def text(self):
-        from kernels.model import e8p_q4, embedding as e, reranking as r
+        from kernels.model import e8p_q4, embedding as e, reranking as r, encoder_rows
         from kernels.vision.encoder import attention
 
         self.emit(
@@ -115,22 +116,17 @@ class Builder(Projections):
             mlp = root + "mlp."
             self.norm(base + "/norm1", "THidden", "TNorm", root + "input_layernorm.weight", 1024)
             self.activation_input(base + "/rotate_qkv", "TNorm", 1024)
-            for role, n, offset in [("q", 2048, 0), ("k", 1024, 2048), ("v", 1024, 3072)]:
-                self.projection(
-                    base + "/" + role,
-                    attn + role + "_proj.weight",
-                    n,
-                    1024,
-                    "TQKV",
-                    stride=4096,
-                    offset=offset,
-                )
+            fused = self.w.combined_projection(
+                attn + "qkv_proj.weight", [attn + role + "_proj.weight" for role in ("q", "k", "v")]
+            )
+            self.projection(base + "/qkv", fused, 4096, 1024, "TQKV")
             self.emit(
                 base + "/qk_rope",
                 "qk-rope",
                 lambda: primitive(r.qk_rope, self.capacity),
                 dict(
                     X="TQKV",
+                    Ranges="RowRanges",
                     QNorm=self.w.immutable(attn + "q_norm.weight", cast="float16"),
                     KNorm=self.w.immutable(attn + "k_norm.weight", cast="float16"),
                     Cos="TextCos",
@@ -143,8 +139,8 @@ class Builder(Projections):
             self.emit(
                 base + "/attention",
                 "causal-gqa",
-                lambda: primitive(attention, 2048, 16, kv_heads=8, causal=True),
-                dict(Q="TQ", K="TK", V="TValue", Length="Length", Y="TAttention"),
+                lambda: primitive(attention, 2048, 16, kv_heads=8, causal=True, segmented=True),
+                dict(Q="TQ", K="TK", V="TValue", Length="RowRanges", Y="TAttention"),
             )
             self.activation_input(base + "/quantize_o", "TAttention", 2048, compressed=False)
             self.projection(base + "/o", attn + "o_proj.weight", 1024, 2048, "TProduct")
@@ -158,16 +154,11 @@ class Builder(Projections):
                 base + "/norm2", "THidden", "TNorm", root + "post_attention_layernorm.weight", 1024
             )
             self.activation_input(base + "/rotate_gateup", "TNorm", 1024)
-            for role, offset in [("gate", 0), ("up", 3072)]:
-                self.projection(
-                    base + "/" + role,
-                    mlp + role + "_proj.weight",
-                    3072,
-                    1024,
-                    "TGateUp",
-                    stride=6144,
-                    offset=offset,
-                )
+            fused = self.w.combined_projection(
+                mlp + "gate_up_proj.weight",
+                [mlp + role + "_proj.weight" for role in ("gate", "up")],
+            )
+            self.projection(base + "/gate_up", fused, 6144, 1024, "TGateUp")
             self.emit(
                 base + "/swiglu",
                 "swiglu-3072",
@@ -186,9 +177,13 @@ class Builder(Projections):
         self.emit(
             "classifier",
             "two-class-head",
-            lambda: primitive(r.classifier, self.capacity),
+            lambda: primitive(encoder_rows.classifier),
             dict(
-                X="TNorm", W=self.w.immutable("orinfer.reranker.classifier.weight"), Y="ClassLogits"
+                X="TNorm",
+                W=self.w.immutable("orinfer.reranker.classifier.weight"),
+                Y="ClassLogits",
+                Segments="Segments",
+                Count="SequenceCount",
             ),
         )
 
@@ -209,6 +204,7 @@ class Builder(Projections):
         prepare_tokenizer(self.args.source, self.root / "tokenizer.json")
         ids = self.config["quantization_config"]["classifier_token_ids"]
         spec = dict(
+            rows=self.row_spec(),
             program="rerank",
             length="Length",
             output="ClassLogits",
@@ -296,8 +292,8 @@ def main():
     p.add_argument("--gpu-lock", type=Path, default=ROOT / "artifacts/gpu-experiment.lock")
     p.add_argument("--gpu-lock-held", action="store_true")
     args = p.parse_args()
-    if not 512 <= args.context <= 32768:
-        p.error("Context must be 512..32768")
+    if not 512 <= args.context <= 32768 or args.context % 32:
+        p.error("Context must be a multiple of 32 in 512..32768")
     args.engine = args.engine.resolve(strict=True)
     with atomic_model(args.model_output) as root:
         Builder(args, root).publish()

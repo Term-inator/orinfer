@@ -91,3 +91,5 @@ ORINFER_CHECKPOINT_DIR="$PWD/artifacts/nemotron-build/model" \
 算子检查覆盖双向 GQA、非对齐尾部、RMSNorm、Pixtral axial RoPE、patch 合并和改变输入后的 Graph replay。完整请求检查与官方 BF16 比较中文、英文、图片、图文和多图向量及检索排序，并验证反向输入顺序、变长工作区复用和 Graph/direct 一致性。这些用例用于接入验收，完整检索质量需要在目标语料上评测。
 
 模型权重遵循 [OpenMDW-1.1](https://openmdw.ai/)，Ministral 基座遵循 Apache-2.0；保留 checkpoint 的 README 和来源 revision。引擎及 kernel 实现遵循本仓库 LGPL-3.0-or-later。
+
+同一请求内的多条输入可共享文本主干投影。各输入按 32 行对齐，保持独立的双向 attention、RoPE 位置和平均池化边界，填充不计入输入或池化；图片特征按 owner 写入各自的文本位置。Q/K/V 与 gate/up 使用无损拼接后的单份权重 bank。超过 packet 容量时按完整输入分包，输出顺序保持不变。新构建器的 `--context` 使用 512–32768 内的 32 倍数，旧执行包继续使用逐输入执行。

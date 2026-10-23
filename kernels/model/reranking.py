@@ -11,6 +11,7 @@ def qk_rope(capacity, dynamic_rows=True):
 
     @T.prim_func
     def main(
+        Ranges: T.Tensor((m, 2), T.int32),
         X: T.Tensor((m, 4096), T.float16),
         QNorm: T.Tensor((128,), T.float16),
         KNorm: T.Tensor((128,), T.float16),
@@ -35,10 +36,12 @@ def qk_rope(capacity, dynamic_rows=True):
                     normalized[d] = v * T.if_then_else(head < 16, QNorm[d], KNorm[d])
                 T.sync_threads()
                 for d in T.Parallel(128):
-                    a = T.cast(normalized[d] * Cos[row, d], T.float16)
+                    a = T.cast(normalized[d] * Cos[row - Ranges[row, 0], d], T.float16)
                     b = T.cast(
                         normalized[(d + 64) % 128]
-                        * T.if_then_else(d < 64, -Sin[row, d], Sin[row, d]),
+                        * T.if_then_else(
+                            d < 64, -Sin[row - Ranges[row, 0], d], Sin[row - Ranges[row, 0], d]
+                        ),
                         T.float16,
                     )
                     value = T.cast(T.cast(a, T.float32) + T.cast(b, T.float32), T.float16)

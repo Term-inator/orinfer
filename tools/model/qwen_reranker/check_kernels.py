@@ -73,13 +73,14 @@ def run(original):
             q, k = apply_rotary_pos_emb(*normalized, cos, sin, unsqueeze_dim=0)
             return [q.transpose(0, 1).reshape(n, 2048), k.transpose(0, 1).reshape(n, 1024), v]
 
+        ranges = torch.zeros(n, 2, device="cuda", dtype=torch.int32)
         kernel = primitive(r.qk_rope, 32768, dynamic_rows=True)
-        launch(kernel, x, qnorm, knorm, cos, sin, *outputs, n)
+        launch(kernel, ranges, x, qnorm, knorm, cos, sin, *outputs, n)
         for a, b in zip(outputs, reference_rope()):
             torch.testing.assert_close(a, b, atol=0.002, rtol=0.002)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            launch(kernel, x, qnorm, knorm, cos, sin, *outputs, n)
+            launch(kernel, ranges, x, qnorm, knorm, cos, sin, *outputs, n)
         x.neg_()
         graph.replay()
         for a, b in zip(outputs, reference_rope()):

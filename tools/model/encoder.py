@@ -19,6 +19,24 @@ class Projections:
             row_divisor=divisor,
         )
 
+    def row_workspace(self):
+        for name, shape in [
+            ("RowRanges", [self.capacity, 2]),
+            ("Segments", [128, 2]),
+            ("SequenceCount", [1]),
+        ]:
+            self.w.fixed(name, "i32", shape)
+
+    @staticmethod
+    def row_spec():
+        return dict(
+            ranges="RowRanges",
+            segments="Segments",
+            count="SequenceCount",
+            max_sequences=128,
+            alignment=32,
+        )
+
     def norm(self, name, source, dest, weight, hidden, *, vision=False, divisor=1):
         from kernels.model.embedding import rms_norm
 
@@ -51,7 +69,9 @@ class Projections:
     def projection(
         self, name, weight, n, k, dest, *, vision=False, divisor=1, stride=None, offset=0
     ):
-        compressed = weight + ".packed" in self.w.index["weight_map"]
+        compressed = (
+            weight + ".packed" in self.w.index["weight_map"] or weight + ".packed" in self.w.buffers
+        )
         suffix, kind = (".packed", "e8p_q4") if compressed else (".int8", "w8")
         data, scale = self.w.immutable(weight + suffix), self.w.immutable(weight + ".scale")
         key = (kind, n, k, stride)
@@ -78,15 +98,35 @@ class Projections:
                     dynamic=True,
                     weights=actual,
                     weight_identity=identity,
-                    measure_rows=[16, 128, 512],
+                    measure_rows=sorted(
+                        {min(self.capacity, rows) for rows in (32, 128, 512, 2048)}
+                    ),
+                    objective="total_latency",
                     output_stride=stride,
                     packed_k=128 if compressed else 0,
-                    candidate_configs=[
-                        dict(algorithm="tensor_core", block_m=m, block_n=64, block_k=128, stages=2)
-                        for m in (16, 32, 64)
-                    ]
-                    if compressed
-                    else [dict(block_m=m, block_n=64, block_k=128) for m in (16, 32, 64)],
+                    candidate_configs=(
+                        [
+                            dict(
+                                algorithm="tensor_core",
+                                block_m=m,
+                                block_n=n,
+                                block_k=128,
+                                stages=stages,
+                            )
+                            for m, n, stages in [
+                                (32, 64, 2),
+                                (64, 64, 2),
+                                (128, 128, 1),
+                                (128, 128, 2),
+                                (256, 64, 1),
+                            ]
+                        ]
+                        if compressed
+                        else [
+                            dict(block_m=m, block_n=n, block_k=128)
+                            for m, n in [(32, 64), (64, 64), (128, 64), (128, 128)]
+                        ]
+                    ),
                 )
                 self.tuned[key] = kernel
                 write_json(self.args.output / f"projection-{kind}-{n}-{k}-{stride}.json", config)

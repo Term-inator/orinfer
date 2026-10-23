@@ -97,6 +97,7 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
     {
         return Err("Invalid reranker input or scoring roles".into());
     }
+    let packed_rows = spec.rows.is_some();
     use crate::artifact::{Access, Dtype};
     let require = |name: &str, dtype: Dtype, shape: &[usize], layout: &str| -> Result<()> {
         let b = m
@@ -153,12 +154,17 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
     for layer in 0..28 {
         let rotated_w8 = protected.contains(&layer);
         let root = format!("model.layers.{layer}");
-        for (role, n, k, w8) in [
-            ("q", 2048, 1024, false),
-            ("k", 1024, 1024, false),
-            ("v", 1024, 1024, false),
-            ("o", 1024, 2048, true),
-        ] {
+        let attention = if packed_rows {
+            vec![("qkv", 4096, 1024, false), ("o", 1024, 2048, true)]
+        } else {
+            vec![
+                ("q", 2048, 1024, false),
+                ("k", 1024, 1024, false),
+                ("v", 1024, 1024, false),
+                ("o", 1024, 2048, true),
+            ]
+        };
+        for (role, n, k, w8) in attention {
             matrix(
                 &format!("{root}.self_attn.{role}_proj.weight"),
                 n,
@@ -166,11 +172,16 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
                 w8 || rotated_w8,
             )?;
         }
-        for (role, n, k) in [
-            ("gate", 3072, 1024),
-            ("up", 3072, 1024),
-            ("down", 1024, 3072),
-        ] {
+        let ffn = if packed_rows {
+            vec![("gate_up", 6144, 1024), ("down", 1024, 3072)]
+        } else {
+            vec![
+                ("gate", 3072, 1024),
+                ("up", 3072, 1024),
+                ("down", 1024, 3072),
+            ]
+        };
+        for (role, n, k) in ffn {
             matrix(&format!("{root}.mlp.{role}_proj.weight"), n, k, rotated_w8)?;
         }
         for role in ["input_layernorm", "post_attention_layernorm"] {
@@ -192,8 +203,26 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
     }
     let mut program = vec![operation("embedding")];
     for layer in 0..28 {
-        program.extend(
-            [
+        let roles = if packed_rows {
+            vec![
+                "norm1",
+                "rotate_qkv",
+                "qkv",
+                "qk_rope",
+                "attention",
+                "quantize_o",
+                "o",
+                "add1",
+                "norm2",
+                "rotate_gateup",
+                "gate_up",
+                "swiglu",
+                "rotate_down",
+                "down",
+                "add2",
+            ]
+        } else {
+            vec![
                 "norm1",
                 "rotate_qkv",
                 "q",
@@ -213,7 +242,11 @@ pub(crate) fn create(request: CreateRequest, policy: Policy) -> Result<crate::re
                 "down",
                 "add2",
             ]
-            .map(|role| operation(format!("layer{layer}/{role}"))),
+        };
+        program.extend(
+            roles
+                .into_iter()
+                .map(|role| operation(format!("layer{layer}/{role}"))),
         );
     }
     program.extend([operation("final_norm"), operation("classifier")]);

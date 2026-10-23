@@ -141,13 +141,14 @@ def run():
                 v,
             ]
 
+        ranges = torch.zeros(n, 2, device="cuda", dtype=torch.int32)
         kernel = primitive(e.text_rope, n, dynamic_rows=True)
-        launch(kernel, x, cos, sin, scale, *output, n)
+        launch(kernel, ranges, x, cos, sin, scale, *output, n)
         for actual, expected in zip(output, expected_text_rope()):
             torch.testing.assert_close(actual, expected, atol=0.0005, rtol=0.002)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            launch(kernel, x, cos, sin, scale, *output, n)
+            launch(kernel, ranges, x, cos, sin, scale, *output, n)
         x.neg_()
         graph.replay()
         for actual, expected in zip(output, expected_text_rope()):

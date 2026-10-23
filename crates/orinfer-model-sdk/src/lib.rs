@@ -4,6 +4,7 @@ pub mod architecture;
 pub mod artifact;
 pub mod catalog;
 pub mod embedding;
+pub mod encoder_rows;
 pub mod execution;
 pub mod model;
 pub mod mtp;

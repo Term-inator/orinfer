@@ -103,3 +103,16 @@ ORINFER_BATCH_FIXTURE=/absolute/path/to/fixed-requests.json \
 ```
 
 输出保存完整 token 序列与各轮首输出、decode 和墙钟计时。自然完成的翻译、代码质量及 HTTP 排队性能分别使用上方 Chat API 工具验收。最新测量表及执行包身份见[性能参考](../../docs/performance.md)。
+
+
+`encoders.py` 测量完整嵌入或重排 HTTP 请求。冻结输入文件格式为 `{"cases":[{"id":"case","request":{...}}]}`；嵌入使用完整 `input` 数组和 `input_type`，重排使用 `query` 与完整 `documents` 数组。两个后端使用同一份文件，工具为 vLLM 的嵌入接口转换为 Cohere `/v2/embed`，保留图片顺序和 query/document 角色并禁止截断。测量期间由调用者持有全局 GPU 锁，独立服务使用私有 worker 锁，避免重复获取全局锁。身份文件记录引擎版本、模型来源及 revision、精度、执行包或容器 digest、启动参数和设备；输入 hash 固定在报告中。
+
+```sh
+python -m tools.bench.encoders --task rerank --backend orinfer \
+  --url http://127.0.0.1:8089 --model bench --requests inputs.json \
+  --identity native-identity.json --output native-results.json
+python -m tools.bench.encoders --compare vllm-results.json native-results.json \
+  --output comparison.json
+```
+
+默认每个 case 预热一次、测量五次，记录中位数时延、每秒完成项数、全部测量时延和完整响应。比较同时列出各 case 加速比、几何均值、整套工作量加速比及是否每项达到 2 倍；输出比较包含嵌入 cosine 或重排 top1 与概率误差。算子微测与某个 case 的结果各自说明，完整性能结论以相同配置和全部 workload 的真实结果为准。

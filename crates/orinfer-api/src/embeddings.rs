@@ -320,9 +320,15 @@ fn response(
     }
     let mut data = Vec::with_capacity(prepared.len());
     let mut tokens = 0usize;
-    for (index, p) in prepared.into_iter().enumerate() {
+    let vectors = model.embed_many(
+        &prepared
+            .iter()
+            .map(|p| (p.tokens.as_slice(), p.images.as_slice(), p.index.as_slice()))
+            .collect::<Vec<_>>(),
+        dimensions,
+    )?;
+    for (index, (p, vector)) in prepared.into_iter().zip(vectors).enumerate() {
         tokens += p.tokens.len();
-        let vector = model.embed(&p.tokens, &p.images, &p.index, dimensions)?;
         let embedding = if encoding == "base64" {
             let bytes: Vec<_> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
             json!(STANDARD.encode(bytes))

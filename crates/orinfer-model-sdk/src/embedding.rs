@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<crate::encoder_rows::Spec>,
     pub dimension: usize,
     pub output: String,
     pub program: String,
@@ -24,6 +26,9 @@ pub struct Spec {
 impl Spec {
     pub fn validate(&self, manifest: &crate::model::Manifest) -> crate::artifact::Result<()> {
         use crate::artifact::{Access, Dtype};
+        if let Some(rows) = &self.rows {
+            rows.validate(manifest)?;
+        }
         if self.dimension == 0
             || self.dimension > 16384
             || !(1..=64).contains(&self.patch_size)
@@ -40,7 +45,11 @@ impl Spec {
             return Err("Invalid independent embedding contract".into());
         }
         for (name, dtype, elements) in [
-            (&self.output, Dtype::F32, self.dimension),
+            (
+                &self.output,
+                Dtype::F32,
+                self.dimension * self.rows.as_ref().map_or(1, |r| r.max_sequences),
+            ),
             (&self.length, Dtype::I32, 1),
             (&self.feature_index, Dtype::I32, manifest.chunk_tokens),
             (&self.grid, Dtype::I32, 2),
@@ -150,5 +159,51 @@ mod tests {
             m.buffers.iter_mut().find(|b| b.name == name).unwrap().shape[0] += 1;
             assert!(m.validate().is_err(), "{name}");
         }
+    }
+    #[test]
+    fn packed_encoders_require_complete_owner_tables_and_batch_outputs() {
+        let mut m = manifest();
+        m.embedding.as_mut().unwrap().rows = Some(crate::encoder_rows::Spec {
+            ranges: "Ranges".into(),
+            segments: "Segments".into(),
+            count: "Count".into(),
+            max_sequences: 128,
+            alignment: 32,
+        });
+        m.buffers
+            .iter_mut()
+            .find(|b| b.name == "Output")
+            .unwrap()
+            .shape = vec![128, 8];
+        for (name, shape) in [
+            ("Ranges", vec![512, 2]),
+            ("Segments", vec![128, 2]),
+            ("Count", vec![1]),
+        ] {
+            m.buffers.push(
+                serde_json::from_value(json!({"name":name,"dtype":"i32",
+                "shape":shape,"layout":"native_contiguous","alignment":256,"access":"read_write"}))
+                .unwrap(),
+            );
+        }
+        m.validate().unwrap();
+        for name in ["Ranges", "Segments", "Count", "Output"] {
+            let mut wrong = m.clone();
+            wrong
+                .buffers
+                .iter_mut()
+                .find(|b| b.name == name)
+                .unwrap()
+                .shape[0] += 1;
+            assert!(wrong.validate().is_err(), "{name}");
+        }
+        m.embedding
+            .as_mut()
+            .unwrap()
+            .rows
+            .as_mut()
+            .unwrap()
+            .alignment = 16;
+        assert!(m.validate().is_err());
     }
 }

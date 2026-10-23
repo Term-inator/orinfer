@@ -86,6 +86,31 @@ impl Model {
         feature_index: &[i32],
         dimensions: Option<usize>,
     ) -> Result<Vec<f32>> {
+        if self.spec.rows.is_some() {
+            return Ok(self
+                .embed_many(&[(tokens, images, feature_index)], dimensions)?
+                .remove(0));
+        }
+        self.validate_input(tokens, images, feature_index, dimensions)?;
+        let dimension = dimensions.unwrap_or(self.spec.dimension);
+        let mut offset = 0;
+        self.upload_images(images, &mut offset)?;
+        let e = &self.execution;
+        e.upload_ids(&self.input, tokens)?;
+        e.upload_ids(&self.spec.length, &[tokens.len() as u32])?;
+        let index: Vec<u8> = feature_index.iter().flat_map(|i| i.to_le_bytes()).collect();
+        e.upload_bytes(&self.spec.feature_index, &index)?;
+        e.submit_program_rows(&self.spec.program, tokens.len(), ExecutionPhase::Prefill)?;
+        let bytes = e.download_bytes(&self.spec.output, self.spec.dimension * 4)?;
+        vector(&bytes, dimension)
+    }
+    fn validate_input(
+        &self,
+        tokens: &[u32],
+        images: &[crate::vision::ImageInput],
+        feature_index: &[i32],
+        dimensions: Option<usize>,
+    ) -> Result<usize> {
         let dimension = dimensions.unwrap_or(self.spec.dimension);
         if dimension == 0
             || dimension > self.spec.dimension
@@ -134,8 +159,14 @@ impl Model {
         if next != features {
             return Err("Unused embedding image features".into());
         }
+        Ok(features)
+    }
+    fn upload_images(
+        &self,
+        images: &[crate::vision::ImageInput],
+        offset: &mut usize,
+    ) -> Result<()> {
         let e = &self.execution;
-        let mut offset = 0;
         for image in images {
             let patches = image.grid_height * image.grid_width;
             let pixels: Vec<u8> = image
@@ -155,35 +186,87 @@ impl Model {
                 &self.spec.vision_output,
                 0,
                 &self.spec.features,
-                offset * self.spec.dimension * 2,
+                *offset * self.spec.dimension * 2,
                 count * self.spec.dimension * 2,
             )?;
-            offset += count;
+            *offset += count;
         }
-        e.upload_ids(&self.input, tokens)?;
-        e.upload_ids(&self.spec.length, &[tokens.len() as u32])?;
-        let index: Vec<u8> = feature_index.iter().flat_map(|i| i.to_le_bytes()).collect();
-        e.upload_bytes(&self.spec.feature_index, &index)?;
-        e.submit_program_rows(&self.spec.program, tokens.len(), ExecutionPhase::Prefill)?;
-        let bytes = e.download_bytes(&self.spec.output, self.spec.dimension * 4)?;
-        let mut output: Vec<f32> = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .take(dimension)
-            .map(|b| f32::from_le_bytes(*b))
-            .collect();
-        let norm = output
-            .iter()
-            .map(|&x| (x as f64).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        if !norm.is_finite() || norm <= 1e-12 {
-            return Err("Embedding execution produced a nonfinite or zero vector".into());
+        Ok(())
+    }
+    pub fn embed_many(
+        &mut self,
+        inputs: &[(&[u32], &[crate::vision::ImageInput], &[i32])],
+        dimensions: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let Some(rows) = self.spec.rows.clone() else {
+            return inputs
+                .iter()
+                .map(|&(tokens, images, index)| self.embed(tokens, images, index, dimensions))
+                .collect();
+        };
+        for &(tokens, images, index) in inputs {
+            self.validate_input(tokens, images, index, dimensions)?;
         }
-        for x in &mut output {
-            *x = (*x as f64 / norm) as f32;
+        let packets = rows.packets(
+            &inputs.iter().map(|t| t.0.len()).collect::<Vec<_>>(),
+            self.context,
+        )?;
+        let mut output = Vec::with_capacity(inputs.len());
+        for packet in packets {
+            let mut tokens = vec![0; packet.rows];
+            let mut indices = vec![-1i32; packet.rows];
+            let mut offset = 0;
+            for (owner, &[start, end]) in packet.segments.iter().enumerate() {
+                let (ids, images, index) = inputs[packet.first + owner];
+                tokens[start as usize..end as usize].copy_from_slice(ids);
+                for (target, &source) in indices[start as usize..end as usize].iter_mut().zip(index)
+                {
+                    if source >= 0 {
+                        *target = source + offset as i32;
+                    }
+                }
+                self.upload_images(images, &mut offset)?;
+            }
+            let e = &self.execution;
+            e.upload_ids(&self.input, &tokens)?;
+            e.upload_bytes(
+                &self.spec.feature_index,
+                &indices
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )?;
+            crate::encoder_rows::upload(e, &rows, &packet)?;
+            e.submit_program_rows(&self.spec.program, packet.rows, ExecutionPhase::Prefill)?;
+            let bytes = e.download_bytes(
+                &self.spec.output,
+                packet.segments.len() * self.spec.dimension * 4,
+            )?;
+            for item in bytes.chunks_exact(self.spec.dimension * 4) {
+                output.push(vector(item, dimensions.unwrap_or(self.spec.dimension))?);
+            }
         }
         Ok(output)
     }
+}
+fn vector(bytes: &[u8], dimension: usize) -> Result<Vec<f32>> {
+    let mut output: Vec<f32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .take(dimension)
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    let norm = output
+        .iter()
+        .map(|&x| (x as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() || norm <= 1e-12 {
+        return Err("Embedding execution produced a nonfinite or zero vector".into());
+    }
+    for x in &mut output {
+        *x = (*x as f64 / norm) as f32;
+    }
+    Ok(output)
 }

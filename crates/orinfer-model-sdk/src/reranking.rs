@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<crate::encoder_rows::Spec>,
     pub program: String,
     pub length: String,
     pub output: String,
@@ -13,6 +15,9 @@ pub struct Spec {
 impl Spec {
     pub fn validate(&self, m: &crate::model::Manifest) -> crate::artifact::Result<()> {
         use crate::artifact::{Access, Dtype};
+        if let Some(rows) = &self.rows {
+            rows.validate(m)?;
+        }
         if self.false_token_id == self.true_token_id
             || [self.false_token_id, self.true_token_id]
                 .iter()
@@ -27,7 +32,13 @@ impl Spec {
             return Err("Invalid independent reranking contract".into());
         }
         for (name, dtype, shape) in [
-            (&self.output, Dtype::F32, vec![2]),
+            (
+                &self.output,
+                Dtype::F32,
+                self.rows
+                    .as_ref()
+                    .map_or_else(|| vec![2], |r| vec![r.max_sequences, 2]),
+            ),
             (&self.length, Dtype::I32, vec![1]),
         ] {
             let buffer = m

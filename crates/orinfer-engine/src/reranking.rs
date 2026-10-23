@@ -73,7 +73,43 @@ impl Model {
     pub fn statistics(&self) -> &Statistics {
         &self.statistics
     }
+    pub fn score_many(&mut self, inputs: &[&[u32]]) -> Result<Vec<Score>> {
+        let Some(rows) = self.spec.rows.clone() else {
+            return inputs.iter().map(|tokens| self.score(tokens)).collect();
+        };
+        if inputs.iter().any(|t| {
+            t.is_empty() || t.len() > self.context || t.iter().any(|&id| id as usize >= self.vocab)
+        }) {
+            return Err("Invalid reranking tokens or context length".into());
+        }
+        let packets = rows.packets(
+            &inputs.iter().map(|t| t.len()).collect::<Vec<_>>(),
+            self.context,
+        )?;
+        let mut output = Vec::with_capacity(inputs.len());
+        for packet in packets {
+            let mut tokens = vec![0; packet.rows];
+            for (owner, &[start, end]) in packet.segments.iter().enumerate() {
+                tokens[start as usize..end as usize].copy_from_slice(inputs[packet.first + owner]);
+            }
+            let e = &self.execution;
+            e.upload_ids(&self.input, &tokens)?;
+            crate::encoder_rows::upload(e, &rows, &packet)?;
+            e.submit_program_rows(&self.spec.program, packet.rows, ExecutionPhase::Prefill)?;
+            for pair in e
+                .download_bytes(&self.spec.output, packet.segments.len() * 8)?
+                .as_chunks::<8>()
+                .0
+            {
+                output.push(score_from_bytes(pair)?);
+            }
+        }
+        Ok(output)
+    }
     pub fn score(&mut self, tokens: &[u32]) -> Result<Score> {
+        if self.spec.rows.is_some() {
+            return Ok(self.score_many(&[tokens])?.remove(0));
+        }
         if tokens.is_empty()
             || tokens.len() > self.context
             || tokens.iter().any(|&t| t as usize >= self.vocab)
@@ -89,20 +125,23 @@ impl Model {
             ExecutionPhase::Prefill,
         )?;
         let bytes = self.execution.download_bytes(&self.spec.output, 8)?;
-        let no_logit = f32::from_le_bytes(bytes[..4].try_into().unwrap());
-        let yes_logit = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        if !no_logit.is_finite() || !yes_logit.is_finite() {
-            return Err("Reranking produced nonfinite logits".into());
-        }
-        let difference = yes_logit as f64 - no_logit as f64;
-        let relevance_score = probability(difference);
-        Ok(Score {
-            no_logit,
-            yes_logit,
-            logit_difference: difference,
-            relevance_score,
-        })
+        score_from_bytes(&bytes)
     }
+}
+fn score_from_bytes(bytes: &[u8]) -> Result<Score> {
+    let no_logit = f32::from_le_bytes(bytes[..4].try_into().unwrap());
+    let yes_logit = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if !no_logit.is_finite() || !yes_logit.is_finite() {
+        return Err("Reranking produced nonfinite logits".into());
+    }
+    let difference = yes_logit as f64 - no_logit as f64;
+    let relevance_score = probability(difference);
+    Ok(Score {
+        no_logit,
+        yes_logit,
+        logit_difference: difference,
+        relevance_score,
+    })
 }
 fn probability(difference: f64) -> f64 {
     if difference >= 0.0 {

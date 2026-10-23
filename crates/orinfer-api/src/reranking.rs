@@ -212,10 +212,7 @@ fn response(
         .map(|doc| codec.prepare(request.instruction, request.query, document_text(doc)?))
         .collect::<Result<_>>()?;
     let total: usize = inputs.iter().map(Vec::len).sum();
-    let scores = inputs
-        .iter()
-        .map(|tokens| model.score(tokens))
-        .collect::<Result<Vec<_>>>()?;
+    let scores = model.score_many(&inputs.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
     let mut result = ranked(&request, &scores);
     result["model"] = json!(id);
     result["usage"] = json!({"prompt_tokens":total,"total_tokens":total});
