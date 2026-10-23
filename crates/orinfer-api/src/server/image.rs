@@ -92,6 +92,15 @@ pub fn preprocess(
     detail: &str,
     preparation: &mut super::preparation::Context,
 ) -> Result<ImageInput> {
+    preprocess_with_limit(data, v, detail, None, preparation)
+}
+fn preprocess_with_limit(
+    data: &[u8],
+    v: &VisionSpec,
+    detail: &str,
+    feature_limit: Option<usize>,
+    preparation: &mut super::preparation::Context,
+) -> Result<ImageInput> {
     if !["auto", "high", "low"].contains(&detail) {
         return Err("image_url.detail must be auto, high or low".into());
     }
@@ -107,17 +116,28 @@ pub fn preprocess(
     if source_pixels > 16_777_216 {
         return Err("Image exceeds decoded pixel limit".into());
     }
-    let max_pixels = if detail == "low" {
+    let factor = v.patch_size * v.merge_size;
+    let configured_pixels = if detail == "low" {
         MIN_PIXELS
     } else {
         (v.max_patches * v.patch_size * v.patch_size).min(16_777_216)
     };
+    let max_pixels = configured_pixels
+        .min(feature_limit.map_or(usize::MAX, |n| n.saturating_mul(factor * factor)));
+    if max_pixels < MIN_PIXELS {
+        return Err(
+            "Too many images for the model's minimum image detail; reduce the image count".into(),
+        );
+    }
     let (rh, rw) = resize_shape(
         height as usize,
         width as usize,
         v.patch_size * v.merge_size,
         max_pixels,
     )?;
+    if feature_limit.is_some_and(|limit| rh / factor * (rw / factor) > limit) {
+        return Err("Image aspect ratio exceeds its automatic image budget at minimum detail; reduce the image count".into());
+    }
     // Decode may hold RGBA/16-bit source, RGB conversion and resized patch FP32 together.
     preparation.checkpoint(data.len() + source_pixels * 12 + rh * rw * 16)?;
     let mut reader = ImageReader::new(Cursor::new(data))
@@ -133,11 +153,6 @@ pub fn preprocess(
         .decode()
         .map_err(|e| format!("Image decode: {e}"))?
         .to_rgb8();
-    let max_pixels = if detail == "low" {
-        MIN_PIXELS
-    } else {
-        (v.max_patches * v.patch_size * v.patch_size).min(16_777_216)
-    };
     let (height, width) = resize_shape(
         decoded.height() as usize,
         decoded.width() as usize,
@@ -201,8 +216,96 @@ pub fn messages(
     spec: Option<&VisionSpec>,
     preparation: &mut super::preparation::Context,
 ) -> Result<(Vec<Value>, Vec<ImageInput>)> {
-    let mut images = Vec::new();
-    let mut features = 0usize;
+    let mut descriptors = Vec::new();
+    for message in &messages {
+        if let Some(parts) = message["content"].as_array() {
+            for part in parts.iter().filter(|p| p["type"] == "image_url") {
+                if message["role"] != "user" {
+                    return Err("Image parts are supported in user messages".into());
+                }
+                let url = part["image_url"]["url"]
+                    .as_str()
+                    .ok_or("image_url requires url")?;
+                let detail = part["image_url"]
+                    .get("detail")
+                    .map(|v| v.as_str().ok_or("Invalid image detail"))
+                    .transpose()?
+                    .unwrap_or("auto");
+                if !["auto", "high", "low"].contains(&detail) {
+                    return Err("image_url.detail must be auto, high or low".into());
+                }
+                descriptors.push((url, detail));
+            }
+        }
+    }
+    let count = descriptors.len();
+    let mut prepared: Vec<Option<ImageInput>> =
+        std::iter::repeat_with(|| None).take(count).collect();
+    if count > 0 {
+        let v = spec.ok_or("This model manifest has no vision encoder")?;
+        let factor = v.patch_size * v.merge_size;
+        let minimum = MIN_PIXELS.div_ceil(factor * factor);
+        if count > v.max_features / minimum {
+            return Err(format!(
+                "Images exceed feature capacity at minimum image detail: {count} images, {} available features; reduce the image count",
+                v.max_features
+            ));
+        }
+        let mut features = 0usize;
+        // Honor explicit detail first, then divide the remaining capacity among
+        // automatic images. Output slots preserve original message/image order.
+        for (i, &(url, detail)) in descriptors
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, d))| *d != "auto")
+        {
+            let image = preprocess(&load(url, preparation)?, v, detail, preparation)?;
+            features = features
+                .checked_add(v.feature_count(&image)?)
+                .ok_or("Image feature count overflow")?;
+            if features > v.max_features {
+                return Err(format!(
+                    "Images exceed feature capacity: explicit detail requires {features} features, model limit {}; use auto/low detail or fewer images",
+                    v.max_features
+                ));
+            }
+            prepared[i] = Some(image);
+        }
+        let automatic = descriptors
+            .iter()
+            .filter(|(_, detail)| *detail == "auto")
+            .count();
+        if let Some(share) = (v.max_features - features).checked_div(automatic) {
+            if share < minimum {
+                return Err(format!(
+                    "Images exceed feature capacity: explicit detail leaves {} features for {automatic} automatic images; use auto/low detail or fewer images",
+                    v.max_features - features
+                ));
+            }
+            for (i, &(url, detail)) in descriptors
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, d))| *d == "auto")
+            {
+                let image = preprocess_with_limit(
+                    &load(url, preparation)?,
+                    v,
+                    detail,
+                    Some(share),
+                    preparation,
+                )?;
+                features = features
+                    .checked_add(v.feature_count(&image)?)
+                    .ok_or("Image feature count overflow")?;
+                prepared[i] = Some(image);
+            }
+            if features > v.max_features {
+                return Err("Images exceed feature capacity".into());
+            }
+        }
+    }
+    drop(descriptors);
+    let mut images = Vec::with_capacity(count);
     for message in &mut messages {
         let Some(parts) = message["content"].as_array() else {
             continue;
@@ -216,26 +319,11 @@ pub fn messages(
                 }
                 Some("audio") => content.push_str("<|audio_start|><|audio_pad|><|audio_end|>"),
                 Some("image_url") => {
-                    if message["role"] != "user" {
-                        return Err("Image parts are supported in user messages".into());
-                    }
-                    let v = spec.ok_or("This model manifest has no vision encoder")?;
-                    let url = part["image_url"]["url"]
-                        .as_str()
-                        .ok_or("image_url requires url")?;
-                    let detail = part["image_url"]
-                        .get("detail")
-                        .map(|v| v.as_str().ok_or("Invalid image detail"))
-                        .transpose()?
-                        .unwrap_or("auto");
-                    let image = preprocess(&load(url, preparation)?, v, detail, preparation)?;
-                    features = features
-                        .checked_add(v.feature_count(&image)?)
-                        .ok_or("Image feature count overflow")?;
-                    if features > v.max_features {
-                        return Err("Images exceed feature capacity".into());
-                    }
-                    images.push(image);
+                    images.push(
+                        prepared[images.len()]
+                            .take()
+                            .ok_or("Missing prepared image")?,
+                    );
                     content.push_str(MARKER);
                 }
                 _ => return Err("Supported content parts: text and image_url".into()),
@@ -334,6 +422,105 @@ mod tests {
                 .all(|i| i.pixels.iter().all(|p| p.is_finite()))
         );
         context.checkpoint(0).unwrap();
+    }
+    #[test]
+    #[ignore = "Real five-image request near the 32768-feature capacity; needs host RAM"]
+    fn automatic_large_images_fit_real_model_capacity() {
+        let spec: VisionSpec = serde_json::from_value(json!({"hidden":5120,"patch_size":16,
+            "temporal_patch_size":2,"merge_size":2,"max_patches":32768,"max_features":32768,
+            "pixels":"p","grid":"g","length":"l","output":"o","features":"f","feature_index":"i",
+            "mrope_positions":"r","plans":[{"patches":32768,"program":"v"}],"image_token_id":10,
+            "vision_start_token_id":11,"vision_end_token_id":12}))
+        .unwrap();
+        let image = image::RgbImage::from_pixel(4096, 2048, image::Rgb([32, 128, 224]));
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let url = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(encoded.get_ref())
+        );
+        let request: super::super::ChatRequest = serde_json::from_value(json!({"model":"test","messages":[
+            {"role":"user","content":(0..5).map(|_|json!({"type":"image_url","image_url":{"url":url}})).collect::<Vec<_>>()}]})).unwrap();
+        assert!(5 * (4096 / 32) * (2048 / 32) > spec.max_features);
+        let estimate =
+            crate::server::preparation::request_memory(&request, 262144, Some(&spec), 2048);
+        let mut context = estimate.context(std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let (_, images) = messages(request.messages, Some(&spec), &mut context).unwrap();
+        assert_eq!(images.len(), 5);
+        let features: usize = images.iter().map(|i| spec.feature_count(i).unwrap()).sum();
+        assert!(features <= spec.max_features);
+        assert!(features > 30000);
+        context.checkpoint(0).unwrap();
+    }
+    #[test]
+    fn automatic_images_share_features_and_preserve_input_order() {
+        let spec: VisionSpec = serde_json::from_value(json!({"hidden":5120,"patch_size":16,
+            "temporal_patch_size":2,"merge_size":2,"max_patches":1024,"max_features":256,
+            "pixels":"p","grid":"g","length":"l","output":"o","features":"f","feature_index":"i",
+            "mrope_positions":"r","plans":[{"patches":1024,"program":"v"}],"image_token_id":10,
+            "vision_start_token_id":11,"vision_end_token_id":12}))
+        .unwrap();
+        let encode = |size, color| {
+            let image = image::RgbImage::from_pixel(size, size, image::Rgb(color));
+            let mut output = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image)
+                .write_to(&mut output, image::ImageFormat::Png)
+                .unwrap();
+            format!(
+                "data:image/png;base64,{}",
+                STANDARD.encode(output.get_ref())
+            )
+        };
+        let red = encode(512, [255, 0, 0]);
+        let blue = encode(512, [0, 0, 255]);
+        let part = |url: &str, detail: &str| json!({"type":"image_url","image_url":{"url":url,"detail":detail}});
+        let run = |parts: Vec<Value>| {
+            messages(
+                vec![json!({"role":"user","content":parts})],
+                Some(&spec),
+                &mut crate::server::preparation::Context::unbounded(),
+            )
+        };
+        let (rendered, images) = run(vec![part(&red, "auto"), part(&blue, "auto")]).unwrap();
+        assert_eq!(images.len(), 2);
+        assert_eq!(rendered[0]["content"], format!("{MARKER}{MARKER}"));
+        assert!(
+            images
+                .iter()
+                .map(|i| spec.feature_count(i).unwrap())
+                .sum::<usize>()
+                <= 256
+        );
+        assert_eq!(images[0].pixels[0], 1.0);
+        assert_eq!(images[1].pixels[0], -1.0);
+        let (_, reverse) = run(vec![part(&blue, "auto"), part(&red, "auto")]).unwrap();
+        assert_eq!(images[0].pixels, reverse[1].pixels);
+        assert_eq!(images[1].pixels, reverse[0].pixels);
+        let (_, single) = run(vec![part(&red, "auto")]).unwrap();
+        assert_eq!(spec.feature_count(&single[0]).unwrap(), 256);
+        let error = run(vec![part(&red, "high"), part(&blue, "high")]).unwrap_err();
+        assert!(error.contains("feature capacity") && error.contains("512"));
+        let small_blue = encode(256, [0, 0, 255]);
+        let (_, mixed) = run(vec![part(&red, "auto"), part(&small_blue, "high")]).unwrap();
+        assert_eq!((mixed[1].grid_height, mixed[1].grid_width), (16, 16));
+        assert_eq!(mixed[0].pixels[0], 1.0);
+        assert_eq!(mixed[1].pixels[0], -1.0);
+        assert!(
+            mixed
+                .iter()
+                .map(|i| spec.feature_count(i).unwrap())
+                .sum::<usize>()
+                <= 256
+        );
+        let error = run((0..5)
+            .map(|_| part("https://invalid.invalid/never-fetch", "auto"))
+            .collect())
+        .unwrap_err();
+        assert!(error.contains("minimum image detail"));
     }
     #[test]
     fn patch_order_temporal_duplication_and_image_parts() {
