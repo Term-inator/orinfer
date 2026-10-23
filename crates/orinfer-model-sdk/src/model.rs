@@ -75,6 +75,8 @@ pub struct Manifest {
     pub audio: Option<crate::audio::AudioSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<crate::embedding::Spec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reranking: Option<crate::reranking::Spec>,
     #[serde(default)]
     pub mtp: Option<crate::mtp::Spec>,
     #[serde(default)]
@@ -377,6 +379,10 @@ pub fn validate_graph_branches(manifest: &Manifest, kernels: &[Kernel]) -> Resul
 }
 
 impl Manifest {
+    pub fn independent(&self) -> bool {
+        self.embedding.is_some() || self.reranking.is_some()
+    }
+
     pub fn prefill_plan(&self, tokens: usize) -> Option<&PrefillPlan> {
         self.prefill_plans
             .iter()
@@ -562,6 +568,9 @@ impl Manifest {
         if let Some(embedding) = &self.embedding {
             embedding.validate(self)?;
         }
+        if let Some(reranking) = &self.reranking {
+            reranking.validate(self)?;
+        }
         if let Some(vision) = &self.vision {
             vision.validate(self)?;
         }
@@ -588,7 +597,7 @@ impl Manifest {
             }
         }
         let logits = lookup(&self.logits)?;
-        if self.embedding.is_none()
+        if !self.independent()
             && (!matches!(
                 logits.dtype,
                 crate::artifact::Dtype::F16 | crate::artifact::Dtype::F32
@@ -645,7 +654,7 @@ impl Manifest {
                 }
             }
         }
-        for required in if self.embedding.is_some() {
+        for required in if self.independent() {
             &[][..]
         } else {
             &["prefill", "head", "decode"][..]
@@ -783,7 +792,7 @@ impl Manifest {
                 }
             }
         }
-        if self.embedding.is_none() && !self.reset_buffers.contains(&self.position) {
+        if !self.independent() && !self.reset_buffers.contains(&self.position) {
             return Err("Position must reset between requests".into());
         }
         for name in &self.reset_buffers {

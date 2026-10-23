@@ -31,7 +31,7 @@ check: lint
 	$(PYTHON) -m unittest discover -s tools/quantization -p 'test_*.py' -v
 	$(PYTHON) -m unittest tools.model.test_safetensors_source -v
 	$(PYTHON) -m unittest tools.model.qwen35.test_build tools.model.qwen35.test_parallel tools.model.qwen35.test_attention -v
-	$(PYTHON) -m unittest tools.model.nemotron_embed.test_config -v
+	$(PYTHON) -m unittest tools.model.nemotron_embed.test_config tools.model.qwen_reranker.test_config -v
 	$(PYTHON) -m unittest tools.model.test_compact -v
 	$(PYTHON) -m unittest tools.model.flash_next.tests.test_decode_package tools.model.flash_next.tests.test_decode_policy tools.model.flash_next.tests.test_kernel_policy tools.model.flash_next.tests.test_repack -v
 	$(PYTHON) -m unittest tools.model.flash_next.tests.test_weights -v

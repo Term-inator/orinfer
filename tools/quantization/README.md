@@ -10,6 +10,7 @@ CPU 工具使用项目 uv 环境，GPU 编码使用固定编译镜像。编码�
 | 27B 主干与输出头 | 两级整数 E8P Q4，U32 描述 8 个权重 | 固定系数 `[4,1]`，输出行 FP16 scale，A8 计算 |
 | Index-Translate-2B/9B 主干 | 两级整数 E8P Q4 | 固定系数 `[4,1]`，输出行 FP16 scale，A8 计算 |
 | Qwen3-ASR-1.7B 文本主干与共享输出头 | 两级整数 E8P Q4 | `[4,1]`、输出行 FP16 scale、A8；前 4 层与 attention 输出保留 W8，音频编码器和 projector 保留 FP16 |
+| Qwen3-Reranker-0.6B | 两级整数 E8P Q4 | `[4,1]`、A8；attention 输出保留 W8，norm 与原始 yes/no 双行分类头保留 FP16；见[重排说明](../../docs/reranking.md) |
 | Flash Next 部分非专家投影 | 旋转标量码表 Q4 | signed-block128，输出行 FP16 scale，A8 计算 |
 
 敏感部分保留 W8、FP16、BF16 或 FP32。scale、basis、旋转符号、padding 和例外权重均计入实际空间；权重常驻为单份压缩 bank，W8 展开限定用于临时计算。

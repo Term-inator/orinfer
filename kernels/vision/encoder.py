@@ -294,6 +294,7 @@ def attention(
     window: int = 0,
     windowed_lengths: bool = False,
     kv_heads: int | None = None,
+    causal: bool = False,
 ):
     dim = hidden // heads
     kv_heads = heads if kv_heads is None else kv_heads
@@ -341,7 +342,9 @@ def attention(
                 q[i, d] = T.if_then_else(
                     base + qb * bm + i < end and d < dim, Q[base + qb * bm + i, head * dim + d], 0
                 )
-            for kb in T.serial(T.ceildiv(end - base, bn)):
+            for kb in T.serial(
+                T.ceildiv(T.min(end - base, (qb + 1) * bm) if causal else end - base, bn)
+            ):
                 for j, d in T.Parallel(bn, padded):
                     k[j, d] = T.if_then_else(
                         base + kb * bn + j < end and d < dim,
@@ -360,12 +363,16 @@ def attention(
                     previous[i] = maximum[i]
                 for i, j in T.Parallel(bm, bn):
                     score[i, j] = T.if_then_else(
-                        base + kb * bn + j < end, score[i, j] * math.sqrt(1.0 / dim), -1e30
+                        base + kb * bn + j < end and (not causal or kb * bn + j <= qb * bm + i),
+                        score[i, j] * math.sqrt(1.0 / dim),
+                        -1e30,
                     )
                 T.reduce_max(score, maximum, dim=1, clear=False)
                 for i, j in T.Parallel(bm, bn):
                     score[i, j] = T.if_then_else(
-                        base + kb * bn + j < end, T.exp(score[i, j] - maximum[i]), 0
+                        base + kb * bn + j < end and (not causal or kb * bn + j <= qb * bm + i),
+                        T.exp(score[i, j] - maximum[i]),
+                        0,
                     )
                     p[i, j] = score[i, j]
                 T.reduce_sum(score, rowsum, dim=1)

@@ -357,254 +357,41 @@ pub fn run_model(root: &Path, requests: &Path, options: LoadOptions) -> Result<V
     )
 }
 
-#[derive(Clone)]
-struct Service {
-    sender: tokio::sync::mpsc::Sender<Job>,
-    slots: std::sync::Arc<tokio::sync::Semaphore>,
-    model: std::sync::Arc<str>,
-    key: Option<std::sync::Arc<str>>,
-    timeout_ms: u64,
+struct EmbeddingBackend {
+    codec: Codec,
+    model: Model,
+    id: String,
 }
-struct Job {
-    _slot: tokio::sync::OwnedSemaphorePermit,
-    request: Value,
-    result: tokio::sync::oneshot::Sender<Result<Value>>,
-    deadline: Instant,
+impl crate::encoder_service::Backend for EmbeddingBackend {
+    fn respond(&mut self, request: Value) -> Result<Value> {
+        response(&self.codec, &mut self.model, request, &self.id, false)
+    }
 }
-
 pub(crate) fn serve(settings: crate::ServerConfig) -> Result<()> {
-    if !settings.default_request_params.is_empty() {
-        return Err(
-            "Embedding services accept request fields directly; Chat defaults are unsupported"
-                .into(),
-        );
-    }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(|e| e.to_string())?;
-    runtime.block_on(serve_async(settings))
-}
-async fn serve_async(settings: crate::ServerConfig) -> Result<()> {
-    use axum::{
-        Router,
-        extract::DefaultBodyLimit,
-        routing::{get, post},
-    };
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Job>(4);
-    let (ready, initialized) = tokio::sync::oneshot::channel();
-    let state = Service {
-        sender,
-        slots: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
-        model: settings.model.clone().into(),
-        key: std::env::var("ORINFER_API_KEY")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(Into::into),
-        timeout_ms: settings.limits.output_ms,
-    };
-    let listen = settings.listen.clone();
-    let worker = std::thread::Builder::new()
-        .name("orinfer-embedding-gpu".into())
-        .spawn(move || {
-            let initialize = || -> Result<_> {
-                let lock = crate::manager::locked_file(&settings.gpu_lock)?;
-                let (codec, model) = crate::server::startup::load_parallel(
-                    || Codec::load(&settings.model_dir),
-                    || {
-                        Model::load(
-                            &settings.model_dir,
-                            LoadOptions {
-                                cuda_graph: settings.cuda_graph,
-                                verify_weights: settings.verify_weights,
-                                load_workers: settings.load_workers,
-                                ..Default::default()
-                            },
-                        )
+    crate::encoder_service::serve(settings, vec!["/v1/embeddings"], |settings| {
+        let (codec, model) = crate::server::startup::load_parallel(
+            || Codec::load(&settings.model_dir),
+            || {
+                Model::load(
+                    &settings.model_dir,
+                    LoadOptions {
+                        cuda_graph: settings.cuda_graph,
+                        verify_weights: settings.verify_weights,
+                        load_workers: settings.load_workers,
+                        ..Default::default()
                     },
-                )?;
-                if &codec.hashes != model.frontend_assets() {
-                    return Err("Embedding frontend changed during loading".into());
-                }
-                // Field order keeps the model alive only while GPU ownership is held.
-                struct Loaded {
-                    model: Model,
-                    codec: Codec,
-                    _lock: std::fs::File,
-                }
-                Ok(Loaded {
-                    model,
-                    codec,
-                    _lock: lock,
-                })
-            };
-            match initialize() {
-                Err(error) => {
-                    let _ = ready.send(Err(error));
-                }
-                Ok(mut loaded) => {
-                    if ready.send(Ok(())).is_err() {
-                        return;
-                    }
-                    while let Some(job) = receiver.blocking_recv() {
-                        if job.result.is_closed() {
-                            continue;
-                        }
-                        let result = if Instant::now() >= job.deadline {
-                            Err("Embedding request expired in queue".into())
-                        } else {
-                            response(
-                                &loaded.codec,
-                                &mut loaded.model,
-                                job.request,
-                                &settings.model,
-                                false,
-                            )
-                        };
-                        let _ = job.result.send(result);
-                    }
-                }
-            }
+                )
+            },
+        )?;
+        if &codec.hashes != model.frontend_assets() {
+            return Err("Embedding frontend changed during loading".into());
+        }
+        Ok(EmbeddingBackend {
+            codec,
+            model,
+            id: settings.model.clone(),
         })
-        .map_err(|e| e.to_string())?;
-    let initialized = initialized
-        .await
-        .map_err(|_| "Embedding GPU worker disconnected during startup".to_owned())
-        .and_then(|r| r);
-    if let Err(error) = initialized {
-        drop(state);
-        let _ = worker.join();
-        return Err(error);
-    }
-    let result = async {
-        let router = Router::new()
-            .route(
-                "/health",
-                get(|| async { axum::Json(json!({"status":"ok"})) }),
-            )
-            .route("/v1/models", get(embedding_models))
-            .route("/v1/embeddings", post(embedding_request))
-            .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
-            .with_state(state.clone());
-        async fn shutdown() {
-            #[cfg(unix)]
-            {
-                let mut terminate =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("SIGTERM listener");
-                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
-        if let Some(path) = listen.strip_prefix("unix:") {
-            let listener = tokio::net::UnixListener::bind(path).map_err(|e| e.to_string())?;
-            eprintln!(
-                "API READY embeddings at {listen}; one complete bidirectional request at a time"
-            );
-            axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown())
-                .await
-                .map_err(|e| e.to_string())
-        } else {
-            let listener = tokio::net::TcpListener::bind(&listen)
-                .await
-                .map_err(|e| e.to_string())?;
-            eprintln!(
-                "API READY embeddings at {listen}; one complete bidirectional request at a time"
-            );
-            axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown())
-                .await
-                .map_err(|e| e.to_string())
-        }
-    }
-    .await;
-    drop(state);
-    tokio::task::spawn_blocking(move || worker.join())
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|_| "Embedding GPU worker panicked".to_owned())?;
-    result
-}
-
-fn authorized(state: &Service, headers: &axum::http::HeaderMap) -> bool {
-    state.key.as_ref().is_none_or(|key| {
-        headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            == Some(key.as_ref())
     })
-}
-fn failure(status: axum::http::StatusCode, message: impl Into<String>) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    (
-        status,
-        axum::Json(json!({"error":{"message":message.into(),"type":"invalid_request_error"}})),
-    )
-        .into_response()
-}
-async fn embedding_models(
-    axum::extract::State(state): axum::extract::State<Service>,
-    headers: axum::http::HeaderMap,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    if !authorized(&state, &headers) {
-        return failure(axum::http::StatusCode::UNAUTHORIZED, "Invalid API key");
-    }
-    axum::Json(json!({"object":"list","data":[{"id":state.model.as_ref(),"object":"model","owned_by":"orinfer"}]})).into_response()
-}
-async fn embedding_request(
-    axum::extract::State(state): axum::extract::State<Service>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Body,
-) -> axum::response::Response {
-    use axum::{http::StatusCode, response::IntoResponse};
-    if !authorized(&state, &headers) {
-        return failure(StatusCode::UNAUTHORIZED, "Invalid API key");
-    }
-    let Ok(slot) = std::sync::Arc::clone(&state.slots).try_acquire_owned() else {
-        return failure(StatusCode::TOO_MANY_REQUESTS, "Embedding ingress is full");
-    };
-    let bytes = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
-        Ok(bytes) => bytes,
-        Err(e) => return failure(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
-    };
-    let request = match serde_json::from_slice::<Value>(&bytes) {
-        Ok(value) => value,
-        Err(e) => return failure(StatusCode::BAD_REQUEST, e.to_string()),
-    };
-    drop(bytes);
-    let (result, receiver) = tokio::sync::oneshot::channel();
-    let timeout = std::time::Duration::from_millis(state.timeout_ms);
-    if state
-        .sender
-        .try_send(Job {
-            _slot: slot,
-            request,
-            result,
-            deadline: Instant::now() + timeout,
-        })
-        .is_err()
-    {
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Embedding request queue is full",
-        );
-    }
-    match tokio::time::timeout(timeout, receiver).await {
-        Ok(Ok(Ok(value))) => axum::Json(value).into_response(),
-        Ok(Ok(Err(error))) => failure(StatusCode::BAD_REQUEST, error),
-        Ok(Err(_)) => failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Embedding GPU worker disconnected",
-        ),
-        Err(_) => failure(StatusCode::GATEWAY_TIMEOUT, "Embedding request timed out"),
-    }
 }
 
 #[cfg(test)]
@@ -682,32 +469,5 @@ mod tests {
                 .prepare(&json!({"images":["unused"]}), "query", false)
                 .is_err()
         );
-    }
-
-    #[tokio::test]
-    async fn cancelled_embedding_handler_retains_its_ingress_permit_until_job_drops() {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let state = Service {
-            sender,
-            slots: std::sync::Arc::clone(&slots),
-            model: "embed".into(),
-            key: None,
-            timeout_ms: 10000,
-        };
-        let handler = tokio::spawn(embedding_request(
-            axum::extract::State(state),
-            axum::http::HeaderMap::new(),
-            axum::body::Body::from(r#"{"model":"embed","input":"hello"}"#),
-        ));
-        let job = receiver.recv().await.unwrap();
-        assert_eq!(job.request["input"], "hello");
-        assert_eq!(slots.available_permits(), 0);
-        handler.abort();
-        let _ = handler.await;
-        assert!(job.result.is_closed());
-        assert_eq!(slots.available_permits(), 0);
-        drop(job);
-        assert_eq!(slots.available_permits(), 1);
     }
 }

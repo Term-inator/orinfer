@@ -35,6 +35,7 @@ impl Spec {
             || manifest.mtp.is_some()
             || manifest.vision.is_some()
             || manifest.audio.is_some()
+            || manifest.reranking.is_some()
         {
             return Err("Invalid independent embedding contract".into());
         }

@@ -99,6 +99,10 @@ def verify_execution(package, directory):
 
 
 def config_signature(config):
+    if config.get("model_type") == "qwen3":
+        from tools.model.qwen_reranker.config import signature
+
+        return signature(config)
     if config.get("model_type") == "mistral3":
         from tools.model.nemotron_embed.config import signature
 
@@ -207,6 +211,13 @@ def pin_assets(directory):
     names = (
         ("tokenizer.json", "tokenizer_config.json", "processor_config.json", "chat_template.jinja")
         if descriptor["metadata"].get("embedding")
+        else (
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "generation_config.json",
+        )
+        if descriptor["metadata"].get("reranking")
         else ("tokenizer.json", "chat_template.jinja", "generation_config.json")
     )
     identities = {name: file_hash(source_path(directory, name)) for name in names}

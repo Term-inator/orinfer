@@ -1,0 +1,307 @@
+"""Build a complete-sequence causal Qwen3-Reranker E8P execution package."""
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import numpy as np
+
+from tools.build.files import file_hash, write_json
+from tools.build.gpu import gpu_lock
+from tools.model.compile import primitive
+from tools.model.encoder import Projections
+from tools.model.compact import compact_package
+from tools.model.frontend import prepare_tokenizer
+from tools.model.package import execution_identity, model_library
+from tools.model.publication import atomic_model
+from tools.model.qwen35.compiler import Aot
+from tools.model.qwen35.storage import Weights
+from tools.model.qwen_reranker.config import configuration, signature
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+class Builder(Projections):
+    kernel_prefix = "qwen_reranker"
+    norm_epsilon = 1e-6
+
+    def __init__(self, args, root):
+        self.args, self.root = args, root
+        self.config = json.loads((args.source / "config.json").read_text())
+        configuration(self.config, quantized=True)
+        self.state = json.loads((args.source / "progress.json").read_text())
+        if not self.state.get("complete"):
+            raise ValueError("Quantization is incomplete")
+        self.capacity, self.patches = args.context, 0
+        self.w = Weights(args.source, root, packed_k=128)
+        self.lock = None if args.gpu_lock_held else args.gpu_lock
+        self.aot = Aot(
+            root / "cache",
+            args.output,
+            args.cache,
+            self.w.buffers,
+            compile_lock=lambda: gpu_lock(self.lock),
+        )
+        self.aot.identity["weights"] = hashlib.sha256(self.state["contract"].encode()).hexdigest()
+        self.aot.identity["reranker_capacity"] = str(self.capacity)
+        self.tuned = {}
+        self.signs = {
+            k: self.w.immutable(f"orinfer.rotation.k{k}.signs") for k in (1024, 2048, 3072)
+        }
+        from tools.quantization.e8p import basis
+        from tools.quantization.vq import e8p_selector_table
+
+        original = self.w.array("orinfer.e8p_q4.basis")
+        if not np.array_equal(original, basis()):
+            raise ValueError("Unexpected E8P basis")
+        self.book = self.w.constant("E8PBook", e8p_selector_table(original))
+        self.workspace()
+        self.text()
+
+    def workspace(self):
+        for name, dtype, shape in [
+            ("Input", "i32", [self.capacity]),
+            ("Length", "i32", [1]),
+            ("Control", "i32", [1]),
+            ("ClassLogits", "f32", [2]),
+            ("THidden", "f16", [self.capacity, 1024]),
+            ("TNorm", "f16", [self.capacity, 1024]),
+            ("TQKV", "f16", [self.capacity, 4096]),
+            ("TQ", "f16", [self.capacity, 2048]),
+            ("TK", "f16", [self.capacity, 1024]),
+            ("TValue", "f16", [self.capacity, 1024]),
+            ("TAttention", "f16", [self.capacity, 2048]),
+            ("TProduct", "f16", [self.capacity, 1024]),
+            ("TGateUp", "f16", [self.capacity, 6144]),
+            ("TFFN", "f16", [self.capacity, 3072]),
+            ("A8", "i8", [self.capacity * 3072]),
+            ("AS", "f16", [self.capacity]),
+        ]:
+            self.w.fixed(name, dtype, shape)
+        import torch
+        from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+
+        cfg = Qwen3Config(**{k: v for k, v in self.config.items() if k != "quantization_config"})
+        cos, sin = Qwen3RotaryEmbedding(cfg)(
+            torch.empty(1, dtype=torch.float16), torch.arange(self.capacity).reshape(1, -1)
+        )
+        for name, data in [("TextCos", cos), ("TextSin", sin)]:
+            self.w.constant(name, data[0].numpy())
+
+    def text(self):
+        from kernels.model import e8p_q4, embedding as e, reranking as r
+        from kernels.vision.encoder import attention
+
+        self.emit(
+            "embedding",
+            "embedding",
+            lambda: primitive(e8p_q4.embedding, self.capacity, 151669, 1024),
+            dict(
+                IDs="Input",
+                Weight=self.w.immutable("model.embed_tokens.weight.packed"),
+                Scale=self.w.immutable("model.embed_tokens.weight.scale"),
+                Signs=self.signs[1024],
+                Book=self.book,
+                Output="THidden",
+            ),
+        )
+        for layer in range(28):
+            base = f"layer{layer}"
+            root = f"model.layers.{layer}."
+            attn = root + "self_attn."
+            mlp = root + "mlp."
+            self.norm(base + "/norm1", "THidden", "TNorm", root + "input_layernorm.weight", 1024)
+            self.activation_input(base + "/rotate_qkv", "TNorm", 1024)
+            for role, n, offset in [("q", 2048, 0), ("k", 1024, 2048), ("v", 1024, 3072)]:
+                self.projection(
+                    base + "/" + role,
+                    attn + role + "_proj.weight",
+                    n,
+                    1024,
+                    "TQKV",
+                    stride=4096,
+                    offset=offset,
+                )
+            self.emit(
+                base + "/qk_rope",
+                "qk-rope",
+                lambda: primitive(r.qk_rope, self.capacity),
+                dict(
+                    X="TQKV",
+                    QNorm=self.w.immutable(attn + "q_norm.weight", cast="float16"),
+                    KNorm=self.w.immutable(attn + "k_norm.weight", cast="float16"),
+                    Cos="TextCos",
+                    Sin="TextSin",
+                    Q="TQ",
+                    K="TK",
+                    V="TValue",
+                ),
+            )
+            self.emit(
+                base + "/attention",
+                "causal-gqa",
+                lambda: primitive(attention, 2048, 16, kv_heads=8, causal=True),
+                dict(Q="TQ", K="TK", V="TValue", Length="Length", Y="TAttention"),
+            )
+            self.activation_input(base + "/quantize_o", "TAttention", 2048, compressed=False)
+            self.projection(base + "/o", attn + "o_proj.weight", 1024, 2048, "TProduct")
+            self.emit(
+                base + "/add1",
+                "add-1024",
+                lambda: primitive(e.add, self.capacity, 1024),
+                dict(X="TProduct", Residual="THidden", Y="THidden"),
+            )
+            self.norm(
+                base + "/norm2", "THidden", "TNorm", root + "post_attention_layernorm.weight", 1024
+            )
+            self.activation_input(base + "/rotate_gateup", "TNorm", 1024)
+            for role, offset in [("gate", 0), ("up", 3072)]:
+                self.projection(
+                    base + "/" + role,
+                    mlp + role + "_proj.weight",
+                    3072,
+                    1024,
+                    "TGateUp",
+                    stride=6144,
+                    offset=offset,
+                )
+            self.emit(
+                base + "/swiglu",
+                "swiglu-3072",
+                lambda: primitive(e.activation, self.capacity, 3072),
+                dict(X="TGateUp", Y="TFFN"),
+            )
+            self.activation_input(base + "/rotate_down", "TFFN", 3072)
+            self.projection(base + "/down", mlp + "down_proj.weight", 1024, 3072, "TProduct")
+            self.emit(
+                base + "/add2",
+                "add-1024",
+                lambda: primitive(e.add, self.capacity, 1024),
+                dict(X="TProduct", Residual="THidden", Y="THidden"),
+            )
+        self.norm("final_norm", "THidden", "TNorm", "model.norm.weight", 1024)
+        self.emit(
+            "classifier",
+            "two-class-head",
+            lambda: primitive(r.classifier, self.capacity),
+            dict(
+                X="TNorm", W=self.w.immutable("orinfer.reranker.classifier.weight"), Y="ClassLogits"
+            ),
+        )
+
+    def publish(self):
+        total = self.w.finish()
+        names = [
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+            "chat_template.jinja",
+            "README.md",
+            "LICENSE",
+        ]
+        for name in names:
+            if (self.args.source / name).is_file():
+                shutil.copyfile(self.args.source / name, self.root / name)
+        prepare_tokenizer(self.args.source, self.root / "tokenizer.json")
+        ids = self.config["quantization_config"]["classifier_token_ids"]
+        spec = dict(
+            program="rerank",
+            length="Length",
+            output="ClassLogits",
+            false_token_id=ids[0],
+            true_token_id=ids[1],
+        )
+        metadata = dict(
+            schema_version=2,
+            target="sm_87",
+            model="Qwen3-Reranker-0.6B-E8P-Q4A8",
+            chunk_tokens=self.capacity,
+            max_context=self.capacity,
+            vocab=151669,
+            toolchain=self.aot.identity,
+            buffers=list(self.w.buffers.values()),
+            reset_buffers=[],
+            input="Input",
+            token="Control",
+            status="Control",
+            logits="ClassLogits",
+            position="Control",
+            weight_bytes=total,
+            weight_parameters=self.state["parameters"],
+            weight_scope="Two-stage E8P Q4A8; attention output and protected text blocks W8; norms and original two-class head FP16; one packed embedding bank",
+            reranking=spec,
+        )
+        package = dict(
+            schema_version=1,
+            runtime_abi=1,
+            target="sm_87",
+            architecture="qwen3_reranker",
+            compute_policy="int8_quality",
+            config_signature=signature(self.config),
+            prefill_profiles=[],
+            kernels=self.aot.kernels,
+            dynamic_batch_kernels=self.aot.dynamic,
+            buffer_contracts=[
+                {k: v for k, v in b.items() if k != "data"} for b in self.w.buffers.values()
+            ],
+            toolchain=self.aot.identity,
+            execution=execution_identity(
+                model_library(), self.args.engine, "qwen3_reranker", "int8_quality"
+            ),
+        )
+        digest = compact_package(self.root / "cache", package, self.root / "cache/packages")
+        write_json(
+            self.root / "cache/model.json",
+            dict(
+                schema_version=1,
+                architecture="qwen3_reranker",
+                compute_policy="int8_quality",
+                execution_package=digest,
+                buffer_scopes=self.w.scopes,
+                metadata=metadata,
+                frontend_assets={
+                    name: file_hash(self.root / name)
+                    for name in [
+                        "tokenizer.json",
+                        "tokenizer_config.json",
+                        "chat_template.jinja",
+                        "generation_config.json",
+                    ]
+                },
+            ),
+        )
+        subprocess.run([str(self.args.engine), "validate-model", str(self.root)], check=True)
+        write_json(
+            self.args.output / "result.json",
+            dict(
+                weight_bytes=total,
+                parameters=self.state["parameters"],
+                effective_weight_bits=total * 8 / self.state["parameters"],
+                execution_package=digest,
+            ),
+        )
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    for name in ["source", "model-output", "output"]:
+        p.add_argument("--" + name, type=Path, required=True)
+    p.add_argument("--context", type=int, default=32768)
+    p.add_argument("--cache", type=Path, default=ROOT / "artifacts/build-cache/qwen-reranker")
+    p.add_argument("--engine", type=Path, default=ROOT / "target/release/orinfer")
+    p.add_argument("--gpu-lock", type=Path, default=ROOT / "artifacts/gpu-experiment.lock")
+    p.add_argument("--gpu-lock-held", action="store_true")
+    args = p.parse_args()
+    if not 512 <= args.context <= 32768:
+        p.error("Context must be 512..32768")
+    args.engine = args.engine.resolve(strict=True)
+    with atomic_model(args.model_output) as root:
+        Builder(args, root).publish()
+
+
+if __name__ == "__main__":
+    main()

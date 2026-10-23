@@ -82,8 +82,8 @@ impl ModelRuntime {
                 crate::execution::ResidentExperts::Full
             ),
         )?;
-        if prepared.plan.embedding.is_some() {
-            return Err("This model provides embeddings; use embed-model or /v1/embeddings".into());
+        if prepared.plan.independent() {
+            return Err("This model provides independent encodings; use its embedding or reranking entrypoint".into());
         }
         let request_hidden_ring = prepared
             .plan

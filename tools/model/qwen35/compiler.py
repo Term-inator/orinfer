@@ -24,6 +24,7 @@ class Aot:
             ROOT / "tools/model/qwen35",
             ROOT / "tools/model/qwen_asr",
             ROOT / "tools/model/nemotron_embed",
+            ROOT / "tools/model/qwen_reranker",
             ROOT / "tools/build",
         ]:
             for file in sorted(directory.rglob("*.py")):
@@ -33,6 +34,7 @@ class Aot:
         sources.extend(
             [
                 ROOT / "tools/model/compile.py",
+                ROOT / "tools/model/encoder.py",
                 ROOT / "tools/model/row_tuning.py",
                 ROOT / "tools/model/tuning.py",
                 ROOT / "tools/model/attention_reference.py",

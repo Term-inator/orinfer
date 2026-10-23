@@ -236,7 +236,7 @@ fn validate_scopes(model: &Manifest, scopes: &BTreeMap<String, BufferScope>) -> 
             }
         }
     }
-    if model.embedding.is_some() {
+    if model.independent() {
         if !model.reset_buffers.is_empty()
             || model.state_pointer_table.is_some()
             || model.sampling.is_some()
@@ -245,7 +245,7 @@ fn validate_scopes(model: &Manifest, scopes: &BTreeMap<String, BufferScope>) -> 
             })
         {
             return Err(
-                "Independent embeddings require shared workspace and no persistent sequence state"
+                "Independent encoders require shared workspace and no persistent sequence state"
                     .into(),
             );
         }
@@ -474,6 +474,13 @@ fn validate_frontend_assets(root: &Path, expected: &BTreeMap<String, String>) ->
             "tokenizer_config.json",
             "processor_config.json",
             "chat_template.jinja",
+        ]
+    } else if expected.contains_key("tokenizer_config.json") {
+        &[
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "generation_config.json",
         ]
     } else {
         &[

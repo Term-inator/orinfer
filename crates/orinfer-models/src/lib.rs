@@ -9,6 +9,7 @@ mod packet;
 mod policy;
 mod prefill;
 mod qwen3_5;
+mod qwen_reranker;
 mod registry;
 mod sampling;
 mod vision;
@@ -185,7 +186,13 @@ mod tests {
         assert_eq!(info.runtime_abi, 1);
         assert_eq!(
             info.architectures,
-            ["nemotron_embed", "qwen3_asr", "flash_next", "qwen3_5"]
+            [
+                "qwen3_reranker",
+                "nemotron_embed",
+                "qwen3_asr",
+                "flash_next",
+                "qwen3_5"
+            ]
         );
         assert_eq!(info.compute_policies, ["int8_quality"]);
     }

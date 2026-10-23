@@ -14,6 +14,7 @@ mod model_package;
 pub mod mtp;
 pub mod operators;
 pub mod prefix;
+pub mod reranking;
 mod runtime;
 pub mod sampling;
 pub mod scheduler;

@@ -51,7 +51,7 @@ async fn transcriptions(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    gateway_request(manager, headers, body, None, true, false).await
+    gateway_request(manager, headers, body, None, true, None).await
 }
 
 async fn embeddings(
@@ -59,7 +59,11 @@ async fn embeddings(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    gateway_request(manager, headers, body, None, false, true).await
+    gateway_request(manager, headers, body, None, false, Some("/v1/embeddings")).await
+}
+
+async fn rerank(State(manager): State<Arc<Manager>>, headers: HeaderMap, body: Body) -> Response {
+    gateway_request(manager, headers, body, None, false, Some("/v1/rerank")).await
 }
 
 pub(super) async fn gateway(
@@ -68,7 +72,7 @@ pub(super) async fn gateway(
     body: Body,
     protocol: Option<ollama::Kind>,
 ) -> Response {
-    gateway_request(manager, headers, body, protocol, false, false).await
+    gateway_request(manager, headers, body, protocol, false, None).await
 }
 
 async fn gateway_request(
@@ -77,7 +81,7 @@ async fn gateway_request(
     body: Body,
     protocol: Option<ollama::Kind>,
     transcription: bool,
-    embedding: bool,
+    scoring: Option<&str>,
 ) -> Response {
     if !authorized(&headers) {
         return error(StatusCode::UNAUTHORIZED, "Invalid API key");
@@ -184,7 +188,7 @@ async fn gateway_request(
             );
         }
     }
-    if !embedding
+    if scoring.is_none()
         && let Err(message) =
             crate::server::defaults::merge(&mut request, &record.options.default_request_params)
     {
@@ -215,11 +219,10 @@ async fn gateway_request(
     let mut upstream = lease
         .0
         .client
-        .post(if embedding {
-            "http://localhost/v1/embeddings"
-        } else {
-            "http://localhost/v1/chat/completions"
-        })
+        .post(format!(
+            "http://localhost{}",
+            scoring.unwrap_or("/v1/chat/completions")
+        ))
         .json(&request);
     for key in ["authorization", "x-request-id"] {
         if let Some(value) = headers.get(key) {
@@ -577,6 +580,8 @@ pub(super) fn public_router(manager: Arc<Manager>) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/rerank", post(rerank))
+        .route("/rerank", post(rerank))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .merge(ollama::router())
         .with_state(manager)
@@ -598,6 +603,8 @@ pub(super) async fn serve(manager: Arc<Manager>) -> Result<()> {
         .route("/show", get(show))
         .route("/v1/chat/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/rerank", post(rerank))
+        .route("/rerank", post(rerank))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/import", post(import))
         .route("/pull", post(pull_model))

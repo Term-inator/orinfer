@@ -27,6 +27,10 @@ from tools.build.gpu import gpu_lock
 
 
 def rotated_w8_layers(config):
+    if config["model_type"] == "qwen3":
+        from tools.model.qwen_reranker.config import ROTATED_W8_LAYERS
+
+        return list(ROTATED_W8_LAYERS)
     if config["model_type"] == "mistral3":
         from tools.model.nemotron_embed.config import ROTATED_W8_LAYERS
 
@@ -67,7 +71,11 @@ def policy(name, info, *, protected_layers=()):
         return "w8"
     if any(
         name.startswith(
-            (f"model.language_model.layers.{layer}.", f"language_model.layers.{layer}.")
+            (
+                f"model.language_model.layers.{layer}.",
+                f"language_model.layers.{layer}.",
+                f"model.layers.{layer}.",
+            )
         )
         for layer in protected_layers
     ):
@@ -76,6 +84,10 @@ def policy(name, info, *, protected_layers=()):
 
 
 def text_configuration(config):
+    if config.get("model_type") == "qwen3":
+        from tools.model.qwen_reranker.config import configuration
+
+        return configuration(config)
     if config.get("model_type") == "mistral3":
         from tools.model.nemotron_embed.config import configuration
 
@@ -153,11 +165,10 @@ def encode(args):
     config = json.loads((source_dir / "config.json").read_text())
     t = text_configuration(config)
     protected_layers = rotated_w8_layers(config)
-    model_policy = (
-        "nemotron35-embed-e8p-q4a8-v1"
-        if config["model_type"] == "mistral3"
-        else "qwen35-dense-e8p-q4a8-v2"
-    )
+    model_policy = {
+        "mistral3": "nemotron35-embed-e8p-q4a8-v1",
+        "qwen3": "qwen3-reranker-e8p-q4a8-v1",
+    }.get(config["model_type"], "qwen35-dense-e8p-q4a8-v2")
     origin = json.loads((source_dir / "source.json").read_text())
     source = Source(source_dir / "model.safetensors.index.json", directory=source_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -463,7 +474,7 @@ def encode(args):
         layout="u32-low-coarse-high-residual",
         policy=model_policy,
         embedding="e8p_q4",
-        vision=None if config["model_type"] == "qwen3_asr" else "e8p_q4",
+        vision=None if config["model_type"] in ("qwen3_asr", "qwen3") else "e8p_q4",
         **(dict(audio="float16") if config["model_type"] == "qwen3_asr" else {}),
         **(dict(rotated_w8_layers=protected_layers) if protected_layers else {}),
         source=origin["repo"],

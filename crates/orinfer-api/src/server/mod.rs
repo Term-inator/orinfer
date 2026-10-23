@@ -98,6 +98,9 @@ pub fn run(settings: Settings) -> Result<()> {
     if !descriptor["metadata"]["embedding"].is_null() {
         return crate::embeddings::serve(settings);
     }
+    if !descriptor["metadata"]["reranking"].is_null() {
+        return crate::reranking::serve(settings);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

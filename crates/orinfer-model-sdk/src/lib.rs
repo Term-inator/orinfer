@@ -8,6 +8,7 @@ pub mod execution;
 pub mod model;
 pub mod mtp;
 pub mod operators;
+pub mod reranking;
 pub mod vision;
 
 pub mod audio;

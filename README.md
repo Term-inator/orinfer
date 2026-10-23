@@ -11,6 +11,7 @@ Built for **Jetson AGX Orin 64GB / CUDA SM87**. Rust runs the engine and APIs; T
 - OpenAI Chat Completions and Ollama chat/generate APIs: streaming, thinking, sampling, function calling, JSON Schema constraints and token probabilities.
 - [Speech recognition](docs/audio.md): Qwen3-ASR-1.7B, file transcription and Chat audio input through the Rust runtime.
 - [Embeddings](docs/embeddings.md): Nemotron-3.5-Embed-1B with E8P Q4A8 text, image and multi-image document retrieval, an embeddings API and offline CLI.
+- [Reranking](docs/reranking.md): Qwen3-Reranker-0.6B with E8P Q4A8, causal yes/no scoring, a document reranking API and offline CLI.
 - [JSONL offline inference](docs/batch.md): continuous batching, incremental output and resumable jobs through the Rust CLI.
 - E8P Q4A8/W8 mixed weights for Qwen3_5 models; E8P Q2 experts and Q4/W8 projections for Flash Next. Sensitive paths retain BF16/FP16/FP32.
 - Chunked prefill, isolated request state, prefix cache, INT8 KV and model-configured context up to 256K tokens.

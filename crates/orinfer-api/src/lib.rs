@@ -1,7 +1,9 @@
 //! CPU-side OpenAI Chat protocol adapter. GPU execution belongs to orinfer-engine.
 mod config;
 pub mod embeddings;
+mod encoder_service;
 pub mod manager;
+pub mod reranking;
 mod server;
 #[cfg(test)]
 mod test_fixtures;

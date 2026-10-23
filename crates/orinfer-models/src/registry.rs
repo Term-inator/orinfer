@@ -13,6 +13,11 @@ struct Factory {
 }
 const FACTORIES: &[Factory] = &[
     Factory {
+        architecture: "qwen3_reranker",
+        policies: &[Policy::Int8Quality],
+        create: crate::qwen_reranker::create,
+    },
+    Factory {
         architecture: "nemotron_embed",
         policies: &[Policy::Int8Quality],
         create: crate::nemotron_embed::create,
