@@ -30,7 +30,7 @@ def int8_projection(
         raise ValueError("Invalid INT8 projection geometry")
     if output_dtype not in ("float16", "float32"):
         raise ValueError("Invalid INT8 projection output dtype")
-    if block_m not in (16, 32, 64, 128):
+    if block_m not in (16, 32, 64, 128, 256):
         raise ValueError("Invalid INT8 row tile")
     if block_n not in (64, 128) or block_k not in (64, 128) or K % block_k:
         raise ValueError("Invalid INT8 column/reduction tile")

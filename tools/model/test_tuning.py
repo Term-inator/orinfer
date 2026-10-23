@@ -3,12 +3,36 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from tools.build.files import atomic_json
 from tools.model.tuning import compile_candidates, measure, read_record, record_path
 
 
 class TuningTests(unittest.TestCase):
+    def test_encoder_subsets_remain_legal_for_short_and_large_packets(self):
+        from tools.model.projection_policy import encoder_configs, e8p_q4_configs, w8_configs
+
+        for kind in ("e8p_q4", "w8"):
+            selected = encoder_configs(kind)
+            self.assertEqual(len(selected), len({tuple(sorted(c.items())) for c in selected}))
+            self.assertTrue(any(c.get("cache_scales") for c in selected))
+            for rows in (1, 32, 2049, 32768):
+                legal = e8p_q4_configs(rows) if kind == "e8p_q4" else w8_configs(rows, 6144)
+                self.assertTrue(selected and all(c in legal for c in selected))
+        with self.assertRaises(ValueError):
+            encoder_configs("unknown")
+
+    def test_measured_scale_caching_reaches_the_compiled_projection(self):
+        from tools.model.projection_tuning import factory
+
+        for kind in ("e8p_q4", "w8"):
+            with patch("tools.model.projection_tuning.make_prim") as build:
+                factory(dict(kind=kind))(block_m=256, cache_scales=True)
+            spec, config = build.call_args.args
+            self.assertEqual(spec["kind"], kind)
+            self.assertTrue(config["cache_scales"])
+
     def test_corrupt_stale_and_incomplete_records_are_recomputed(self):
         with tempfile.TemporaryDirectory() as folder:
             identity = dict(seed=17, geometry=[128, 512])

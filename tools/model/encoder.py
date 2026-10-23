@@ -2,6 +2,7 @@
 
 from tools.build.files import write_json
 from tools.model.compile import primitive
+from tools.model.projection_policy import encoder_configs
 
 
 class Projections:
@@ -116,45 +117,7 @@ class Projections:
                     objective="total_latency",
                     output_stride=stride,
                     packed_k=128 if compressed else 0,
-                    candidate_configs=(
-                        [
-                            dict(
-                                algorithm="tensor_core",
-                                block_m=m,
-                                block_n=n,
-                                block_k=128,
-                                stages=stages,
-                            )
-                            for m, n, stages in [
-                                (32, 64, 2),
-                                (64, 64, 2),
-                                (128, 64, 1),
-                                (128, 128, 1),
-                                (128, 128, 2),
-                                (256, 64, 1),
-                            ]
-                        ]
-                        + [
-                            dict(
-                                algorithm="tensor_core",
-                                block_m=256,
-                                block_n=64,
-                                block_k=128,
-                                stages=1,
-                                group_m=1,
-                            )
-                        ]
-                        if compressed
-                        else [
-                            dict(block_m=m, block_n=n, block_k=128)
-                            for m, n in [(32, 64), (64, 64), (128, 64), (128, 128)]
-                        ]
-                        + [dict(block_m=128, block_n=128, block_k=128, group_m=4)]
-                        + [
-                            dict(block_m=m, block_n=n, block_k=128, group_m=1, cache_scales=True)
-                            for m, n in [(32, 64), (64, 64), (128, 128)]
-                        ]
-                    ),
+                    candidate_configs=encoder_configs(kind),
                 )
                 kernel, config = tuner.compile(kind, capacity, n, k, "float16", **options)
                 choices = []

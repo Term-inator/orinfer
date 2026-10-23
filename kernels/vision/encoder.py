@@ -315,7 +315,7 @@ def attention(
         raise ValueError("Invalid grouped-query attention geometry")
     if segmented and (bm > 32 or 32 % bm):
         raise ValueError("Segmented query tiles must divide the packet alignment")
-    head_stride = 1 << (head_group - 1).bit_length()
+    head_stride = head_group
     query_rows = bm * head_stride
     policy = T.GemmWarpPolicy.FullRow if full_row else T.GemmWarpPolicy.Square
     padded = ((dim + 15) // 16) * 16

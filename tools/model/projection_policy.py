@@ -73,7 +73,12 @@ def e8p_q4_configs(rows, *, direct=False):
     large = configs[-1]
     configs += [
         large | options
-        for options in ({"group_m": 1}, {"tail_m": 16}, {"group_m": 1, "tail_m": 16})
+        for options in (
+            {"group_m": 1},
+            {"group_m": 1, "cache_scales": True},
+            {"tail_m": 16},
+            {"group_m": 1, "tail_m": 16},
+        )
     ]
     if direct:
         configs += [
@@ -93,10 +98,33 @@ def w8_configs(rows, outputs):
         + [dict(block_m=128, block_n=128, block_k=128, group_m=4)]
         + [
             dict(block_m=m, block_n=n, block_k=128, group_m=1, cache_scales=True)
-            for m, n in ((32, 64), (64, 64), (128, 128))
+            for m, n in ((32, 64), (64, 64), (128, 128), (256, 64))
         ]
         + [dict(algorithm="dp4a", block_m=min(rows, 4), block_n=n, block_k=128) for n in (4, 8, 16)]
     )
+
+
+def encoder_configs(kind):
+    """Keep the encoder subset tied to the shared legal tile catalog."""
+    if kind == "w8":
+        tiles = {(32, 64), (64, 64), (128, 64), (128, 128), (256, 64)}
+        return [
+            c
+            for c in w8_configs(CAPACITY, 1)
+            if c.get("algorithm", "tensor_core") == "tensor_core"
+            and (c["block_m"], c["block_n"]) in tiles
+        ]
+    if kind != "e8p_q4":
+        raise ValueError("Unsupported encoder projection codec")
+    tiles = {(32, 64, 2), (64, 64, 2), (128, 64, 1), (128, 128, 1), (128, 128, 2), (256, 64, 1)}
+    return [
+        c
+        for c in e8p_q4_configs(CAPACITY)
+        if c["algorithm"] == "tensor_core"
+        and c["block_k"] == 128
+        and not c.get("tail_m")
+        and (c["block_m"], c["block_n"], c["stages"]) in tiles
+    ]
 
 
 def swiglu_configs(rows):

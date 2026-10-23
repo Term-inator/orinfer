@@ -155,6 +155,7 @@ def projection(
     split_k=1,
     tail_m=0,
     group_m=0,
+    cache_scales=False,
 ):
     validate_shape(M, N, K)
     source = decode_source(coefficients)
@@ -170,6 +171,8 @@ def projection(
         raise ValueError("Invalid E8P row grouping")
     if algorithm != "tensor_core" and (tail_m or group_m):
         raise ValueError("Tail/group scheduling requires the INT8 Tensor Core path")
+    if type(cache_scales) is not bool or (cache_scales and algorithm != "tensor_core"):
+        raise ValueError("Scale caching requires the INT8 Tensor Core path")
     if algorithm != "int4_direct" and split_k != 1:
         raise ValueError("K partition requires direct INT4")
     if algorithm == "tensor_core":
@@ -227,6 +230,7 @@ def projection(
                 source=source,
                 packed_k=packed_k,
                 tail_m=tail_m,
+                cache_scales=cache_scales,
             )
         else:
             project = dp4a(
