@@ -295,6 +295,15 @@ class RowTuner:
         self.records[str(spec)] = result
         return result
 
+    def causal_attention(self, context):
+        from tools.model.qwen35.attention import select
+        from tools.model.qwen35.parallel import geometry
+
+        key = str(("independent_query_attention", context))
+        if key not in self.records:
+            self.records[key] = select(self, context, geometry(self.attention(context)))
+        return self.records[key]
+
     def staged_attention(self, context, selection):
         """Measure complete INT8 and temporary-FP16 KV pipelines at every row extent."""
         from tools.model.row_selection import samples

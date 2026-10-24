@@ -12,14 +12,37 @@ COLUMNS = {
     )
 }
 OWNERS = (1, 2, 3, 4, 8, 17, 32, 64, 128)
+CAUSAL_ROWS = 8
+
+
+def causal_selection(selection, config):
+    """Use the same measured query arithmetic for decode and verification."""
+    configs = [dict(c) for c in selection["configs"]]
+    canonical = dict(config, independent_queries=True)
+    if canonical not in configs:
+        configs.append(canonical)
+    name = str(configs.index(canonical))
+    ranges = [
+        dict(r, min_rows=max(CAUSAL_ROWS + 1, r["min_rows"]))
+        for r in selection["selections"]
+        if r["max_rows"] > CAUSAL_ROWS
+    ]
+    ranges.insert(0, dict(min_rows=1, max_rows=CAUSAL_ROWS, implementation=name))
+    return dict(
+        selection,
+        configs=configs,
+        selections=ranges,
+        used=sorted({selection["default"], name, *(r["implementation"] for r in ranges)}),
+    )
 
 
 def candidates(query_heads, kv_heads, reference):
     if min(query_heads, kv_heads) <= 0 or query_heads % kv_heads:
         raise ValueError("Invalid owner-attention heads")
     keys = ("block_m", "block_n", "head_group", "max_splits", "threads", "stages")
-    original = {key: reference[key] for key in keys if key in reference}
-    base = dict(block_m=16, head_group=query_heads // kv_heads, max_splits=16)
+    base = dict(block_m=16, head_group=query_heads // kv_heads, independent_queries=True)
+    original = {key: reference[key] for key in keys if key in reference} | base
+    base = dict(base, max_splits=16)
     options = [original] + [
         dict(base, block_n=bn, threads=threads, stages=1)
         for bn, threads in ((32, 128), (64, 128), (64, 256))
@@ -156,7 +179,7 @@ def select(tuner, context, reference):
 
     measured = tuner.select(
         dict(
-            kind="private_owner_attention",
+            kind="independent_query_attention",
             query_heads=qh,
             kv_heads=kvh,
             context=context,

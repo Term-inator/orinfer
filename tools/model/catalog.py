@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -23,10 +24,25 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
 
 
+def construction_contracts(package):
+    """Retain bindings whose presence changes a registered execution program.
+
+    Older Qwen packages use a separate convolution-history writer. Its presence
+    must reach the constructor even though it has no row-selection suffix.
+    In-place convolution packages have no such binding to retain.
+    """
+    return set(package.get("plan_kernel_contracts", [])) | {
+        k["name"]
+        for k in package["kernels"]
+        if re.fullmatch(r"qwen_rows/state/layer[0-9]+/history", k["name"])
+    }
+
+
 def factor(package):
     package = copy.deepcopy(package)
+    selected = construction_contracts(package)
     kernels = package.pop("kernels")
-    selected = set(package.pop("plan_kernel_contracts", []))
+    package.pop("plan_kernel_contracts", None)
     dynamic = package.pop("dynamic_batch_kernels", [])
     assets, definitions, templates = [], [], []
     asset_ids, definition_ids, template_ids = {}, {}, {}
@@ -189,7 +205,7 @@ def seal(package, directory, engine=None):
         raise ValueError("Compiled catalog failed exact binding roundtrip")
     if {v["name"]: v for v in dynamic} != {
         v["name"]: dict({"capacity": 128}, **v) for v in package.get("dynamic_batch_kernels", [])
-    } or set(contracts) != set(package.get("plan_kernel_contracts", [])):
+    } or set(contracts) != construction_contracts(package):
         raise ValueError("Compiled catalog failed dynamic/plan contract roundtrip")
     factored["execution"] = build_library(factored, bindings, directory, engine)
     return factored

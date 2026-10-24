@@ -48,6 +48,7 @@ def factories(b, attention, conv):
         query_heads=b.qh,
         kv_heads=b.kvh,
         head_group=attention["head_group"],
+        independent_queries=attention.get("independent_queries", False),
     )
     common = dict(key_heads=b.hk, value_heads=b.hv)
     out = {
@@ -88,10 +89,14 @@ def factories(b, attention, conv):
 
 
 def build(b, *, attention=None, conv=None):
-    selection = attention or b.row_tuner.attention(b.context)
+    selection = attention
+    canonical = (
+        geometry(selection) if selection is not None else b.row_tuner.causal_attention(b.context)
+    )
+    canonical = dict(canonical, independent_queries=True)
     configs, choices = {}, []
     for width in range(2, 9):
-        config = geometry(selection, width)
+        config = canonical
         key = json.dumps(config, sort_keys=True)
         name = f"attention{len(configs)}" if key not in configs else configs[key][0]
         configs[key] = (name, config)
@@ -99,7 +104,7 @@ def build(b, *, attention=None, conv=None):
             choices[-1]["max_tokens"] = width
         else:
             choices.append(dict(min_tokens=width, max_tokens=width, program=name))
-    attention = geometry(selection)
+    attention = canonical
     conv = conv or geometry(b.row_tuner.gdn_convolution())
     functions = factories(b, attention, conv)
     b.weights.fixed(OFFSET, "i32", [1], "sequence")

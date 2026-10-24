@@ -548,11 +548,13 @@ class Builder:
     ):
         from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
         from tools.model.row_tuning import ATTENTION_TARGET
+        from tools.model.qwen35.attention import causal_selection, CAUSAL_ROWS
 
         with gpu_lock(self.lock):
             selection = self.row_tuner.attention(self.context)
             if staging:
                 selection = self.row_tuner.staged_attention(self.context, selection)
+            selection = causal_selection(selection, self.row_tuner.causal_attention(self.context))
         partial = dict(
             Partial="AttentionPartial",
             Maximum="AttentionMaximum",
@@ -617,6 +619,7 @@ class Builder:
                     head_group=group,
                     dimension=self.dimension,
                     gated=not self.standard,
+                    independent_queries=config.get("independent_queries", False),
                 )
                 if fn is causal_attention_int8:
                     options.update(
@@ -638,10 +641,15 @@ class Builder:
                 self.emit(
                     role + suffix,
                     f"gqa-rows-{fn.__name__}-{self.context}-{bm}-{bn}-{group}-"
-                    f"{config['max_splits']}-{threads}-{stages}-decoded{config.get('decoded_kv', False)}",
-                    lambda fn=fn, options=options: primitive(fn, CAPACITY, **options),
+                    f"{config['max_splits']}-{threads}-{stages}-decoded{config.get('decoded_kv', False)}-"
+                    f"independent{config.get('independent_queries', False)}",
+                    lambda fn=fn, options=options, config=config: primitive(
+                        fn,
+                        CAUSAL_ROWS if config.get("independent_queries") else CAPACITY,
+                        **options,
+                    ),
                     bindings,
-                    rows,
+                    min(rows, CAUSAL_ROWS) if config.get("independent_queries") else rows,
                 )
 
     def convolution(self, name, bindings):

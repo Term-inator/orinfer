@@ -4,6 +4,8 @@ A row is a query token, independent of request/batch/MTP meaning. The caller
 binds one owner's KV and causal positions. Query heads sharing KV are packed
 into the MMA row axis. Split count follows the live grid geometry; its target
 and tile sizes are selected offline, never from a context-length enumeration.
+Short causal packets can instead assign one CTA tile per query, preserving
+the single-query split and reduction contract for every owner and width.
 """
 
 import tilelang.language as T
@@ -39,7 +41,11 @@ __device__ __forceinline__ int attn_max_position(const int* positions, int rows,
 """
 
 
-def geometry(rows, block_m, target_tiles, max_splits, groups, instances=1):
+def geometry(
+    rows, block_m, target_tiles, max_splits, groups, instances=1, independent_queries=False
+):
+    if independent_queries:
+        return rows, min(max_splits, target_tiles)
     tiles = T.ceildiv(rows * groups, block_m)
     splits = T.min(max_splits, T.ceildiv(target_tiles, tiles * instances))
     return tiles, splits
@@ -68,6 +74,7 @@ def causal_attention_int8(
     parallel_instances=False,
     decoded_kv=False,
     gated=True,
+    independent_queries=False,
 ):
     groups = query_heads // kv_heads if head_group is None else head_group
     if (
@@ -83,15 +90,21 @@ def causal_attention_int8(
         or max_splits not in (1, 2, 4, 8, 16)
         or groups <= 0
         or (query_heads // kv_heads) % groups
+        or type(independent_queries) is not bool
+        or (independent_queries and groups > block_m)
+        or (independent_queries and capacity > 8)
     ):
         raise ValueError("Invalid dynamic GQA geometry")
     m = row_count(capacity, True)
     instances = T.dynamic("independent_instances") if parallel_instances else 1
     work_heads = query_heads // groups
     heads_per_kv = query_heads // kv_heads // groups
-    tiles, splits = geometry(m, block_m, target_tiles, max_splits, groups, instances)
+    tiles, splits = geometry(
+        m, block_m, target_tiles, max_splits, groups, instances, independent_queries
+    )
     # splits > 1 implies tiles < target_tiles, and tiles*splits < 2*target_tiles.
     workspace_tiles = 2 * target_tiles
+    workspace_heads = m * work_heads if independent_queries else work_heads
     load_kv = int8_kv_tile(block_n, dimension, threads)
     storage_width = kv_heads * dimension // (1 if decoded_kv else 4)
     storage_dtype = T.float16 if decoded_kv else T.uint32
@@ -107,16 +120,26 @@ def causal_attention_int8(
         Positions: T.Tensor((m,), T.int32),
         Lengths: T.Tensor((1,), T.int32),
         Y: T.Tensor((m, query_heads, dimension), T.float16),
-        Partial: T.Tensor((work_heads, workspace_tiles, block_m, dimension), T.float32),
-        Maximum: T.Tensor((work_heads, workspace_tiles, block_m), T.float32),
-        Denominator: T.Tensor((work_heads, workspace_tiles, block_m), T.float32),
+        Partial: T.Tensor((workspace_heads, workspace_tiles, block_m, dimension), T.float32),
+        Maximum: T.Tensor((workspace_heads, workspace_tiles, block_m), T.float32),
+        Denominator: T.Tensor((workspace_heads, workspace_tiles, block_m), T.float32),
     ):
         with T.Kernel(tiles, work_heads, splits, threads=threads) as (qb, kh, split):
             T.import_source(HALF2_SOURCE + SCALAR_SOURCE)
             split_count = T.alloc_local((1,), T.int32)
-            split_count[0] = T.call_pure_extern(
-                "int32", "attn_split_count", m, groups, block_m, target_tiles, max_splits, instances
-            )
+            if independent_queries:
+                split_count[0] = min(max_splits, target_tiles)
+            else:
+                split_count[0] = T.call_pure_extern(
+                    "int32",
+                    "attn_split_count",
+                    m,
+                    groups,
+                    block_m,
+                    target_tiles,
+                    max_splits,
+                    instances,
+                )
             q = T.alloc_shared((block_m, dimension), T.float16)
             k = T.alloc_shared((block_n, dimension), T.float16)
             v = T.alloc_shared((block_n, dimension), T.float16)
@@ -141,9 +164,12 @@ def causal_attention_int8(
             T.clear(denom)
             T.fill(maximum, -1e30)
             for i in T.Parallel(block_m):
-                token = (qb * block_m + i) // groups
-                pos[i] = T.if_then_else(token < m, Positions[token], -1)
-            if block_m == 128:
+                token = qb if independent_queries else (qb * block_m + i) // groups
+                live = token < m and (i < groups if independent_queries else True)
+                pos[i] = T.if_then_else(live, Positions[token], -1)
+            if independent_queries:
+                maxpos[0] = Positions[qb]
+            elif block_m == 128:
                 # Keep the CTA-wide position reduction independent of the MMA
                 # fragment's row layout for larger query tiles.
                 maxpos[0] = T.call_extern(
@@ -177,10 +203,11 @@ def causal_attention_int8(
                     (1, end, kv_heads * dimension // 64), T.float16, data=VS.data
                 )
             for i, d in T.Parallel(block_m, dimension):
-                token = (qb * block_m + i) // groups
+                token = qb if independent_queries else (qb * block_m + i) // groups
                 q[i, d] = 0.0
-                if token < m:
-                    q[i, d] = Q[token, kh * groups + (qb * block_m + i) % groups, d]
+                if token < m and (i < groups if independent_queries else True):
+                    head = kh * groups + (i if independent_queries else (qb * block_m + i) % groups)
+                    q[i, d] = Q[token, head, d]
             for tile in T.Pipelined(T.ceildiv(T.max(0, end - start), block_n), num_stages=stages):
                 base = start + tile * block_n
                 if decoded_kv:
@@ -226,16 +253,18 @@ def causal_attention_int8(
                     out[i, d] *= correction[i]
                 T.gemm(p, v, out, policy=T.GemmWarpPolicy.FullRow)
             if split_count[0] > 1:
+                storage_head = qb * work_heads + kh if independent_queries else kh
+                storage_tile = split if independent_queries else qb * split_count[0] + split
                 for i, d in T.Parallel(block_m, dimension):
-                    Partial[kh, qb * split_count[0] + split, i, d] = out[i, d]
+                    Partial[storage_head, storage_tile, i, d] = out[i, d]
                 for i in T.Parallel(block_m):
-                    Maximum[kh, qb * split_count[0] + split, i] = maximum[i]
-                    Denominator[kh, qb * split_count[0] + split, i] = denom[i]
+                    Maximum[storage_head, storage_tile, i] = maximum[i]
+                    Denominator[storage_head, storage_tile, i] = denom[i]
             else:
                 for i, d in T.Parallel(block_m, dimension):
-                    token = (qb * block_m + i) // groups
-                    head = kh * groups + (qb * block_m + i) % groups
-                    if token < m:
+                    token = qb if independent_queries else (qb * block_m + i) // groups
+                    head = kh * groups + (i if independent_queries else (qb * block_m + i) % groups)
+                    if token < m and (i < groups if independent_queries else True):
                         value = T.if_then_else(denom[i] > 0, out[i, d] / T.max(denom[i], 1e-30), 0)
                         Y[token, head, d] = (
                             gate_result(value, Gate[token, head, d])
@@ -259,43 +288,65 @@ def merge_attention_int8(
     head_group=None,
     parallel_instances=False,
     gated=True,
+    independent_queries=False,
 ):
     m = row_count(capacity, True)
     instances = T.dynamic("independent_instances") if parallel_instances else 1
     groups = query_heads // kv_heads if head_group is None else head_group
-    if groups <= 0 or (query_heads // kv_heads) % groups or max_splits not in (1, 2, 4, 8, 16):
+    if (
+        groups <= 0
+        or (query_heads // kv_heads) % groups
+        or max_splits not in (1, 2, 4, 8, 16)
+        or type(independent_queries) is not bool
+        or (independent_queries and groups > block_m)
+        or (independent_queries and capacity > 8)
+    ):
         raise ValueError("Invalid query-head group")
     reduction_levels = max_splits.bit_length() - 1
     work_heads = query_heads // groups
-    _, splits = geometry(m, block_m, target_tiles, max_splits, groups, instances)
+    _, splits = geometry(
+        m, block_m, target_tiles, max_splits, groups, instances, independent_queries
+    )
     workspace_tiles = 2 * target_tiles
+    workspace_heads = m * work_heads if independent_queries else work_heads
     grid = (
         m * query_heads
-        if parallel_instances
+        if parallel_instances or independent_queries
         else T.min(m * query_heads, 1 + (splits - 1) * target_tiles * block_m * query_heads)
     )
 
     @T.prim_func
     def main(
-        Partial: T.Tensor((work_heads, workspace_tiles, block_m, dimension), T.float32),
-        Maximum: T.Tensor((work_heads, workspace_tiles, block_m), T.float32),
-        Denominator: T.Tensor((work_heads, workspace_tiles, block_m), T.float32),
+        Partial: T.Tensor((workspace_heads, workspace_tiles, block_m, dimension), T.float32),
+        Maximum: T.Tensor((workspace_heads, workspace_tiles, block_m), T.float32),
+        Denominator: T.Tensor((workspace_heads, workspace_tiles, block_m), T.float32),
         Gate: T.Tensor((m, query_heads, dimension), T.float16),
         Y: T.Tensor((m, query_heads, dimension), T.float16),
     ):
         with T.Kernel(grid, threads=128) as work:
             T.import_source(SCALAR_SOURCE)
             split_count = T.alloc_local((1,), T.int32)
-            split_count[0] = T.call_pure_extern(
-                "int32", "attn_split_count", m, groups, block_m, target_tiles, max_splits, instances
-            )
+            if independent_queries:
+                split_count[0] = min(max_splits, target_tiles)
+            else:
+                split_count[0] = T.call_pure_extern(
+                    "int32",
+                    "attn_split_count",
+                    m,
+                    groups,
+                    block_m,
+                    target_tiles,
+                    max_splits,
+                    instances,
+                )
             if split_count[0] > 1:
                 token = work // query_heads
                 head = work % query_heads
                 kh = head // groups
                 flat = token * groups + head % groups
-                qb = flat // block_m
-                qi = flat % block_m
+                qb = token if independent_queries else flat // block_m
+                qi = head % groups if independent_queries else flat % block_m
+                storage_head = token * work_heads + kh if independent_queries else kh
                 # Each thread owns output columns. Keep only a short split
                 # vector live, rather than a split-by-head-dimension fragment.
                 # Both sums use a balanced FP32 tree before FP16 gate rounding.
@@ -307,14 +358,16 @@ def merge_attention_int8(
                 maximum[0] = -1e30
                 for s in T.unroll(max_splits):
                     maxima[s] = -1e30
-                    if s < split_count[0] and Denominator[kh, qb * split_count[0] + s, qi] > 0:
-                        maxima[s] = Maximum[kh, qb * split_count[0] + s, qi]
+                    storage_tile = s if independent_queries else qb * split_count[0] + s
+                    if s < split_count[0] and Denominator[storage_head, storage_tile, qi] > 0:
+                        maxima[s] = Maximum[storage_head, storage_tile, qi]
                     maximum[0] = T.max(maximum[0], maxima[s])
                 for s in T.unroll(max_splits):
                     factors[s] = T.exp(maxima[s] - maximum[0])
                     weights[s] = 0.0
                     if s < split_count[0]:
-                        weights[s] = factors[s] * Denominator[kh, qb * split_count[0] + s, qi]
+                        storage_tile = s if independent_queries else qb * split_count[0] + s
+                        weights[s] = factors[s] * Denominator[storage_head, storage_tile, qi]
                 for level in T.unroll(reduction_levels):
                     for s in T.unroll(max_splits >> (level + 1)):
                         weights[s] = weights[2 * s] + weights[2 * s + 1]
@@ -324,7 +377,8 @@ def merge_attention_int8(
                         for s in T.unroll(max_splits):
                             values[s] = 0.0
                             if s < split_count[0]:
-                                values[s] = factors[s] * Partial[kh, qb * split_count[0] + s, qi, d]
+                                storage_tile = s if independent_queries else qb * split_count[0] + s
+                                values[s] = factors[s] * Partial[storage_head, storage_tile, qi, d]
                         for level in T.unroll(reduction_levels):
                             for s in T.unroll(max_splits >> (level + 1)):
                                 values[s] = values[2 * s] + values[2 * s + 1]

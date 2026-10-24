@@ -7,11 +7,24 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tools.model.catalog import build_library, expand, factor, rust_source
+from tools.model.catalog import build_library, construction_contracts, expand, factor, rust_source
 from tools.model.binding_templates import factor as templates, expand as expand_templates
 
 
 class CatalogTests(unittest.TestCase):
+    def test_separate_qwen_history_survives_native_construction_filtering(self):
+        package = self.package()
+        history = copy.deepcopy(package["kernels"][0])
+        history["name"] = "qwen_rows/state/layer0/history"
+        package["kernels"].append(history)
+        factored, bindings = factor(package)
+        marked = {b["name"] for b in bindings if b["plan_contract"]}
+        self.assertIn(history["name"], marked)
+        self.assertNotIn("layer1/projection", marked)
+        _, _, contracts = expand(factored["catalog"], bindings)
+        self.assertEqual(set(contracts), construction_contracts(package))
+        self.assertNotIn(history["name"], package["plan_kernel_contracts"])
+
     def package(self):
         identity = dict(file="assets.safetensors", tensor="a" * 64, sha256="a" * 64)
         kernel = dict(

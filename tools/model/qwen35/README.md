@@ -37,6 +37,18 @@ E8P 的 INT8 Tensor Core 路径先将压缩 K128 slab 异步读入 CTA 共享内
 
 宽 FFN 的 SwiGLU、block128 旋转按列 tile 并行，再从局部最大值计算同一个输出行 A8 scale；旋转、舍入及 FP16 边界复用公共实现，保持每个输出行一个 scale。因果注意力使用公共行模板，离线选择 query-head 分组与 split 上限，支持动态拆分与编译期固定为单个 split 的特化。所有配置复用 INT8 KV 读取、FP32 softmax 和输出处理；真实行数与 KV 长度均在运行时传入。KV 读取使用紧凑的线程条带循环以控制指令量；split merge 按输出列保留短向量，使用 FP32 树形归约后再执行原有 FP16 边界和 gate。调优包含非整 tile 的 KV 长度。Prefill、decode 与 MTP 复用同一计算体，Rust 分别绑定每个请求的 KV 和位置。
 
+1–8 行短段为每个 query 使用独立的 attention tile。普通 decode 与 MTP 验证共享一个离线选择的几何、固定 split 数和归约顺序；分段边界由该 query 的因果位置决定。请求数及同段其他 query 的位置保持这一算术契约。较大 prefill 使用原有动态行选择。每个 query 的临时部分结果具有相同的内部布局，普通地址表包装与共享验证模板读取相同的 FP32 中间表示。
+
+对已发布、使用紧凑单行 decode tile 和共享验证工作区的 Qwen 包，可只重建短段 attention 与原生计划：
+
+```bash
+bash tools/operators/run.sh tools/model/qwen35/rebuild_attention.py \
+  artifacts/qwen35-attention-rebuild --model /path/to/model \
+  --target artifacts/models/qwen35-attention-fixed
+```
+
+该入口复用输入包已测量的 decode 几何、权重及大 prefill 实现。独立的卷积 history 更新绑定自动保留为原生构建契约；使用原地 history 更新的包保持其对应计划。包含 owner-parallel verification table 的包使用完整构建入口，以同时重建私有工作区布局。输入几何或 ABI 不匹配时重建会报错，并保留原模型目录。
+
 整数投影保留一个大行数动态 fallback 与常用精确 AOT；128 行内非 AOT packet 的 tile 由离线测量选择，有界动态特化按真实行数执行。选择区间排除固定 AOT 点，复用同一投影计算体，部署包保留选中的实现。
 
 上述流水线通过 `tools/model/row_tuning.py` 离线选择 tile，复用 Flash Next 的相邻选择区间合并规则；执行包只包含被选中的候选。各 batch 与上下文长度复用动态 cubin，运行时显式传入真实行数与 KV 长度。共享 workspace 保存临时旋转区和有界注意力部分结果；权重保持压缩表示。
@@ -54,6 +66,7 @@ bash tools/operators/run.sh tools/model/qwen35/check_kernels.py artifacts/qwen35
   --gpu-lock-held
 bash tools/operators/run.sh tools/model/qwen35/check_rows.py artifacts/qwen35-rows
 bash tools/operators/run.sh tools/model/qwen35/check_decode.py artifacts/qwen35-decode
+bash tools/operators/run.sh tools/model/qwen35/check_causal_attention.py artifacts/qwen35-causal-attention
 ```
 
 构建缓存默认位于 `artifacts/build-cache/qwen35`。失败可用包装器 `--resume` 重跑，已校验编译对象会复用。算子检查验证局部数值与 ABI；新执行包还须完成真实模型加载、生成、prefix 恢复、并发和 MTP 验收。

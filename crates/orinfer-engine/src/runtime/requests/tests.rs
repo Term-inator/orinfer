@@ -4,6 +4,7 @@ mod benchmark;
 mod decode_quality;
 mod decode_template;
 mod flash_batch;
+mod mtp_consistency;
 mod sampling;
 mod single_decode;
 mod single_row;

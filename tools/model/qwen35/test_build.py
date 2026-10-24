@@ -512,10 +512,13 @@ class BuildTests(unittest.TestCase):
         builder.context, builder.lock = 262144, None
         builder.qh, builder.kvh = 24, 4
         builder.dimension, builder.standard, builder.kv_width = 256, False, 1024
-        builder.row_tuner = SimpleNamespace(attention=lambda _: selection)
+        builder.row_tuner = SimpleNamespace(
+            attention=lambda _: selection,
+            causal_attention=lambda _: dict(selection["configs"][0], block_m=16, head_group=6),
+        )
         launches = []
         builder.emit = lambda name, key, build, bindings, rows: launches.append(
-            (build(), bindings, rows)
+            (name, build(), bindings, rows)
         )
         with (
             patch.dict(
@@ -538,7 +541,7 @@ class BuildTests(unittest.TestCase):
                 prefix="Draft",
                 rows=7,
             )
-        options, bindings, rows = launches[0]
+        _, options, bindings, rows = launches[0]
         self.assertEqual((options["threads"], options["stages"], rows), (256, 1, 7))
         for name, expected in (
             ("k", "KPages"),
@@ -548,8 +551,10 @@ class BuildTests(unittest.TestCase):
         ):
             self.assertEqual(bindings[f"live_{name}"], "Draft" + expected)
         self.assertEqual(bindings["Lengths"], "length")
-        self.assertNotIn("stages", launches[1][0])
-        self.assertNotIn("live_k", launches[1][1])
+        self.assertTrue(options["independent_queries"])
+        merge = next(x for x in launches if x[0] == "draft_attention_merge")
+        self.assertNotIn("stages", merge[1])
+        self.assertNotIn("live_k", merge[2])
 
     def test_staged_attention_preserves_private_kv_and_obeys_measured_decoder_ranges(self):
         first, merge, decoder = (lambda: None), (lambda: None), (lambda: None)
@@ -573,7 +578,9 @@ class BuildTests(unittest.TestCase):
         builder.context, builder.lock, builder.qh, builder.kvh = 262144, None, 16, 2
         builder.dimension, builder.standard, builder.kv_width = 256, False, 512
         builder.row_tuner = SimpleNamespace(
-            attention=lambda _: selection, staged_attention=lambda _, selection: selection
+            attention=lambda _: selection,
+            staged_attention=lambda _, selection: selection,
+            causal_attention=lambda _: dict(baseline, block_m=16, head_group=8),
         )
         buffers = {}
         builder.weights = SimpleNamespace(
@@ -606,13 +613,16 @@ class BuildTests(unittest.TestCase):
                 staging=True,
             )
         role = "layer3/private/attention"
-        self.assertIn(role + "_decode/skip/1-73", launches)
+        self.assertIn(role + "_decode/skip/1-8", launches)
+        self.assertIn(role + "_decode/skip/9-73", launches)
         self.assertEqual(launches[role + "_decode"][1]["K"], "L3_KPages")
         self.assertEqual(launches[role + "_decode"][1]["DK"], "AttentionDecodedK")
         self.assertTrue(launches[role][0]["decoded_kv"])
         self.assertEqual(launches[role][1]["live_k"], "AttentionDecodedK")
-        self.assertFalse(launches[role + "/rows/1-73"][0]["decoded_kv"])
-        self.assertEqual(launches[role + "/rows/1-73"][1]["K"], "L3_KPages")
+        self.assertFalse(launches[role + "/rows/9-73"][0]["decoded_kv"])
+        self.assertEqual(launches[role + "/rows/9-73"][1]["K"], "L3_KPages")
+        self.assertTrue(launches[role + "/rows/1-8"][0]["independent_queries"])
+        self.assertEqual(launches[role + "/rows/1-8"][2], 8)
         self.assertEqual(
             buffers,
             {name: ("f16", [262144, 512]) for name in ("AttentionDecodedK", "AttentionDecodedV")},

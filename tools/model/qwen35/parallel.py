@@ -115,6 +115,7 @@ def factory(role, context, attention, text=None, recurrent=None):
             max_splits=attention["max_splits"],
             head_group=attention["head_group"],
             parallel_instances=True,
+            independent_queries=attention.get("independent_queries", False),
             dimension=dim,
             gated=gated,
         )
@@ -142,10 +143,8 @@ def build(b, attention=None, recurrent=None):
     from tools.build.gpu import gpu_lock
 
     if attention is None:
-        from tools.model.qwen35.attention import select
-
         with gpu_lock(b.lock):
-            attention = select(b.row_tuner, b.context, geometry(b.row_tuner.attention(b.context)))
+            attention = b.row_tuner.causal_attention(b.context)
     if recurrent is None:
         if any(kind == "linear_attention" for kind in b.text["layer_types"]):
             with gpu_lock(b.lock):
