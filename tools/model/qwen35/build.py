@@ -1,6 +1,6 @@
 """Build native dense/MoE Qwen3.5 data and a schema-1 Rust/TileLang package.
 
-Consumes completed scalar or two-stage E8P Q4A8 checkpoints.
+Consumes completed scalar Q4 or single/two-stage E8P Q2A8/Q4A8 checkpoints.
 Weight shards are linked or losslessly K-repacked; transforms, scales and the
 single packed weight copy remain fixed. All online scheduling and layer order are registered Rust code.
 """
@@ -152,7 +152,11 @@ def configuration(config, context):
 
         if q.get("rotated_w8_layers") != rotated_w8_layers(config):
             raise ValueError("ASR requires its quality-first W8 layer policy")
-    if q.get("quant_method") not in ("orinfer_q4_int8", "orinfer_e8p_q4_int8"):
+    if q.get("quant_method") not in (
+        "orinfer_q4_int8",
+        "orinfer_e8p_q4_int8",
+        "orinfer_e8p_q2_int8",
+    ):
         raise ValueError("Unsupported Qwen Q4 codec")
     if q["quant_method"] == "orinfer_e8p_q4_int8":
         if any(
@@ -164,17 +168,29 @@ def configuration(config, context):
             ).items()
         ) or any(type(v) is not int for v in q["coefficients"]):
             raise ValueError("Unsupported two-stage E8P-Q4 contract")
-    if t["tie_word_embeddings"] and (
-        q["quant_method"] != "orinfer_e8p_q4_int8" or q.get("embedding") != "e8p_q4"
+    codec = "e8p_q2" if q["quant_method"] == "orinfer_e8p_q2_int8" else "e8p_q4"
+    if q.get("experts") is not None and (
+        config["model_type"] != "qwen3_5_moe"
+        or q["quant_method"] not in ("orinfer_e8p_q4_int8", "orinfer_e8p_q2_int8")
+        or q["experts"] not in ("e8p_q2", "e8p_q4")
     ):
-        raise ValueError("Tied embedding/head requires the shared E8P Q4 bank")
-    if any(q.get(role) not in (None, "e8p_q4") for role in ("embedding", "vision")):
+        raise ValueError("Expert precision requires a Qwen MoE E8P codec")
+    if codec == "e8p_q2" and any(
+        q.get(k) != v
+        for k, v in dict(
+            coefficients=[1], basis_tensor="orinfer.e8p_q2.basis", layout="u16-e8p"
+        ).items()
+    ):
+        raise ValueError("Unsupported single-stage E8P-Q2 contract")
+    if t["tie_word_embeddings"] and q.get("embedding") != codec:
+        raise ValueError("Tied embedding/head requires the shared E8P bank")
+    if any(q.get(role) not in (None, codec) for role in ("embedding", "vision")):
         raise ValueError("Unsupported embedding or vision codec")
     if (
         any(q.get(role) for role in ("embedding", "vision"))
-        and q["quant_method"] != "orinfer_e8p_q4_int8"
+        and q["quant_method"] == "orinfer_q4_int8"
     ):
-        raise ValueError("Embedding/vision Q4 requires the two-stage E8P codec")
+        raise ValueError("Embedding/vision compression requires E8P")
     if type(context) is not int or not 1 <= context <= min(t["max_position_embeddings"], 262144):
         raise ValueError("Invalid context capacity")
     return t
@@ -216,12 +232,18 @@ class Builder:
         self.head_weight = (
             "model.language_model.embed_tokens.weight" if self.tied else "lm_head.weight"
         )
-        self.embedding_q4 = self.config["quantization_config"].get("embedding") == "e8p_q4"
+        self.embedding_q4 = self.config["quantization_config"].get("embedding") in (
+            "e8p_q4",
+            "e8p_q2",
+        )
         self.q4_codec = (
-            "e8p_q4"
+            "e8p_q2"
+            if self.config["quantization_config"]["quant_method"] == "orinfer_e8p_q2_int8"
+            else "e8p_q4"
             if self.config["quantization_config"]["quant_method"] == "orinfer_e8p_q4_int8"
             else "q4"
         )
+        self.expert_codec = self.config["quantization_config"].get("experts") or self.q4_codec
         state = json.loads((source / "progress.json").read_text())
         if not state.get("complete"):
             raise ValueError("Quantization is still running; no partial model may be published")
@@ -231,7 +253,9 @@ class Builder:
         self.gdn_execution = (
             None if self.standard else dict(prefill="sequential", decode=dict(kind="dense"))
         )
-        self.weights = Weights(source, root, packed_k=128 if self.q4_codec == "e8p_q4" else 0)
+        self.weights = Weights(
+            source, root, packed_k=128 if self.q4_codec in ("e8p_q4", "e8p_q2") else 0
+        )
         prepare_chat_template(source, root / "chat_template.jinja")
         self.aot = Aot(
             root / "cache", output, cache, self.weights.buffers, compile_lock=lambda: gpu_lock(lock)
@@ -390,7 +414,7 @@ class Builder:
         )
         self.signs = {}
         widths = {h, f}
-        if self.config["quantization_config"].get("vision") == "e8p_q4":
+        if self.config["quantization_config"].get("vision") in ("e8p_q4", "e8p_q2"):
             v = self.config["vision_config"]
             widths.update(
                 k
@@ -403,15 +427,15 @@ class Builder:
             if signs.dtype != np.int8 or signs.shape != (k,) or not np.isin(signs, [-1, 1]).all():
                 raise ValueError("Invalid rotation signs")
             self.signs[k] = w.constant(name, signs)
-        if self.q4_codec == "e8p_q4":
+        if self.q4_codec in ("e8p_q4", "e8p_q2"):
             from tools.quantization.e8p import basis
             from tools.quantization.vq import e8p_selector_table
 
-            table = w.array("orinfer.e8p_q4.basis")
+            table = w.array(f"orinfer.{self.q4_codec}.basis")
             if table.dtype != np.int8 or not np.array_equal(table, basis()):
                 raise ValueError("E8P-Q4 basis differs from compiled decoder")
-            w.constant("orinfer.e8p_q4.basis", table)
-            self.book = w.constant("orinfer.e8p_q4.selectors", e8p_selector_table(table))
+            w.constant(f"orinfer.{self.q4_codec}.basis", table)
+            self.book = w.constant(f"orinfer.{self.q4_codec}.selectors", e8p_selector_table(table))
         else:
             table = w.array("orinfer.q4.table")
             if not np.array_equal(
@@ -460,9 +484,13 @@ class Builder:
             args["Weight"] = self.weights.immutable(weight + ".int8")
         self.emit(
             name,
-            f"embedding-{self.embedding_q4}-{rows}",
+            f"embedding-{self.q4_codec}-{self.embedding_q4}-{rows}",
             lambda: primitive(
-                e8p_q4.embedding if self.embedding_q4 else qwen35.embedding, rows, self.v, self.h
+                e8p_q4.embedding if self.embedding_q4 else qwen35.embedding,
+                rows,
+                self.v,
+                self.h,
+                **(dict(codec=self.q4_codec) if self.embedding_q4 else {}),
             ),
             args,
             rows,
@@ -720,7 +748,7 @@ class Builder:
                 if weight + ".int8" in w.index["weight_map"] or weight + ".int8" in w.buffers
                 else self.q4_codec
             )
-        compressed = kind in ("q4", "e8p_q4")
+        compressed = kind in ("q4", "e8p_q4", "e8p_q2")
         suffix = ".packed" if compressed else ".int8"
         data = w.immutable(weight + suffix)
         scale = w.immutable(weight + ".scale")
@@ -751,7 +779,7 @@ class Builder:
                 Output=target,
             )
         )
-        if kind == "e8p_q4":
+        if kind in ("e8p_q4", "e8p_q2"):
             bind["Book"] = self.book
         from tools.model.projection_policy import SPECIALIZATIONS
 
@@ -759,7 +787,7 @@ class Builder:
         if dynamic:
             shapes += [(r, False, f"{name}/rows/{r}-{r}") for r in SPECIALIZATIONS if r <= rows]
         for live, symbolic, binding in shapes:
-            key = f"{kind}-{live}-{symbolic}-{n}-{k}-{stride}-{head}-pk{w.packed_k if kind == 'e8p_q4' else 0}"
+            key = f"{kind}-{live}-{symbolic}-{n}-{k}-{stride}-{head}-pk{w.packed_k if kind in ('e8p_q4', 'e8p_q2') else 0}"
 
             def build():
                 return self.compile_projection(
@@ -802,17 +830,17 @@ class Builder:
         from tools.model.row_selection import samples
 
         w = self.weights
-        suffix = ".packed" if kind in ("q4", "e8p_q4") else ".int8"
+        suffix = ".packed" if kind in ("q4", "e8p_q4", "e8p_q2") else ".int8"
         actual = dict(
             W=torch.from_numpy(w.array(weight + suffix).copy()).cuda(),
             WS=torch.from_numpy(w.array(weight + ".scale").copy()).cuda(),
         )
         if kind == "q4":
             actual["W"] = actual["W"].view(torch.uint16)
-        if kind == "e8p_q4":
+        if kind in ("e8p_q4", "e8p_q2"):
             actual["Book"] = torch.from_numpy(w.extra[self.book].copy()).cuda()
         identity = w.buffers[weight + suffix]["data"]["sha256"]
-        if kind == "e8p_q4":
+        if kind in ("e8p_q4", "e8p_q2"):
             identity += w.buffers[self.book]["data"]["sha256"]
         tuner = ProjectionTuner(self.output / "tuning", self.aot.cache.root / "tuning")
         compile = tuner.compile_choices if select_rows else tuner.compile
@@ -832,7 +860,7 @@ class Builder:
             else None,
             objective="total_latency" if dynamic and rows >= self.capacity else "relative_geomean",
             output_stride=stride,
-            packed_k=w.packed_k if kind == "e8p_q4" else 0,
+            packed_k=w.packed_k if kind in ("e8p_q4", "e8p_q2") else 0,
             **(dict(fixed=SPECIALIZATIONS) if select_rows else {}),
         )
         return result if select_rows else result[0]
@@ -1190,7 +1218,7 @@ class Builder:
             position="Step",
             weight_bytes=total,
             weight_parameters=self.state["parameters"],
-            weight_scope=f"Original BF16 -> signed-block128 {self.q4_codec} Q4A8; embedding/vision precision from quantization policy, sensitive output/MTP projections W8; one packed resident copy; no permanent W8 expansion",
+            weight_scope=f"Original BF16 -> signed-block128 {self.q4_codec} A8, routed experts {self.expert_codec}; embedding/vision precision from quantization policy, sensitive output/MTP projections W8; one packed resident copy; no permanent W8 expansion",
             kv_cache=dict(
                 direct_prefill=True, demand_mapping=True, buffers=self.kv, prefill_workspace={}
             ),

@@ -193,6 +193,8 @@ fn validate_weights(
     m: &Manifest,
     config: &Configuration,
     e8p: bool,
+    q2: bool,
+    expert_q2: bool,
     embedding_q4: bool,
 ) -> Result<()> {
     let t = config.text();
@@ -380,9 +382,19 @@ fn validate_weights(
         }
         Ok(())
     };
+    let codec = if q2 { "e8p_q2" } else { "e8p_q4" };
+    let packed_layout = if q2 {
+        "e8p-q2-k128-u16"
+    } else {
+        "e8p-q4-k128-u32"
+    };
     if e8p {
-        check("orinfer.e8p_q4.basis".into(), Dtype::I8, vec![256, 8])?;
-        check("orinfer.e8p_q4.selectors".into(), Dtype::U32, vec![256, 1])?;
+        check(format!("orinfer.{codec}.basis"), Dtype::I8, vec![256, 8])?;
+        check(
+            format!("orinfer.{codec}.selectors"),
+            Dtype::U32,
+            vec![256, 1],
+        )?;
     }
     let q4 = |name: String, n: usize, k: usize| -> Result<()> {
         if config
@@ -398,13 +410,16 @@ fn validate_weights(
             return Ok(());
         }
         let (dtype, shape) = if e8p {
-            (Dtype::U32, vec![k / 128, n, 16])
+            (
+                if q2 { Dtype::U16 } else { Dtype::U32 },
+                vec![k / 128, n, 16],
+            )
         } else {
             (Dtype::U8, vec![n, k / 2])
         };
         let packed = format!("{name}.packed");
         check(packed.clone(), dtype, shape)?;
-        if e8p && map[packed.as_str()].layout != "e8p-q4-k128-u32" {
+        if e8p && map[packed.as_str()].layout != packed_layout {
             return Err(format!("Invalid Qwen E8P physical layout: {packed}"));
         }
         check(format!("{name}.scale"), Dtype::F16, vec![n])
@@ -457,10 +472,15 @@ fn validate_weights(
                 let packed = format!("{name}.packed");
                 check(
                     packed.clone(),
-                    Dtype::U32,
+                    if expert_q2 { Dtype::U16 } else { Dtype::U32 },
                     vec![t.num_experts, k / 128, n, 16],
                 )?;
-                if map[packed.as_str()].layout != "e8p-q4-k128-u32" {
+                let expert_layout = if expert_q2 {
+                    "e8p-q2-k128-u16"
+                } else {
+                    "e8p-q4-k128-u32"
+                };
+                if map[packed.as_str()].layout != expert_layout {
                     return Err("Invalid Qwen MoE E8P bank layout".into());
                 }
                 check(format!("{name}.scale"), Dtype::F16, vec![t.num_experts, n])?;
@@ -582,15 +602,25 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     let quant = &request.config["quantization_config"];
     let e8p = match quant["quant_method"].as_str() {
         Some("orinfer_q4_int8") => false,
-        Some("orinfer_e8p_q4_int8") => true,
+        Some("orinfer_e8p_q4_int8" | "orinfer_e8p_q2_int8") => true,
         _ => return Err("Unsupported Qwen Q4A8 codec".into()),
     };
+    let q2 = quant["quant_method"] == "orinfer_e8p_q2_int8";
+    let codec = if q2 { "e8p_q2" } else { "e8p_q4" };
     if e8p
+        && !q2
         && (quant["coefficients"] != serde_json::json!([4, 1])
             || quant["basis_tensor"] != "orinfer.e8p_q4.basis"
             || quant["layout"] != "u32-low-coarse-high-residual")
     {
         return Err("Unsupported Qwen E8P-Q4 encoding".into());
+    }
+    if q2
+        && (quant["coefficients"] != serde_json::json!([1])
+            || quant["basis_tensor"] != "orinfer.e8p_q2.basis"
+            || quant["layout"] != "u16-e8p")
+    {
+        return Err("Unsupported Qwen E8P-Q2 encoding".into());
     }
     for (key, value) in [
         ("version", serde_json::json!(1)),
@@ -602,18 +632,25 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             return Err(format!("Unsupported Qwen Q4A8 {key}"));
         }
     }
-    let embedding_q4 = quant["embedding"] == "e8p_q4";
+    let embedding_q4 = quant["embedding"] == codec;
     for role in ["embedding", "vision"] {
-        if !quant[role].is_null() && (!e8p || quant[role] != "e8p_q4") {
+        if !quant[role].is_null() && (!e8p || quant[role] != codec) {
             return Err(format!("Unsupported Qwen {role} precision"));
         }
     }
+    let expert_precision = quant["experts"].clone();
     let c = Configuration::parse(request.config)?;
     let architecture = if c.standard { "qwen3_asr" } else { "qwen3_5" };
     if request.architecture != architecture || c.signature != request.expected_signature {
         return Err("Qwen row architecture or signature differs".into());
     }
     let t = c.text();
+    let expert_q2 = match expert_precision.as_str() {
+        None if expert_precision.is_null() => q2,
+        Some("e8p_q2") if e8p && t.num_experts > 0 => true,
+        Some("e8p_q4") if e8p && t.num_experts > 0 => false,
+        _ => return Err("Unsupported Qwen expert precision".into()),
+    };
     let standard_geometry = c.standard
         && t.hidden_size == 2048
         && t.intermediate_size == 6144
@@ -670,7 +707,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         return Err("Expected dense Qwen compact prefill capacity contract".into());
     }
     let m = &mut request.metadata;
-    validate_weights(m, &c, e8p, embedding_q4)?;
+    validate_weights(m, &c, e8p, q2, expert_q2, embedding_q4)?;
     m.programs.clear();
     let begin = if m.vision.is_some() || m.audio.is_some() {
         vec!["prepare", "embedding", "overlay"]
@@ -2134,6 +2171,35 @@ mod tests {
             }))
             .unwrap(),
         );
+        let mut mixed: CreateRequest =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        mixed.config["quantization_config"]["experts"] = json!("e8p_q2");
+        mixed.expected_signature = Configuration::parse(mixed.config.clone())
+            .unwrap()
+            .signature;
+        for b in &mut mixed.metadata.buffers {
+            if b.name.contains(".mlp.experts.") && b.name.ends_with(".packed") {
+                b.dtype = Dtype::U16;
+                b.layout = "e8p-q2-k128-u16".into();
+            }
+        }
+        let valid: CreateRequest =
+            serde_json::from_value(serde_json::to_value(&mixed).unwrap()).unwrap();
+        assert!(create(valid, Policy::Int8Quality).is_ok());
+        for experts in [true, false] {
+            let mut wrong: CreateRequest =
+                serde_json::from_value(serde_json::to_value(&mixed).unwrap()).unwrap();
+            let bank = wrong
+                .metadata
+                .buffers
+                .iter_mut()
+                .find(|b| {
+                    b.name.ends_with(".packed") && b.name.contains(".mlp.experts.") == experts
+                })
+                .unwrap();
+            bank.dtype = if experts { Dtype::U32 } else { Dtype::U16 };
+            assert!(create(wrong, Policy::Int8Quality).is_err());
+        }
         let copied = serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
         let (adapter, plan) = create(with_mtp(copied), Policy::Int8Quality).unwrap();
         assert_eq!(plan.metadata.prefill_plans[0].stages.len(), 40);
@@ -2341,6 +2407,49 @@ mod tests {
             ]
         );
         assert!(!names.contains(&"qwen_rows/vision/layer1/qkv_project"));
+    }
+
+    #[test]
+    fn q2_banks_share_row_plans_and_reject_q4_storage() {
+        let candidate = || {
+            let mut r = dense_request((5120, 17408, 64, 48, 24, 4, false), true);
+            let q = &mut r.config["quantization_config"];
+            q["quant_method"] = json!("orinfer_e8p_q2_int8");
+            q["coefficients"] = json!([1]);
+            q["basis_tensor"] = json!("orinfer.e8p_q2.basis");
+            q["layout"] = json!("u16-e8p");
+            q["embedding"] = json!("e8p_q2");
+            for b in &mut r.metadata.buffers {
+                if b.name.ends_with(".packed") {
+                    b.dtype = Dtype::U16;
+                    b.layout = "e8p-q2-k128-u16".into();
+                }
+                if b.name.starts_with("orinfer.e8p_q4.") {
+                    b.name = b.name.replace("e8p_q4", "e8p_q2");
+                    b.data.as_mut().unwrap().tensor = b.name.clone();
+                }
+            }
+            r.expected_signature = Configuration::parse(r.config.clone()).unwrap().signature;
+            r
+        };
+        let (adapter, _) = create(candidate(), Policy::Int8Quality).unwrap();
+        assert!(
+            adapter
+                .batch(&[BatchSegment { slot: 2, tokens: 1 }], false)
+                .is_ok()
+        );
+        let mut wrong = candidate();
+        wrong
+            .metadata
+            .buffers
+            .iter_mut()
+            .find(|b| b.name.ends_with(".packed"))
+            .unwrap()
+            .dtype = Dtype::U32;
+        assert!(create(wrong, Policy::Int8Quality).is_err());
+        let mut wrong = candidate();
+        wrong.config["quantization_config"]["coefficients"] = json!([4, 1]);
+        assert!(create(wrong, Policy::Int8Quality).is_err());
     }
 
     #[test]

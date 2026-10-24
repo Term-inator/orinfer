@@ -20,6 +20,7 @@ DTYPES = {
     "U8": "u8",
     "I32": "i32",
     "U32": "u32",
+    "U16": "u16",
 }
 
 
@@ -55,15 +56,20 @@ class Weights:
                 segments = [(path, begin + first, last - first)]
                 if name in packed and self.packed_k:
                     if (
-                        info["dtype"] != "U32"
+                        info["dtype"] not in ("U16", "U32")
                         or len(shape) not in (2, 3)
                         or min(shape) <= 0
                         or shape[-1] % (self.packed_k // 8)
-                        or metadata.get(f"orin.layout.{name}") != "e8p-q4-row-u32"
+                        or metadata.get(f"orin.layout.{name}")
+                        != ("e8p-q2-row-u16" if info["dtype"] == "U16" else "e8p-q4-row-u32")
                     ):
                         raise ValueError(f"Invalid source E8P weight layout: {name}")
                     source = np.memmap(
-                        path, mode="r", offset=begin + first, dtype="<u4", shape=shape
+                        path,
+                        mode="r",
+                        offset=begin + first,
+                        dtype="<u2" if info["dtype"] == "U16" else "<u4",
+                        shape=shape,
                     )
                     n, vectors = shape[-2:]
                     codes = self.packed_k // 8
@@ -78,7 +84,9 @@ class Weights:
                     data.tofile(payload)
                     shape = list(data.shape)
                     segments = [(payload, 0, last - first)]
-                    metadata[f"orin.layout.{name}"] = f"e8p-q4-k{self.packed_k}-u32"
+                    metadata[f"orin.layout.{name}"] = (
+                        f"e8p-q{2 if info['dtype'] == 'U16' else 4}-k{self.packed_k}-{DTYPES[info['dtype']]}"
+                    )
                 tensors.append(dict(name=name, dtype=info["dtype"], shape=shape, segments=segments))
             destination = self.directory / file
             write_shard(destination, tensors, metadata)
@@ -119,9 +127,15 @@ class Weights:
                 .view(np.float32)
                 .reshape(info["shape"])
             )
-        dtype = {"F16": "<f2", "F32": "<f4", "I8": "i1", "U8": "u1", "I32": "<i4", "U32": "<u4"}[
-            info["dtype"]
-        ]
+        dtype = {
+            "F16": "<f2",
+            "F32": "<f4",
+            "I8": "i1",
+            "U8": "u1",
+            "I32": "<i4",
+            "U32": "<u4",
+            "U16": "<u2",
+        }[info["dtype"]]
         return np.frombuffer(raw, dtype=dtype).reshape(info["shape"])
 
     def immutable(self, name, *, cast=None, shape=None):
@@ -191,6 +205,7 @@ class Weights:
             np.dtype("float32"): "f32",
             np.dtype("int32"): "i32",
             np.dtype("uint32"): "u32",
+            np.dtype("uint16"): "u16",
             np.dtype("int8"): "i8",
         }[data.dtype]
         self.extra[name] = data
@@ -222,7 +237,9 @@ class Weights:
             name + suffix, np.concatenate(values, axis=0 if suffix == ".int8" else 1)
         )
         if suffix == ".packed":
-            self.buffers[target]["layout"] = "e8p-q4-k128-u32"
+            self.buffers[target]["layout"] = (
+                "e8p-q2-k128-u16" if values[0].dtype == np.uint16 else "e8p-q4-k128-u32"
+            )
         self.constant(name + ".scale", np.concatenate([self.array(p + ".scale") for p in sources]))
         return name
 
@@ -275,7 +292,9 @@ class Weights:
             write_shard(path, entries, specs.get("__metadata__"))
         total = sum(
             math.prod(b["shape"])
-            * {"f16": 2, "f32": 4, "bf16": 2, "i8": 1, "u8": 1, "i32": 4, "u32": 4}[b["dtype"]]
+            * {"f16": 2, "f32": 4, "bf16": 2, "i8": 1, "u8": 1, "i32": 4, "u32": 4, "u16": 2}[
+                b["dtype"]
+            ]
             for b in self.buffers.values()
             if b["access"] == "read"
         )

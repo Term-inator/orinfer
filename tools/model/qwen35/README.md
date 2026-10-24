@@ -82,3 +82,7 @@ bash tools/operators/run.sh tools/model/qwen35/check_causal_attention.py artifac
 构建缓存默认位于 `artifacts/build-cache/qwen35`。失败可用包装器 `--resume` 重跑，已校验编译对象会复用。算子检查验证局部数值与 ABI；新执行包还须完成真实模型加载、生成、prefix 恢复、并发和 MTP 验收。
 
 Qwen3-ASR-1.7B 使用相同构建器并传入 `--context 65536`。它复用文本投影、动态 GQA、FFN 和请求状态，音频部分由 `qwen_asr/audio.py` 绑定共享 FP16 encoder 组件。其 RMSNorm、完整 RoPE 和 ungated attention 按配置传递，音频前端与转写用法见[语音识别](../../../docs/audio.md)。
+
+单级 E8P Q2 产物也使用本构建入口。契约为 `quant_method=orinfer_e8p_q2_int8`、`coefficients=[1]`、`basis_tensor=orinfer.e8p_q2.basis` 和 `layout=u16-e8p`。输入 U16 `[N,K/8]` 在构建时无损重排为 `[K/128,N,16]`；专家额外保留最外层 expert 维。Q2 与 Q4 共用整数投影、动态行、路由和请求状态实现，Q2 从单个码字解码完整 INT8 权重。离线调优选择实际发布的 INT8 Tensor Core 或 DP4A tile，权重保持单份压缩表示。
+
+MoE 的 `quantization_config.experts` 可独立声明 `e8p_q2` 或 `e8p_q4`；未声明或为 null 时使用全局 E8P 精度。该字段只适用于 MoE，主干/共享 FFN、embedding/head 的精度仍由全局编码契约声明。构建器按专家精度选择 kernel 和离线调优，原生适配器按实际角色校验 U16/U32 bank。两种编码共享基础 E8P selector，尺度及旋转语义保持各自转换结果。`tools/quantization/qwen_moe_mix.py` 可以无损组合主干 Q4、路由专家 Q2 的输入，再使用本构建入口发布独立执行包。文本实验包的验证范围以对应实验报告为准。

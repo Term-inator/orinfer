@@ -36,7 +36,7 @@ def build(b):
     w.fixed("Features", "f16", [features, out], "sequence")
     w.fixed("FeatureIndex", "i32", [b.context], "sequence")
 
-    if b.config["quantization_config"].get("vision") == "e8p_q4":
+    if b.config["quantization_config"].get("vision") in ("e8p_q4", "e8p_q2"):
         width = max(h, f, 4 * h)
         w.fixed("VActivationA8", "i8", [PATCHES * width])
         w.fixed("VActivationScale", "f16", [PATCHES])
@@ -78,7 +78,7 @@ def build(b):
                 role + "_project",
                 f"q4-a8-{capacity}-{n}-{k}",
                 lambda: b.compile_projection(
-                    source_weight, "e8p_q4", n, k, capacity, True, "float32"
+                    source_weight, b.q4_codec, n, k, capacity, True, "float32"
                 ),
                 dict(
                     A="VActivationA8",

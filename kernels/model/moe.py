@@ -68,7 +68,7 @@ def integer_experts(
 ):
     """Routed bank/row views around the shared dense integer MMA computation."""
     from kernels.model.integer_core import tensor_core, tensor_core_tiles
-    from kernels.model.e8p_q4 import decode_source
+    from kernels.model.e8p_q4 import decode_source, q2_decode_source
 
     if (
         min(M, N, K, E, top_k) <= 0
@@ -76,7 +76,7 @@ def integer_experts(
         or K % 128
         or block_m not in (8, 16, 32, 64, 128, 256)
         or block_n not in (32, 64, 128)
-        or codec not in ("w8", "e8p_q4")
+        or codec not in ("w8", "e8p_q4", "e8p_q2")
         or (codec == "w8" and (block_m == 8 or block_n == 32))
         or block_k not in (128, 256)
         or K % block_k
@@ -88,12 +88,14 @@ def integer_experts(
     tiles = (M * top_k + block_m - 1) // block_m + min(E, M * top_k)
     m = row_count(M, dynamic_rows)
     rows = m * top_k
-    packed = codec == "e8p_q4"
+    packed = codec in ("e8p_q4", "e8p_q2")
     threads = 64 if packed and block_n == 32 else 128
     operands = dict(
         stages=stages,
         codec=codec,
-        source=decode_source((4, 1)) if packed else "",
+        source=(q2_decode_source() if codec == "e8p_q2" else decode_source((4, 1)))
+        if packed
+        else "",
         packed_k=128 if packed else 0,
         grouped=True,
     )
@@ -115,7 +117,10 @@ def integer_experts(
     @T.prim_func
     def main(
         A: T.Tensor((rows, K), T.int8),
-        W: T.Tensor((E, K // 128, N, 16) if packed else (E, N, K), T.uint32 if packed else T.int8),
+        W: T.Tensor(
+            (E, K // 128, N, 16) if packed else (E, N, K),
+            (T.uint16 if codec == "e8p_q2" else T.uint32) if packed else T.int8,
+        ),
         Book: T.Tensor((256, 1), T.uint32),
         WS: T.Tensor((E, N), T.float16),
         AS: T.Tensor((rows,), T.float16),

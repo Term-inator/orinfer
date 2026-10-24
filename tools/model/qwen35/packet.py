@@ -63,7 +63,8 @@ def build(b):
         )
         b.emit(
             "packet/" + role,
-            f"packet-{role}-{b.h}-{b.v}-{b.context}-{b.standard}",
+            f"packet-{role}-{b.h}-{b.v}-{b.context}-{b.standard}"
+            + (f"-{b.q4_codec}" if role == "embedding" else ""),
             lambda: compile_function(wrapped),
             bindings,
             LANES,
@@ -84,6 +85,7 @@ def build(b):
         b.v,
         b.h,
         original="begin/embedding",
+        **(dict(codec=b.q4_codec) if b.embedding_q4 else {}),
     )
     media = b.audio or b.vision
     if media:

@@ -63,6 +63,7 @@ ORINFER_CHECKPOINT_DIR=/path/to/original \
 ORINFER_CHECKPOINT_DIR=/path/to/original \
   bash tools/quantization/run.sh qwen_e8p --source-dir /path/to/original \
   --bits 2 --output artifacts/quantization/qwen-e8p-q2
+bash tools/operators/run.sh tools/quantization/check_e8p_q2.py artifacts/check-e8p-q2
 ```
 
 Q2 输出使用独立目录，构建复用 `tools/model/qwen35/build.py`。生产基线以独立质量和完整请求验收结果为准。

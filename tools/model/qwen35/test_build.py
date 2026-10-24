@@ -176,6 +176,8 @@ class BuildTests(unittest.TestCase):
             buffers[name] = dict(dtype=dtype, shape=shape)
 
         builder = SimpleNamespace(
+            q4_codec="e8p_q4",
+            expert_codec="e8p_q4",
             capacity=CAPACITY,
             weights=SimpleNamespace(buffers=buffers, fixed=fixed),
             h=2048,
@@ -389,6 +391,22 @@ class BuildTests(unittest.TestCase):
             layer_types=t["layer_types"][:40],
         )
         self.assertEqual(configuration(candidate, 262144)["num_experts"], 256)
+        quant = candidate["quantization_config"]
+        with patch.dict(
+            quant,
+            dict(
+                quant_method="orinfer_e8p_q4_int8",
+                coefficients=[4, 1],
+                basis_tensor="orinfer.e8p_q4.basis",
+                layout="u32-low-coarse-high-residual",
+                experts="e8p_q2",
+            ),
+        ):
+            self.assertEqual(configuration(candidate, 4096)["num_experts"], 256)
+            for invalid in ["w8", "q2", False]:
+                with patch.dict(quant, {"experts": invalid}):
+                    with self.assertRaisesRegex(ValueError, "Expert precision"):
+                        configuration(candidate, 4096)
         del t["mlp_only_layers"]
         from tools.model.package import config_signature
 

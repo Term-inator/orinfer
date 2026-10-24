@@ -89,7 +89,7 @@ def prepare_e8p_book(source, book):
 
 
 def weight_loader(codec, n, bn, bk, source, *, packed_k=0, grouped=False, wait_for_encoded=True):
-    if codec not in ("w8", "q4", "e8p_q4"):
+    if codec not in ("w8", "q4", "e8p_q4", "e8p_q2"):
         raise ValueError("Unsupported integer weight codec")
 
     @T.macro
@@ -116,7 +116,9 @@ def weight_loader(codec, n, bn, bk, source, *, packed_k=0, grouped=False, wait_f
                 # Stage contiguous compressed slabs alongside A. The pipeline
                 # can prefetch the next slab while this one is decoded/MMA'd;
                 # the resident weight representation remains compressed.
-                encoded = T.alloc_shared((bk // 128, bn, 16), T.uint32)
+                encoded = T.alloc_shared(
+                    (bk // 128, bn, 16), T.uint16 if codec == "e8p_q2" else T.uint32
+                )
                 for part in T.unroll(bk // 128):
                     if grouped:
                         T.copy(
@@ -175,10 +177,12 @@ def tensor_core(
     grouped=False,
     cache_scales=False,
 ):
-    if codec == "e8p_q4" and dual:
+    if codec in ("e8p_q4", "e8p_q2") and dual:
         raise ValueError("E8P-Q4 reserves the secondary operand for its shared basis")
     if grouped and (
-        codec not in ("w8", "e8p_q4") or (codec == "e8p_q4" and packed_k != 128) or dual
+        codec not in ("w8", "e8p_q4", "e8p_q2")
+        or (codec in ("e8p_q4", "e8p_q2") and packed_k != 128)
+        or dual
     ):
         raise ValueError("Unsupported grouped integer operands")
     # A single-stage pipeline already waits for every copy. Preserve that
@@ -227,14 +231,14 @@ def tensor_core(
             u = T.alloc_shared((bn, bk), T.int8)
             up = T.alloc_fragment((bn, bm) if left else (bm, bn), T.int32)
             T.clear(up)
-        if codec == "e8p_q4":
+        if codec in ("e8p_q4", "e8p_q2"):
             T.import_source(source)
             book = T.alloc_shared((512, 1), T.uint32)
             prepare_e8p_book(U, book)
         T.clear(acc)
         for kg in T.Pipelined(k // bk, num_stages=stages):
             T.copy(A[first + by * bm, kg * bk], a)
-            if codec == "e8p_q4":
+            if codec in ("e8p_q4", "e8p_q2"):
                 load(W, book, w, bx, kg, expert)
             else:
                 load(W, W, w, bx, kg, expert)
@@ -273,7 +277,7 @@ def tensor_core(
 
 
 def dp4a(m, n, k, bm, bn, *, codec="w8", source="", dual=False, packed_k=0):
-    if codec not in ("w8", "q4", "e8p_q4"):
+    if codec not in ("w8", "q4", "e8p_q4", "e8p_q2"):
         raise ValueError("Unsupported integer weight codec")
     if dual and codec != "w8":
         raise ValueError("The dual DP4A ABI requires two W8 operands")
@@ -307,7 +311,7 @@ def dp4a(m, n, k, bm, bn, *, codec="w8", source="", dual=False, packed_k=0):
                     )
                 }
             )
-        if codec == "e8p_q4":
+        if codec in ("e8p_q4", "e8p_q2"):
             book = T.alloc_shared((512, 1), T.uint32)
             prepare_e8p_book(U, book)
         T.annotate_layout(

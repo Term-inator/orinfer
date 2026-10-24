@@ -100,6 +100,7 @@ def selection(b, banks):
                 actual,
                 [w.buffers[name]["data"]["sha256"] for bank in banks for name in bank],
                 routing_samples=getattr(b, "moe_routing", None),
+                codec="e8p_q2_k128" if b.expert_codec == "e8p_q2" else "e8p_q4",
             )
     return b.moe_selection
 
@@ -143,7 +144,7 @@ def projections(b, section, bank_up, bank_down, *, rows=None, draft=False):
 
     w, h, f = b.weights, b.h, b.f
     e, top = b.text["num_experts"], b.text["num_experts_per_tok"]
-    codec = "w8" if draft else "e8p_q4"
+    codec = "w8" if draft else "e8p_q2_k128" if b.expert_codec == "e8p_q2" else "e8p_q4"
     emit = emitter(b, section, rows)
     selected = (
         [("", dict(block_m=16, expand=False))]
@@ -431,7 +432,7 @@ def build(b, section, prefix, *, rows=None, draft=False):
     norm = "MtpNorm" if draft else "Norm"
     output = "MtpHidden" if draft else "Hidden"
     gate_up = "MtpGateUp" if draft else "GateUp"
-    codec = "w8" if draft else "e8p_q4"
+    codec = "w8" if draft else b.q4_codec
     bank_up, bank_down = banks(b, prefix, draft)
     emit = emitter(b, section, rows)
 

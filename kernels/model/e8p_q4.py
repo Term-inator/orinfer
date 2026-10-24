@@ -10,7 +10,7 @@ from tools.operators.common import orin_jit
 from tools.quantization.e8p_q4 import validate_coefficients
 
 
-def decode_source(coefficients):
+def decode_source(coefficients, *, single_stage=False):
     a, b = validate_coefficients(coefficients)
     coarse_scale = 4 if (a, b) == (4, 1) else 1
     # Bias each decoded byte by 112 (coarse) and 16 (fine). Their sum is
@@ -36,6 +36,12 @@ def decode_source(coefficients):
                   - {a + b - 1}u * 0x00800080u;
     return ((lo & 0x00ff00ffu) | ((hi & 0x00ff00ffu) << 8)) ^ 0x80808080u;
 """
+    )
+    decoded = (
+        "return e8p_q4_selector_flags(b0, f0, half, 1u);"
+        if single_stage
+        else f"return e8p_q4_combine(e8p_q4_selector_flags(b0, f0, half, {coarse_scale}u), "
+        "e8p_q4_selector_flags(b1, f1, half, 1u));"
     )
     return f"""
 __device__ __forceinline__ unsigned e8p_q4_flags(unsigned code) {{
@@ -64,10 +70,14 @@ __device__ __forceinline__ unsigned e8p_q4_combine(unsigned x, unsigned y) {{
     {combine}
 }}
 __device__ __forceinline__ unsigned e8p_q4_decode_flags(unsigned b0, unsigned b1, unsigned f0, unsigned f1, unsigned half) {{
-    return e8p_q4_combine(e8p_q4_selector_flags(b0, f0, half, {coarse_scale}u),
-                          e8p_q4_selector_flags(b1, f1, half, 1u));
+    {decoded}
 }}
 """
+
+
+def q2_decode_source():
+    """Reuse exact selector/parity decoding for one U16 E8P vector."""
+    return decode_source((2, 1), single_stage=True)
 
 
 def validate_packed_k(K, packed_k):
@@ -76,19 +86,20 @@ def validate_packed_k(K, packed_k):
 
 
 @orin_jit
-def embedding(capacity, vocab, hidden):
+def embedding(capacity, vocab, hidden, *, codec="e8p_q4"):
     """Gather and inverse-rotate selected rows of the shared K128 Q4 bank."""
     from kernels.model.rotation_a8 import block_hadamard
 
     validate_shape(capacity, vocab, hidden)
     m = row_count(capacity, True)
-    source = decode_source((4, 1))
+    source = q2_decode_source() if codec == "e8p_q2" else decode_source((4, 1))
+    packed_dtype = T.uint16 if codec == "e8p_q2" else T.uint32
     butterfly = block_hadamard(128)
 
     @T.prim_func
     def main(
         IDs: T.Tensor((m,), T.int32),
-        Weight: T.Tensor((hidden // 128, vocab, 16), T.uint32),
+        Weight: T.Tensor((hidden // 128, vocab, 16), packed_dtype),
         Book: T.Tensor((256, 1), T.uint32),
         Scale: T.Tensor((vocab,), T.float16),
         Signs: T.Tensor((hidden,), T.int8),
@@ -142,6 +153,7 @@ def projection(
     K,
     *,
     coefficients=(4, 1),
+    codec="e8p_q4",
     algorithm="tensor_core",
     block_m=8,
     block_n=64,
@@ -158,7 +170,8 @@ def projection(
     cache_scales=False,
 ):
     validate_shape(M, N, K)
-    source = decode_source(coefficients)
+    source = q2_decode_source() if codec == "e8p_q2" else decode_source(coefficients)
+    packed_dtype = T.uint16 if codec == "e8p_q2" else T.uint32
     stride = N if output_stride is None else output_stride
     if type(stride) is not int or stride < N:
         raise ValueError("Output stride must contain the entire row")
@@ -184,7 +197,7 @@ def projection(
         if not 1 <= block_m <= 8 or block_n not in (4, 8, 16):
             raise ValueError("Invalid E8P-Q4 DP4A tile")
     elif algorithm == "int4_direct":
-        if not packed_k or not basis_nonzero:
+        if codec != "e8p_q4" or not packed_k or not basis_nonzero:
             raise ValueError("Direct INT4 requires a verified nonzero basis and K-major weights")
         if (
             block_m != 8
@@ -226,23 +239,21 @@ def projection(
                 block_n,
                 block_k,
                 stages=stages,
-                codec="e8p_q4",
+                codec=codec,
                 source=source,
                 packed_k=packed_k,
                 tail_m=tail_m,
                 cache_scales=cache_scales,
             )
         else:
-            project = dp4a(
-                m, N, K, block_m, block_n, codec="e8p_q4", source=source, packed_k=packed_k
-            )
+            project = dp4a(m, N, K, block_m, block_n, codec=codec, source=source, packed_k=packed_k)
     if algorithm != "tensor_core":
         tiles = T.ceildiv(m, block_m)
 
     @T.prim_func
     def main(
         A: T.Tensor((m, activation_width), activation_dtype),
-        W: T.Tensor((K // packed_k, N, packed_k // 8) if packed_k else (N, K // 8), T.uint32),
+        W: T.Tensor((K // packed_k, N, packed_k // 8) if packed_k else (N, K // 8), packed_dtype),
         Book: T.Tensor((256, 1), T.uint32),
         S: T.Tensor((N,), T.float16),
         AS: T.Tensor((m,), T.float16),
@@ -260,14 +271,15 @@ def projection(
 
 
 @orin_jit
-def unpack(N, K, *, coefficients=(4, 1), packed_k=0):
+def unpack(N, K, *, coefficients=(4, 1), packed_k=0, codec="e8p_q4"):
     validate_shape(1, N, K)
     validate_packed_k(K, packed_k)
-    source = decode_source(coefficients)
+    source = q2_decode_source() if codec == "e8p_q2" else decode_source(coefficients)
+    packed_dtype = T.uint16 if codec == "e8p_q2" else T.uint32
 
     @T.prim_func
     def main(
-        W: T.Tensor((K // packed_k, N, packed_k // 8) if packed_k else (N, K // 8), T.uint32),
+        W: T.Tensor((K // packed_k, N, packed_k // 8) if packed_k else (N, K // 8), packed_dtype),
         Book: T.Tensor((256, 1), T.uint32),
         Output: T.Tensor((N, K // 4), T.uint32),
     ):

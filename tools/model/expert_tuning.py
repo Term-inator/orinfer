@@ -99,7 +99,7 @@ def expert_projection(rows, outputs, inputs, experts, top_k, *, codec, config, d
         return inspect.unwrap(e8p_exact_grouped)(
             rows * top_k, experts, tiles, outputs, inputs, block_m=tile, dynamic_rows=dynamic_rows
         )
-    if codec not in ("e8p_q4", "w8"):
+    if codec not in ("e8p_q4", "e8p_q2_k128", "w8"):
         raise ValueError("Unsupported expert codec")
     if config.get("folded"):
         from kernels.model.e8p_prefill import e8p_prefill_grouped
@@ -129,7 +129,7 @@ def expert_projection(rows, outputs, inputs, experts, top_k, *, codec, config, d
         inputs,
         experts,
         top_k,
-        codec="w8" if config.get("expand") else codec,
+        codec="w8" if config.get("expand") else "e8p_q2" if codec == "e8p_q2_k128" else codec,
         dynamic_rows=dynamic_rows,
         **options,
     )
@@ -279,6 +279,7 @@ class MoeTuner(RowTuner):
         weight_identity,
         *,
         routing_samples=None,
+        codec="e8p_q4",
     ):
         import torch
         from kernels.model import moe
@@ -287,7 +288,7 @@ class MoeTuner(RowTuner):
         from tools.quantization.vq import e8p_selector_supports_parity_xor
 
         spec = dict(
-            kind="routed_q4",
+            kind="routed_" + codec,
             hidden=hidden,
             intermediate=intermediate,
             experts=experts,
@@ -317,6 +318,12 @@ class MoeTuner(RowTuner):
         configs = expert_configs(
             "e8p_q4", direct=e8p_selector_supports_parity_xor(weights["book"].cpu().numpy())
         )
+        if codec == "e8p_q2_k128":
+            configs = [
+                c
+                for c in configs
+                if not c.get("expand") and not c.get("folded") and not c.get("cold_rows")
+            ]
         dimensions = [(2 * intermediate, hidden), (hidden, intermediate)]
 
         def build(config):
@@ -364,10 +371,10 @@ class MoeTuner(RowTuner):
                         k,
                         experts,
                         top_k,
-                        codec="e8p_q4",
+                        codec=codec,
                         config=cold,
                         dynamic_rows=True,
-                        compiler_options=expert_passes("e8p_q4", cold),
+                        compiler_options=expert_passes(codec, cold),
                     )
                     for n, k in dimensions
                 ]
@@ -384,10 +391,10 @@ class MoeTuner(RowTuner):
                     k,
                     experts,
                     top_k,
-                    codec="e8p_q4",
+                    codec=codec,
                     config=config,
                     dynamic_rows=True,
-                    compiler_options=expert_passes("e8p_q4", config),
+                    compiler_options=expert_passes(codec, config),
                 )
                 for n, k in dimensions
             ]

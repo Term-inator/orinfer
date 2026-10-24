@@ -57,13 +57,14 @@ def make_prim(spec, config):
 
     rows, n, k = spec["rows"], spec["outputs"], spec["inputs"]
     dynamic = spec["dynamic"]
-    if spec["kind"] in ("q4", "e8p_q4"):
+    if spec["kind"] in ("q4", "e8p_q4", "e8p_q2"):
         options = {}
-        if spec["kind"] == "e8p_q4":
+        if spec["kind"] in ("e8p_q4", "e8p_q2"):
             from kernels.model.e8p_q4 import projection as q4_decode
 
             q4_decode = q4_decode.__wrapped__
             options = {k: spec[k] for k in ("packed_k", "basis_nonzero") if k in spec}
+            options["codec"] = spec["kind"]
         else:
             from kernels.model.q4_projection import q4_decode
 
@@ -150,11 +151,11 @@ def factory(spec):
         cfg = dict(block_m=block_m)
         if decoded["kind"] != "expert":
             cfg.update(algorithm=algorithm, block_n=block_n, block_k=block_k)
-        if decoded["kind"] in ("q4", "e8p_q4"):
+        if decoded["kind"] in ("q4", "e8p_q4", "e8p_q2"):
             cfg["stages"] = stages
         if decoded["kind"] == "e8p_q4" and algorithm == "int4_direct":
             cfg["split_k"] = split_k
-        if decoded["kind"] in ("q4", "e8p_q4", "w8") and algorithm == "tensor_core":
+        if decoded["kind"] in ("q4", "e8p_q4", "e8p_q2", "w8") and algorithm == "tensor_core":
             cfg.update({k: v for k, v in dict(group_m=group_m, tail_m=tail_m).items() if v})
         if decoded["kind"] in ("w8", "e8p_q4") and algorithm == "tensor_core":
             if cache_scales:
@@ -224,7 +225,7 @@ class ProjectionTuner:
         )
         if output_stride is not None:
             if (
-                kind not in ("q4", "e8p_q4", "w8")
+                kind not in ("q4", "e8p_q4", "e8p_q2", "w8")
                 or type(output_stride) is not int
                 or output_stride < outputs
             ):
@@ -232,7 +233,7 @@ class ProjectionTuner:
             spec["output_stride"] = output_stride
         if kind == "expert":
             spec["experts"] = experts
-        if kind == "e8p_q4":
+        if kind in ("e8p_q4", "e8p_q2"):
             from tools.quantization.e8p import basis
             from tools.quantization.vq import e8p_selector_table, e8p_selector_supports_parity_xor
 
@@ -242,7 +243,9 @@ class ProjectionTuner:
                 else e8p_selector_table(basis())
             )
             spec.update(packed_k=packed_k, basis_nonzero=e8p_selector_supports_parity_xor(book))
-            configs = e8p_q4_configs(rows, direct=bool(packed_k and spec["basis_nonzero"]))
+            configs = e8p_q4_configs(
+                rows, direct=bool(kind == "e8p_q4" and packed_k and spec["basis_nonzero"])
+            )
             configs = [c for c in configs if inputs % (c["block_k"] * c.get("split_k", 1)) == 0]
         elif kind == "q4":
             configs = q4_configs(rows)
@@ -498,7 +501,7 @@ from tools.model.row_selection import choices, ranges
                 a, weight, ws, scales, expected, stream=torch.cuda.current_stream().cuda_stream
             )
             args = [a, weight, ws, scales, out]
-        elif kind == "e8p_q4":
+        elif kind in ("e8p_q4", "e8p_q2"):
             from kernels.model.e8p_q4 import unpack
             from tools.quantization.e8p import basis
             from tools.quantization.vq import e8p_selector_table
@@ -506,9 +509,13 @@ from tools.model.row_selection import choices, ranges
             weight = (
                 weights["W"]
                 if weights is not None
-                else torch.randint(0, 2**32, (n, k // 8), device=device, dtype=torch.int64).to(
-                    torch.uint32
-                )
+                else torch.randint(
+                    0,
+                    (2**16 if kind == "e8p_q2" else 2**32),
+                    (n, k // 8),
+                    device=device,
+                    dtype=torch.int64,
+                ).to(torch.uint16 if kind == "e8p_q2" else torch.uint32)
             )
             ws = (
                 weights["WS"]
@@ -530,7 +537,9 @@ from tools.model.row_selection import choices, ranges
                 raise ValueError("E8P tuning weights differ from the compressed layout")
             decoded = torch.empty((n, k), device=device, dtype=torch.int8)
             stream = torch.cuda.current_stream().cuda_stream
-            unpack(n, k, packed_k=packed_k).adapter.func(weight, book, decoded, stream=stream)
+            unpack(n, k, packed_k=packed_k, codec=kind).adapter.func(
+                weight, book, decoded, stream=stream
+            )
             # Keep the independent full-K reference dynamic too: profiling
             # many row extents must not compile a reference cubin per length.
             from tools.model.compile import primitive
@@ -745,7 +754,7 @@ from tools.model.row_selection import choices, ranges
         with torch.cuda.graph(graph):
             kernel.adapter.func(*args, stream=torch.cuda.current_stream().cuda_stream)
         # Scratch outputs change after capture; replay must actually run.
-        output_index = {"expert": 12, "swiglu": 6, "e8p_q4": 5}.get(spec["kind"], 4)
+        output_index = {"expert": 12, "swiglu": 6, "e8p_q4": 5, "e8p_q2": 5}.get(spec["kind"], 4)
         out = args[output_index]
         out.fill_(91)
         graph.replay()
