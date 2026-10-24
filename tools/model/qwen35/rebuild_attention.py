@@ -19,33 +19,15 @@ from tools.model.host_compiler import Compiler, private_roles
 ROOT = Path(__file__).resolve().parents[3]
 
 
-def decode_geometry(kernel, source, dimension):
-    call = re.search(
-        r"= attn_split_count\(1,\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)(?:,[^;]*)?\);", source
-    )
-    if not call:
-        raise ValueError("Expected a measured single-query attention split contract")
-    group, block_m, target, splits = map(int, call.groups())
-    if target != 16 or block_m != 16:
+def decode_geometry(kernel, source, dimension, head_group=None):
+    from tools.model.qwen35.rebuild_mtp import attention_geometry
+
+    geometry = attention_geometry(kernel, source, dimension, head_group)
+    if geometry["block_m"] != 16:
         raise ValueError("Rebuild requires the measured compact decode tile")
-    # The compiled shared tile has one K and one V allocation. Its offset
-    # difference certifies block_n independently of source-local array names.
-    k = re.search(r"(?:void|half_t|half)\* k = [^;]+buf_dyn_shmem \+ (\d+)", source)
-    v = re.search(r"(?:void|half_t|half)\* v = [^;]+buf_dyn_shmem \+ (\d+)", source)
-    if k is None or v is None:
-        raise ValueError("Expected certified shared K/V tile offsets")
-    block_n = abs(int(v[1]) - int(k[1])) // (dimension * 2)
-    if block_n not in (32, 64):
-        raise ValueError("Unsupported measured KV tile")
-    return dict(
-        block_m=block_m,
-        block_n=block_n,
-        head_group=group,
-        max_splits=splits,
-        threads=kernel["block"][0],
-        stages=int("packed_k" in source),
-        independent_queries=True,
-    )
+    geometry.pop("target_tiles")
+    geometry["independent_queries"] = True
+    return geometry
 
 
 def short_alias(name):
@@ -69,8 +51,9 @@ def rebuild(args):
     if data["architecture"] not in ("qwen3_5", "qwen3_asr"):
         raise ValueError("Expected a native Qwen text execution package")
     metadata = data["metadata"]
-    if (metadata.get("mtp") or {}).get("verification_table"):
-        raise ValueError("Use the full Qwen builder for owner-parallel verification tables")
+    verification = (metadata.get("mtp") or {}).get("verification_table")
+    if (metadata.get("mtp") or {}).get("packet_table"):
+        raise ValueError("Rebuild attention before adding the MTP operand table")
     config = json.loads((source / "config.json").read_text())
     text = config.get("text_config", config)
     qh, kvh = text["num_attention_heads"], text["num_key_value_heads"]
@@ -107,7 +90,9 @@ def rebuild(args):
         geometry = (
             json.loads(saved_geometry)
             if saved_geometry
-            else decode_geometry(sample, compiler.read(sample["source"]).decode(), dimension)
+            else decode_geometry(
+                sample, compiler.read(sample["source"]).decode(), dimension, qh // kvh
+            )
         )
         if geometry["head_group"] != qh // kvh:
             raise ValueError("Expected the measured complete GQA head group")
@@ -145,19 +130,60 @@ def rebuild(args):
         )
         columns = metadata["batch_layout"]["state_columns"]
         layers = len(metadata["batch_layout"]["layers"])
+        # Append the new partial layout so retained GDN/convolution wrappers
+        # keep their certified scratch offsets. Both attention paths share it.
+        scratch = buffers["QwenRowScratch"]
+        cursor = (scratch["shape"][0] + 255) // 256 * 256
+        attention_offsets = {}
+        for role, width in (("Partial", dimension), ("Maximum", 1), ("Denominator", 1)):
+            attention_offsets[role] = cursor
+            size = (qh // geometry["head_group"]) * 8 * 32 * geometry["block_m"] * width * 4
+            cursor += (size + 255) // 256 * 256
+        scratch["shape"][0] = cursor
         for old in list(original.values()):
             name = old["name"]
             normal = re.fullmatch(r"qwen_rows/state/layer(\d+)/(attention|attention_merge)", name)
+            verified = re.fullmatch(
+                r"qwen_rows/verify_state/layer(\d+)/attention\d+/(attention|attention_merge)", name
+            )
             shared = re.fullmatch(
                 r"qwen_rows/(?:layer\d+/private|mtp)/(attention|attention_merge)", name
             )
-            if not normal and not shared:
+            if not normal and not shared and not verified:
                 continue
-            role = normal[2] if normal else shared[1]
-            if normal:
-                fn = factory(role, metadata["max_context"], geometry, text)
+            role = normal[2] if normal else verified[2] if verified else shared[1]
+            if normal or verified:
+                selected_columns = verification["columns"] if verified else columns
+                if normal:
+                    fn = factory(role, metadata["max_context"], geometry, text)
+                    options = dict(batch_parameters=("independent_instances",))
+                    table = "QwenRowPointers"
+                else:
+                    from types import SimpleNamespace
+                    from tools.model.qwen35.causal_parallel import factories, symbolic_rows
+
+                    b = SimpleNamespace(
+                        qh=qh,
+                        kvh=kvh,
+                        hk=text["linear_num_key_heads"],
+                        hv=text["linear_num_value_heads"],
+                        qkv=(2 * text["linear_num_key_heads"] + text["linear_num_value_heads"])
+                        * 128,
+                        context=metadata["max_context"],
+                        gdn_execution=metadata["gdn_execution"],
+                    )
+                    fn, variables = symbolic_rows(factories(b, geometry, {})[role]())
+                    options = dict(
+                        scalar_columns={v.name: ("SegmentLength", 8) for v in variables},
+                        row_offset=verification["row_offset"],
+                        row_capacity=metadata["chunk_tokens"],
+                    )
+                    table = verification["buffer"]
                 source_text = compiler.read(old["source"]).decode()
-                roles, offsets = private_roles(source_text, columns, layers * len(columns))
+                roles, offsets = private_roles(
+                    source_text, selected_columns, layers * len(selected_columns)
+                )
+                offsets.update(attention_offsets)
                 modes, pointers = {}, compiler.pointers(old)
                 for buf in fn.buffer_map.values():
                     if buf.name in roles:
@@ -168,13 +194,13 @@ def rebuild(args):
                     fn,
                     128,
                     modes,
-                    columns,
+                    selected_columns,
                     pointers,
-                    "QwenRowPointers",
-                    table_offset=int(normal[1]) * len(columns) * 8,
-                    row_stride=layers * len(columns),
+                    table,
+                    table_offset=int((normal or verified)[1]) * len(selected_columns) * 8,
+                    row_stride=layers * len(selected_columns),
                     offsets=offsets,
-                    batch_parameters=("independent_instances",),
+                    **options,
                 )
                 emitted, launch = compiler.emit(
                     old,
@@ -182,7 +208,7 @@ def rebuild(args):
                     bindings,
                     128,
                     build=lambda fn=fn: fn,
-                    key=f"causal-owner-{role}-{identity}",
+                    key=f"causal-{'verify' if verified else 'owner'}-{role}-{identity}",
                 )
                 package["kernels"] = [k for k in package["kernels"] if k["name"] != name]
                 package["dynamic_batch_kernels"] = [
@@ -197,6 +223,10 @@ def rebuild(args):
                         prefix + ("/kv_prepare" if prefix.endswith("/mtp") else "/prepare")
                     ]
                     bindings = attention_pointers(bindings, compiler.pointers(prepared))
+                    if geometry["stages"]:
+                        bindings.update(
+                            {"live_" + k.lower(): bindings[k] for k in ("K", "V", "KS", "VS")}
+                        )
                 options = {
                     k: v for k, v in geometry.items() if k not in ("block_n", "threads", "stages")
                 }
@@ -236,6 +266,9 @@ def rebuild(args):
             causal_attention_compiler=json.dumps(compiler_identity, sort_keys=True),
         )
         metadata["toolchain"] = package["toolchain"]
+        package["buffer_contracts"] = [
+            {k: v for k, v in b.items() if k != "data"} for b in metadata["buffers"]
+        ]
         digest = compact_package(operator, package, stage / "cache/packages")
         data["execution_package"] = digest
         write_json(stage / "cache/model.json", data)

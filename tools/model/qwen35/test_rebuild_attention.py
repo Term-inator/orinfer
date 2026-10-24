@@ -11,6 +11,7 @@ class RebuildAttentionTests(unittest.TestCase):
         void* k = ((void*)((char*)buf_dyn_shmem + 0));
         void* v = ((void*)((char*)buf_dyn_shmem + 32768));
         split_count[0] = attn_split_count(1, 6, 16, 16, 8, owners);
+        int kv_position = tile * 64;
         """
         self.assertEqual(
             decode_geometry(dict(block=[128, 1, 1]), source, 256),

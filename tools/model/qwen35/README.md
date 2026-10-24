@@ -47,6 +47,8 @@ E8P 的 INT8 Tensor Core 路径先将压缩 K128 slab 异步读入 CTA 共享内
 
 宽 FFN 的 SwiGLU、block128 旋转按列 tile 并行，再从局部最大值计算同一个输出行 A8 scale；旋转、舍入及 FP16 边界复用公共实现，保持每个输出行一个 scale。因果注意力使用公共行模板，离线选择 query-head 分组与 split 上限，支持动态拆分与编译期固定为单个 split 的特化。所有配置复用 INT8 KV 读取、FP32 softmax 和输出处理；真实行数与 KV 长度均在运行时传入。KV 读取使用紧凑的线程条带循环以控制指令量；split merge 按输出列保留短向量，使用 FP32 树形归约后再执行原有 FP16 边界和 gate。调优包含非整 tile 的 KV 长度。Prefill、decode 与 MTP 复用同一计算体，Rust 分别绑定每个请求的 KV 和位置。
 
+`rebuild_attention.py` 支持普通地址表和 owner 并行验证地址表，按包内测量几何重建 attention；新 partial 布局追加到私有 scratch，并保留其他状态算子的偏移。先完成 attention 重建，再用 `rebuild_mtp.py` 为 dense/MoE 包添加 MTP operand table。两步均发布到独立新目录。
+
 1–8 行短段为每个 query 使用独立的 attention tile。普通 decode 与 MTP 验证共享一个离线选择的几何、固定 split 数和归约顺序；分段边界由该 query 的因果位置决定。请求数及同段其他 query 的位置保持这一算术契约。较大 prefill 使用原有动态行选择。每个 query 的临时部分结果具有相同的内部布局，普通地址表包装与共享验证模板读取相同的 FP32 中间表示。
 
 对已发布、使用紧凑单行 decode tile 和共享验证工作区的 Qwen 包，可只重建短段 attention 与原生计划：

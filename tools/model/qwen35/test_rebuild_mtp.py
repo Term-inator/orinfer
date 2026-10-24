@@ -1,7 +1,7 @@
 """Preserve registered geometry and physical buffers during incremental MTP rebuilds."""
 
 import unittest
-from tools.model.qwen35.rebuild_mtp import ExistingWeights, attention_geometry
+from tools.model.qwen35.rebuild_mtp import ExistingWeights, attention_geometry, chunk_geometry
 
 
 class ReconstructionTests(unittest.TestCase):
@@ -11,6 +11,7 @@ class ReconstructionTests(unittest.TestCase):
         void* k = ((void*)((char*)buf_dyn_shmem + 8192));
         void* v = ((void*)((char*)buf_dyn_shmem + 40960));
         split_count[0] = 8;
+        int kv_position = tile * 64;
         """
         result = attention_geometry(kernel, source, 256, 6)
         self.assertEqual(
@@ -35,6 +36,29 @@ class ReconstructionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "split target"):
             attention_geometry(kernel, source.replace("32, 16, 8", "32, 32, 8"), 256, 6)
+
+    def test_geometry_ignores_reordered_shared_allocations_and_rejects_ambiguous_tiles(self):
+        source = """
+        void* k = ((void*)((char*)buf_dyn_shmem + 0));
+        void* v = ((void*)((char*)buf_dyn_shmem + 43008));
+        split_count[0] = 16;
+        int position = tile * 32;
+        """
+        geometry = attention_geometry(dict(block=[128, 1, 1]), source, 256, 8)
+        self.assertEqual((geometry["block_m"], geometry["block_n"]), (16, 32))
+        with self.assertRaisesRegex(ValueError, "one registered attention KV tile"):
+            attention_geometry(dict(block=[128, 1, 1]), source + "tile * 64", 256, 8)
+        with self.assertRaisesRegex(ValueError, "one registered attention KV tile"):
+            attention_geometry(
+                dict(block=[128, 1, 1]), source.replace("tile * 32", "unknown"), 256, 8
+            )
+
+    def test_chunk_reconstruction_retains_measured_loop_and_value_tiles(self):
+        kernel = dict(grid=[4, 32, 1], block=[128, 1, 1])
+        source = "for (int chunk = 0; chunk < ((m + 15) >> 4); ++chunk) {"
+        self.assertEqual(chunk_geometry(kernel, source), dict(C=16, BV=32, threads=128))
+        with self.assertRaisesRegex(ValueError, "GDN chunk loop"):
+            chunk_geometry(kernel, source.replace("+ 15", "+ 31"))
 
     def test_existing_buffers_keep_scope_payload_and_physical_shape(self):
         source = dict(buffers=[dict(name="Input", dtype="i32", shape=[512], data=None)])
