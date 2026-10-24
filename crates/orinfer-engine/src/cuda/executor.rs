@@ -550,7 +550,9 @@ impl Executor {
                     .weights
                     .addresses
                     .insert(b.name.clone(), address);
+                let t = Instant::now();
                 cold_sources.insert(b.name.clone(), weights.source(b)?);
+                weight_io_hash_s += t.elapsed().as_secs_f64();
                 continue;
             }
             let mut address = 0;
@@ -619,9 +621,6 @@ impl Executor {
             if b.data.is_some() {
                 let t = Instant::now();
                 if paged {
-                    if options.verify_weights {
-                        weights.read(b)?;
-                    }
                     expert_sources.insert(b.name.clone(), weights.source(b)?);
                     weight_io_hash_s += t.elapsed().as_secs_f64();
                 } else if options.verify_weights {

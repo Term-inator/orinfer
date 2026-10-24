@@ -60,7 +60,7 @@ impl Weights {
         })
     }
 
-    /// Validate the standard container and binding without faulting tensor payload pages.
+    /// Validate the container, binding and optional payload hash before returning a file range.
     pub(crate) fn source(&mut self, buffer: &Buffer<TensorIdentity>) -> Result<TensorSource> {
         let id = buffer
             .data
@@ -127,6 +127,11 @@ impl Weights {
         if end - begin != buffer.bytes()? {
             return Err(format!("{}: tensor byte length mismatch", buffer.name));
         }
+        if self.verify_payloads
+            && sha256(&shard.mapping[shard.data_start + begin..shard.data_start + end]) != id.sha256
+        {
+            return Err(format!("{}: tensor sha256 mismatch", buffer.name));
+        }
         Ok(TensorSource {
             path: shard.path.clone(),
             offset: shard.data_start + begin,
@@ -142,9 +147,6 @@ impl Weights {
             .ok_or("Buffer has no tensor identity")?;
         let shard = &self.shards[&self.index.weight_map[&id.tensor]];
         let data = &shard.mapping[source.offset..source.offset + source.bytes];
-        if self.verify_payloads && sha256(data) != id.sha256 {
-            return Err(format!("{}: tensor sha256 mismatch", buffer.name));
-        }
         Ok(data)
     }
 
@@ -267,6 +269,19 @@ mod tests {
                 .unwrap()
                 .read(&spec)
                 .is_err()
+        );
+        assert!(
+            Weights::open(&fixture.0, false)
+                .unwrap()
+                .source(&spec)
+                .is_ok()
+        );
+        assert!(
+            Weights::open(&fixture.0, true)
+                .unwrap()
+                .source(&spec)
+                .is_err(),
+            "Deferred uploads must verify payloads before receiving their file range"
         );
         let mut weights = Weights::open(&fixture.0, false).unwrap();
         spec.shape = vec![1, 2];
