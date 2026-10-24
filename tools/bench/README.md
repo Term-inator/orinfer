@@ -90,7 +90,7 @@ ORINFER_BATCH_FIXTURE=/absolute/path/to/flash-fixture.json \
 
 ## 固定工作量与并发 prefill
 
-`runtime::requests::tests::benchmark::benchmark_fixed_requests` 通过真实请求状态机测量固定工作量。`ORINFER_BATCH_FIXTURE` 指定 JSON 夹具，包含 `model`、新 `output` 路径、`repetitions`、`cuda_graph` 和 `cases`。每个 case 包含 `name`、`prompts`（原生模板展开后的 token-ID 数组）、`output_tokens` 及可选的 `concurrent_prefill`。
+`runtime::requests::tests::benchmark::benchmark_fixed_requests` 通过真实请求状态机测量固定工作量。`ORINFER_BATCH_FIXTURE` 指定 JSON 夹具，包含 `model`、新 `output` 路径、`repetitions`、`cuda_graph` 和 `cases`。每个 case 包含 `name`、`prompts`（原生模板展开后的 token-ID 数组）、`output_tokens` 及可选的 `concurrent_prefill`。顶层可用 `resident_experts` 指定有限专家常驻数量；省略时全量常驻。
 
 单流 prefill 设置 `output_tokens=1`；decode 设置 65，首输出完成后再计时后续 64 个提交 tokens。并发 prefill 设置 `concurrent_prefill=true`、`output_tokens=1`，同时推进全部等待请求，按最后一个首输出完成时刻计算吞吐。并发 decode 采用首输出屏障，随后计量固定活跃请求集合。每组先预热一次，再测 `repetitions` 轮；汇总采用热态中位数。该诊断固定忽略 EOS、关闭 MTP/prefix cache，greedy 与 seed `20261002` 保持一致。
 

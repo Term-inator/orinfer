@@ -17,6 +17,8 @@ struct Benchmark {
     cases: Vec<Workload>,
     repetitions: usize,
     cuda_graph: String,
+    #[serde(default)]
+    resident_experts: Option<usize>,
 }
 
 #[test]
@@ -38,6 +40,10 @@ fn benchmark_fixed_requests() {
             cuda_graph: spec.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
+            resident_experts: spec.resident_experts.map_or(
+                crate::execution::ResidentExperts::Full,
+                crate::execution::ResidentExperts::Count,
+            ),
             ..Default::default()
         },
     )
@@ -154,6 +160,7 @@ fn benchmark_fixed_requests() {
                 &spec.output,
                 serde_json::to_vec_pretty(&json!({
                     "scope":"Real complete text requests, no MTP/prefix cache, greedy seed20261002, EOS ignored. Prefill includes request setup/head/sampling. Concurrent prefill cases submit all waiting owners until every first output commits. Decode cohorts use a serial first-output barrier and measure all subsequent committed tokens; their serial prefill is not a simultaneous-prefill throughput measurement.",
+                    "resident_experts":spec.resident_experts,
                     "records":records,
                 }))
                 .unwrap(),
