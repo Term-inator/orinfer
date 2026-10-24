@@ -58,7 +58,7 @@ impl Adapter for Flash {
             abi::BatchOperation::Commit => {
                 let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP adapter")?;
                 let mut owners = std::collections::BTreeSet::new();
-                if segments.len() < 2 || segments.len() > 128 {
+                if segments.is_empty() || segments.len() > 128 {
                     return Err("Invalid MTP commit packet size".into());
                 }
                 let mut plan = vec![];
