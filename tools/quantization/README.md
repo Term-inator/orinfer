@@ -54,3 +54,15 @@ ORINFER_CHECKPOINT_DIR=/path/to/original \
 `rotation.py` 提供分块与完整 Hadamard 变换；`block_ldlq.py` 提供协方差因子及误差反馈的 CPU 数学参考。整模型校准或微调作为独立流程验收；旋转方案须分别验证激活量化、非线性和舍入边界。
 
 量化质量使用同模型原始 BF16；资源不足时可用明确标注的 FP8。固定 seed 20261002 与 teacher-forced 历史，比较任务结果、目标 NLL、概率和长上下文行为。token 一致率和局部重构误差用于诊断，整模型质量结合概率、任务和长上下文评测判定。
+
+## Qwen Q2 实验
+
+`qwen_e8p --bits 2` 从原始 BF16 使用单级整数 E8P 编码，U16 保存八个权重，每个输出行保留一个 FP16 scale。它与 Q4 使用相同 signed-block128 旋转和精度例外策略；主干、专家、embedding/head 和可量化视觉矩阵使用 Q2，敏感输出投影与 MTP 保留 W8。实际平均位数包含这些例外和全部元数据。
+
+```bash
+ORINFER_CHECKPOINT_DIR=/path/to/original \
+  bash tools/quantization/run.sh qwen_e8p --source-dir /path/to/original \
+  --bits 2 --output artifacts/quantization/qwen-e8p-q2
+```
+
+Q2 输出使用独立目录，构建复用 `tools/model/qwen35/build.py`。生产基线以独立质量和完整请求验收结果为准。

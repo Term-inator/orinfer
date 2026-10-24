@@ -1,4 +1,4 @@
-"""Resumable two-stage E8P Q4A8 encoding of original dense Qwen and ASR weights.
+"""Resumable E8P Q2A8/Q4A8 encoding of original dense Qwen and ASR weights.
 
 Each source shard is consumed independently. GPU ownership is released between
 bounded row blocks, and completed blocks are checksummed. Tied embeddings and
@@ -160,6 +160,9 @@ def canonical_name(name):
 
 def encode(args):
     source_dir, out = args.source_dir.resolve(), args.output.resolve()
+    bits = args.bits
+    codec = f"e8p_q{bits}"
+    kind_name = f"e8p-q{bits}"
     if source_dir == out:
         raise ValueError("Source and encoded directories must differ")
     config = json.loads((source_dir / "config.json").read_text())
@@ -192,8 +195,8 @@ def encode(args):
             source_index=file_hash(source_dir / "model.safetensors.index.json"),
             encoder=implementation.hexdigest(),
             seed=20261002,
-            coefficients=[4, 1],
-            search="beam8",
+            coefficients=[4, 1] if bits == 4 else [1],
+            search="beam8" if bits == 4 else "nearest",
             rows=args.rows,
             policy=model_policy,
             **(dict(rotated_w8_layers=protected_layers) if protected_layers else {}),
@@ -237,7 +240,11 @@ def encode(args):
     }
     encoder = None
     from tools.operators.common import configure
-    from tools.quantization.e8p_q4_gpu import Encoder
+
+    if bits == 4:
+        from tools.quantization.e8p_q4_gpu import Encoder
+    else:
+        from tools.quantization.e8p_gpu import Encoder
     from tools.quantization.vq import rotate
 
     shards = sorted(set(source.weight_map.values()))
@@ -261,6 +268,8 @@ def encode(args):
             shape = info["shape"]
             parameters += math.prod(shape)
             kind = policy(name, info, protected_layers=protected_layers)
+            if kind == "e8p-q4":
+                kind = kind_name
             first, last = info["data_offsets"]
             if kind == "original":
                 segments = [(path, begin + first, last - first)]
@@ -313,7 +322,7 @@ def encode(args):
             )
             if (saved["name"], saved["shape"], saved["kind"]) != (name, shape, kind):
                 raise ValueError("Matrix checkpoint changed")
-            codes_per_row = k // 2 if kind == "e8p-q4" else k
+            codes_per_row = k * bits // 8 if kind == kind_name else k
             if saved["rows"]:
                 with pc.open("rb") as pf, sc.open("rb") as sf:
                     for block in saved["blocks"]:
@@ -337,13 +346,18 @@ def encode(args):
                         np.float32
                     )
                     started = time.monotonic()
-                    if kind == "e8p-q4":
+                    if kind == kind_name:
                         with gpu_lock(args.gpu_lock):
                             if encoder is None:
                                 configure()
                                 encoder = Encoder()
-                            fitted = encoder.refine(floating, encoder.fit(floating, signs[k]))
-                        data, scales = fitted.packed.tobytes(), fitted.scales.tobytes()
+                            fitted = encoder.fit(floating, signs[k])
+                            if bits == 4:
+                                fitted = encoder.refine(floating, fitted)
+                        data, scales = (
+                            (fitted.packed if bits == 4 else fitted.indices).tobytes(),
+                            fitted.scales.tobytes(),
+                        )
                         reference = rotate(floating, signs[k])
                         error = fitted.dequantize() - reference
                     else:
@@ -382,13 +396,13 @@ def encode(args):
                             flush=True,
                         )
             del raw
-            packed_name = name + (".packed" if kind == "e8p-q4" else ".int8")
+            packed_name = name + (".packed" if kind == kind_name else ".int8")
             entries.extend(
                 [
                     dict(
                         name=packed_name,
-                        dtype="U32" if kind == "e8p-q4" else "I8",
-                        shape=[*shape[:-1], k // 8] if kind == "e8p-q4" else shape,
+                        dtype=("U32" if bits == 4 else "U16") if kind == kind_name else "I8",
+                        shape=[*shape[:-1], k // 8] if kind == kind_name else shape,
                         segments=[(pc, 0, pc.stat().st_size)],
                     ),
                     dict(
@@ -400,7 +414,7 @@ def encode(args):
                 ]
             )
             layouts["orin.layout." + packed_name] = (
-                "e8p-q4-row-u32" if kind == "e8p-q4" else "native_contiguous"
+                f"e8p-q{bits}-row-u{bits * 8}" if kind == kind_name else "native_contiguous"
             )
             layouts["orin.layout." + name + ".scale"] = "native_contiguous"
             state["quantized"][name] = {k: v for k, v in saved.items() if k != "blocks"}
@@ -429,7 +443,7 @@ def encode(args):
     from tools.quantization.e8p import basis
 
     common = {f"orinfer.rotation.k{k}.signs": s for k, s in signs.items()}
-    common["orinfer.e8p_q4.basis"] = basis()
+    common[f"orinfer.{codec}.basis"] = basis()
     save_file(common, str(out / "quantization.safetensors"))
     mapping = {n: f for f, r in state["shards"].items() for n in r["names"]}
     mapping.update({n: "quantization.safetensors" for n in common})
@@ -464,19 +478,22 @@ def encode(args):
         ):
             shutil.copyfile(path, out / path.name)
     config["quantization_config"] = dict(
-        quant_method="orinfer_e8p_q4_int8",
+        quant_method=f"orinfer_{codec}_int8",
         version=1,
-        coefficients=[4, 1],
+        coefficients=[4, 1] if bits == 4 else [1],
         rotation="signed-block128",
         scale="fp16-output-row",
         compute_dtype="int8_quality",
-        basis_tensor="orinfer.e8p_q4.basis",
-        layout="u32-low-coarse-high-residual",
+        basis_tensor=f"orinfer.{codec}.basis",
+        layout="u32-low-coarse-high-residual" if bits == 4 else "u16-e8p",
         policy=model_policy,
-        embedding="e8p_q4",
-        vision=None if config["model_type"] in ("qwen3_asr", "qwen3") else "e8p_q4",
-        **(dict(audio="float16") if config["model_type"] == "qwen3_asr" else {}),
-        **(dict(rotated_w8_layers=protected_layers) if protected_layers else {}),
+        embedding=codec,
+        vision=None if config["model_type"] in ("qwen3_asr", "qwen3") else codec,
+        **(
+            dict(audio="float16", rotated_w8_layers=protected_layers)
+            if config["model_type"] == "qwen3_asr"
+            else {}
+        ),
         source=origin["repo"],
         source_revision=origin["revision"],
     )
@@ -495,6 +512,7 @@ def main():
     p.add_argument("--source-dir", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--shard")
+    p.add_argument("--bits", type=int, choices=(2, 4), default=4)
     p.add_argument("--rows", type=int, default=512)
     p.add_argument("--gpu-lock", type=Path, default=Path("artifacts/gpu-experiment.lock"))
     args = p.parse_args()
