@@ -4,12 +4,56 @@ use super::*;
 fn target_state(model: &mut ModelRuntime, request: &mut RequestState) -> BTreeMap<String, Vec<u8>> {
     model
         .with_request(request, |m, r| {
+            let deferred = m
+                .manifest
+                .gdn_execution
+                .as_ref()
+                .is_some_and(|g| g.deferred_capacity().is_some());
+            if deferred {
+                // A base plus pending rank-one updates is the same logical
+                // state as its materialized matrix. Canonicalize both paths
+                // before comparing, and prove every pending count is drained.
+                let materialize: Vec<_> = m
+                    .manifest
+                    .kernels
+                    .iter()
+                    .filter(|k| k.name.ends_with("/private/recurrent_materialize"))
+                    .map(|k| crate::execution::Invocation {
+                        operation: crate::model::Operation::Kernel {
+                            name: k.name.clone(),
+                        },
+                        sequence: Some(r.slot),
+                        launch: None,
+                        views: BTreeMap::new(),
+                    })
+                    .collect();
+                assert!(
+                    !materialize.is_empty(),
+                    "Deferred state has no materialization kernels"
+                );
+                m.execution
+                    .execute_batch(vec![], &materialize, false, false)?;
+                for buffer in m
+                    .manifest
+                    .buffers
+                    .iter()
+                    .filter(|b| b.name.ends_with("_GdnLogCount"))
+                {
+                    assert!(
+                        m.read_controls(&buffer.name, buffer.bytes()? / 4)?
+                            .iter()
+                            .all(|&n| n == 0)
+                    );
+                }
+            }
             m.prefix_ranges(r.input.len() + r.generated - 1)?
                 .into_iter()
                 // Draft state has a different cursor during lazy catch-up.
                 // Compare live target state and the hidden row needed by the next bridge.
                 .filter(|(name, _)| {
-                    (name.starts_with('L') && m.manifest.reset_buffers.contains(name))
+                    (name.starts_with('L')
+                        && m.manifest.reset_buffers.contains(name)
+                        && (!deferred || !name.contains("_GdnLog")))
                         || name == &m.manifest.position
                         || m.manifest.mtp.as_ref().and_then(|s| s.hidden_ring.as_ref())
                             == Some(name)
@@ -203,7 +247,7 @@ fn validate_mtp_same_history_consistency() {
                 std::fs::write(&fixture.output, serde_json::to_vec_pretty(&json!({
                     "status":"running","model":fixture.model,"seed":20261002,
                     "manifest_sha256":model.stats.manifest_sha256,"rows":evidence,
-                    "scope":"Real continuous-worker greedy generation, followed by B=1 ordinary packet replay of exactly the committed token history. Fixed serial prompt chunking, prefix cache disabled. Target live KV/scales, GDN, convolution, position and the latest target hidden row compared byte for byte, including each owner; draft cursor/state excluded. Differences are recorded, not hidden behind a tolerance."
+                    "scope":"Real continuous-worker greedy generation, followed by B=1 ordinary packet replay of exactly the committed token history. Fixed serial prompt chunking, prefix cache disabled. Target live KV/scales, materialized GDN, convolution, position and the latest target hidden row compared byte for byte, including each owner. Deferred log counts must be zero; inactive log payloads and draft cursor/state excluded. Differences are recorded, not hidden behind a tolerance."
                 })).unwrap()).unwrap();
             }
         }
