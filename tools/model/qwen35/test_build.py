@@ -54,6 +54,144 @@ def config():
 
 
 class BuildTests(unittest.TestCase):
+    def test_mtp_experts_adopt_native_w8_banks_without_copying_individual_experts(self):
+        from tools.model.qwen35.moe import banks
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            prefix = "mtp.layers.0.mlp.experts."
+            tensors = {
+                prefix + "gate_up_proj.int8": np.arange(2 * 8 * 128, dtype=np.int8).reshape(
+                    2, 8, 128
+                ),
+                prefix + "gate_up_proj.scale": np.full((2, 8), 0.25, np.float16),
+                prefix + "down_proj.int8": np.arange(2 * 128 * 4, dtype=np.int8).reshape(2, 128, 4),
+                prefix + "down_proj.scale": np.full((2, 128), 0.5, np.float16),
+            }
+            shard = source / "weights.safetensors"
+            save_file(tensors, str(shard))
+            (source / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    dict(
+                        metadata={
+                            "orinfer.sha256": {
+                                shard.name: hashlib.sha256(shard.read_bytes()).hexdigest()
+                            }
+                        },
+                        weight_map={name: shard.name for name in tensors},
+                    )
+                )
+            )
+            weights = Weights(source, root / "model")
+            builder = SimpleNamespace(weights=weights, text=dict(num_experts=2))
+            selected = banks(builder, "mtp.layers.0.mlp", True)
+            self.assertEqual(
+                selected,
+                [
+                    (prefix + role + ".int8", prefix + role + ".scale")
+                    for role in ("gate_up_proj", "down_proj")
+                ],
+            )
+            self.assertEqual(set(weights.buffers), set(tensors))
+            for name, expected in tensors.items():
+                np.testing.assert_array_equal(weights.array(name), expected)
+            self.assertEqual(weights.finish(), sum(value.nbytes for value in tensors.values()))
+
+    def test_mtp_warm_fits_the_shared_prefill_workspace(self):
+        from tools.model.qwen35 import mtp
+        from tools.quantization.row_q4 import MAGNITUDES
+
+        modules = {
+            "kernels.model." + name: SimpleNamespace()
+            for name in (
+                "qwen35",
+                "control",
+                "speculation",
+                "speculative_factors",
+                "causal_rows",
+                "flash_mtp",
+                "flash_control",
+            )
+        }
+        modules.update(
+            {
+                "kernels.model.gdn_sequence": SimpleNamespace(_gdn_sequence=None, gdn_commit=None),
+                "kernels.model.kv_int8": SimpleNamespace(full_prepare_mrope_int8=None),
+                "kernels.model.greedy": SimpleNamespace(greedy_partials=None, greedy_merge=None),
+                "kernels.operators.op02_residual_norm": SimpleNamespace(residual_norm=None),
+                "kernels.operators.op23_final_norm": SimpleNamespace(final_norm=None),
+                "kernels.operators.op30_activation_quantization": SimpleNamespace(_compile=None),
+                "kernels.vision.features": SimpleNamespace(overlay=None),
+            }
+        )
+        for capacity, vision in (
+            (capacity, vision) for capacity in (128, 256, 512, 4096) for vision in (False, True)
+        ):
+            with self.subTest(capacity=capacity, vision=vision), patch.dict("sys.modules", modules):
+                buffers, launches = {}, []
+
+                def fixed(name, dtype, shape, scope="workspace"):
+                    buffers[name] = dict(dtype=dtype, shape=shape)
+
+                def array(name):
+                    if name.startswith("orinfer.rotation.k"):
+                        return np.ones(int(name.split("k")[1].split(".")[0]), np.int8)
+                    return np.array((*MAGNITUDES, *(-x for x in MAGNITUDES)), np.int8)
+
+                weights = SimpleNamespace(
+                    fixed=fixed,
+                    array=array,
+                    constant=lambda name, value: name,
+                    immutable=lambda name, **kw: name,
+                )
+                builder = SimpleNamespace(
+                    capacity=capacity,
+                    head_rows=min(512, capacity),
+                    weights=weights,
+                    h=5120,
+                    f=17408,
+                    v=248320,
+                    qkv=10240,
+                    mixdim=6144,
+                    hv=48,
+                    qh=24,
+                    qproj=12288,
+                    dimension=256,
+                    fullx=14336,
+                    kv_width=1024,
+                    standard=False,
+                    vision=dict(max_features=32768) if vision else None,
+                    context=4096,
+                    text=dict(layer_types=[], rope_parameters=dict(rope_theta=1e7)),
+                    config=dict(quantization_config={}),
+                    q4_codec="q4",
+                    moe=False,
+                    head_weight="lm_head.weight",
+                    emit=lambda name, key, build, bindings, rows=None, **kw: launches.append(
+                        (name, rows, bindings)
+                    ),
+                    projection=lambda *args, **kw: None,
+                    embedding=lambda *args: None,
+                    rotation=lambda *args, **kw: None,
+                    attention=lambda *args, **kw: None,
+                )
+                Builder.workspace(builder)
+                mtp.build(builder)
+                warm = builder.mtp["warm_plans"][0]["tokens"]
+                self.assertEqual(warm, min(512, capacity))
+                self.assertEqual([p["tokens"] for p in builder.mtp["capture_plans"]], [1, capacity])
+                self.assertEqual(buffers["MtpHidden"]["shape"][0], warm)
+                self.assertEqual("MtpFeatureIndex" in buffers, vision)
+                self.assertEqual(
+                    builder.mtp["feature_index"], "MtpFeatureIndex" if vision else None
+                )
+                self.assertEqual(any(name == "mtp/overlay" for name, _, _ in launches), vision)
+                for name, rows, bindings in launches:
+                    if bindings.get("S") == "AS":
+                        self.assertLessEqual(rows, buffers["AS"]["shape"][0], name)
+
     def test_joined_integer_banks_preserve_output_rows_scales_and_layout(self):
         from tools.build.files import file_hash
         from tools.model.safetensors_source import local_header

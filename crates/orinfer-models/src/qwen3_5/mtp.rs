@@ -2,6 +2,7 @@
 use super::*;
 
 pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
+    let warm_capacity = m.chunk_tokens.min(512);
     let Some(spec) = m.mtp.as_ref() else {
         return Ok(());
     };
@@ -12,8 +13,9 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
         || spec.target_length != "SeqLength"
         || spec.accepted_inputs != "AcceptedInputs"
         || spec.hidden_ring.as_deref() != Some("MtpTargetHidden")
+        || spec.feature_index.as_deref() != m.vision.as_ref().map(|_| "MtpFeatureIndex")
         || spec.warm_plans.len() != 1
-        || spec.warm_plans[0].tokens != 512
+        || spec.warm_plans[0].tokens != warm_capacity
         || spec.warm_plans[0].min_tokens != 1
         || spec.verification_plans.len() != 1
         || spec.verification_plans[0].tokens != 8
@@ -22,14 +24,15 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
         return Err("Unsupported Qwen compact MTP contract".into());
     }
     let hidden = m.batch_layout.as_ref().ok_or("Missing Qwen layout")?.hidden;
-    let mut warm = kernels(
+    let mut begin = vec!["gather", "prepare", "embedding"];
+    if m.vision.is_some() {
+        begin.push("overlay");
+    }
+    begin.push("concat");
+    let mut warm = kernels("qwen_rows/mtp", &begin);
+    warm.extend(kernels(
         "qwen_rows/mtp",
         &[
-            "gather",
-            "prepare",
-            "embedding",
-            "overlay",
-            "concat",
             "fc_quant",
             "fc",
             "pre_norm",
@@ -45,7 +48,7 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
             "post_norm",
             "post_quant",
         ],
-    );
+    ));
     let ffn = ffn_names(moe, true, false, false, false);
     warm.extend(kernels("qwen_rows/mtp", &ffn));
     warm.extend(kernels("qwen_rows/mtp", &["advance"]));
@@ -140,10 +143,7 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
         kernels("qwen_rows/verify", &["selections"]),
     );
     for (name, names) in [
-        (
-            "mtp_begin",
-            &["gather", "prepare", "embedding", "overlay", "concat"][..],
-        ),
+        ("mtp_begin", begin.as_slice()),
         (
             "mtp_pre",
             &["fc_quant", "fc", "pre_norm", "pre_quant", "q", "k", "v"][..],
@@ -278,7 +278,12 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
     }
     let kv = m.kv_cache.as_mut().ok_or("Missing MTP KV storage")?;
     for (name, position, tokens, length) in [
-        ("mtp_warm", "MtpStep", 512, Some("MtpSegmentLength")),
+        (
+            "mtp_warm",
+            "MtpStep",
+            warm_capacity,
+            Some("MtpSegmentLength"),
+        ),
         ("mtp_draft", "MtpStep", 1, None),
         ("verify", "Step", 8, Some("SegmentLength")),
     ] {

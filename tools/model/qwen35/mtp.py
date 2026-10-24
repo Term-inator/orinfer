@@ -25,30 +25,30 @@ def build(b):
     from kernels.vision.features import overlay
 
     w = b.weights
+    warm = min(WARM, b.capacity)
     for name, dtype, shape, scope in [
         ("MtpStep", "i32", [1], "sequence"),
-        ("MtpInput", "i32", [WARM], "sequence"),
+        ("MtpInput", "i32", [warm], "sequence"),
         ("MtpToken", "i32", [1], "sequence"),
         ("MtpStatus", "i32", [1], "sequence"),
         ("MtpSeqLength", "i32", [1], "sequence"),
         ("MtpSegmentLength", "i32", [1], "sequence"),
         ("MtpLastIndex", "i32", [1], "sequence"),
-        ("MtpPositions", "i32", [WARM], "sequence"),
-        ("MtpCondition", "f16", [WARM, b.h], "sequence"),
+        ("MtpPositions", "i32", [warm], "sequence"),
+        ("MtpCondition", "f16", [warm, b.h], "sequence"),
         ("MtpTargetHidden", "f16", [4096, b.h], "sequence"),
-        ("MtpFeatureIndex", "i32", [b.context], "sequence"),
-        ("MtpEmbedding", "f16", [WARM, b.h], "workspace"),
-        ("MtpConcat", "f16", [WARM, 2 * b.h], "workspace"),
-        ("MtpHidden", "f16", [WARM, b.h], "workspace"),
-        ("MtpNorm", "f16", [WARM, b.h], "workspace"),
-        ("MtpR0", "f32", [WARM, b.h], "workspace"),
-        ("MtpR1", "f32", [WARM, b.h], "workspace"),
-        ("MtpFullX", "f16", [WARM, b.fullx], "workspace"),
-        ("MtpFullQ", "f16", [WARM, b.mixdim], "workspace"),
-        ("MtpFullGate", "f16", [WARM, b.mixdim], "workspace"),
-        ("MtpMixer", "f16", [WARM, b.mixdim], "workspace"),
-        ("MtpMix", "f16", [WARM, b.h], "workspace"),
-        ("MtpGateUp", "f16", [WARM, 2 * b.f], "workspace"),
+        ("MtpEmbedding", "f16", [warm, b.h], "workspace"),
+        ("MtpConcat", "f16", [warm, 2 * b.h], "workspace"),
+        ("MtpHidden", "f16", [warm, b.h], "workspace"),
+        ("MtpNorm", "f16", [warm, b.h], "workspace"),
+        ("MtpR0", "f32", [warm, b.h], "workspace"),
+        ("MtpR1", "f32", [warm, b.h], "workspace"),
+        ("MtpFullX", "f16", [warm, b.fullx], "workspace"),
+        ("MtpFullQ", "f16", [warm, b.mixdim], "workspace"),
+        ("MtpFullGate", "f16", [warm, b.mixdim], "workspace"),
+        ("MtpMixer", "f16", [warm, b.mixdim], "workspace"),
+        ("MtpMix", "f16", [warm, b.h], "workspace"),
+        ("MtpGateUp", "f16", [warm, 2 * b.f], "workspace"),
         ("MtpLastHidden", "f16", [1, b.h], "workspace"),
         ("MtpLogits", "f32", [1, b.v], "sequence"),
         ("SequenceLogits", "f32", [VERIFY, b.v], "sequence"),
@@ -69,7 +69,7 @@ def build(b):
         b.kv[name] = width * (2 if dtype == "f16" else 1)
         b.reset.append(name)
 
-    def emit(role, key, fn, args, rows=WARM, *, dynamic=True):
+    def emit(role, key, fn, args, rows=warm, *, dynamic=True):
         return b.emit("mtp/" + role, key, fn, args, rows, dynamic=dynamic)
 
     def quant(role, k, source, swiglu=False):
@@ -82,21 +82,21 @@ def build(b):
 
     def project(role, weight, n, k, out, *, stride=None, offset=0):
         b.projection(
-            "mtp/" + role, weight, n, k, out, stride=stride, offset=offset, rows=WARM, kind="w8"
+            "mtp/" + role, weight, n, k, out, stride=stride, offset=offset, rows=warm, kind="w8"
         )
 
     emit(
         "gather",
         "mtp-gather",
         lambda: primitive(
-            speculation.gather_target_hidden, WARM, b.h, 4096, ring=True, dynamic_rows=True
+            speculation.gather_target_hidden, warm, b.h, 4096, ring=True, dynamic_rows=True
         ),
         dict(Target="MtpTargetHidden", Step="MtpStep", Out="MtpCondition"),
     )
     emit(
         "prepare",
         "mtp-prepare",
-        lambda: primitive(qwen35.prepare, WARM, b.h, b.context, mrope_input=True),
+        lambda: primitive(qwen35.prepare, warm, b.h, b.context, mrope_input=True),
         dict(
             Step="MtpStep",
             Positions="MtpPositions",
@@ -108,20 +108,22 @@ def build(b):
             Residual="MtpR0",
         ),
     )
-    b.embedding("mtp/embedding", "MtpInput", "MtpEmbedding", WARM)
-    emit(
-        "overlay",
-        "mtp-overlay",
-        lambda: primitive(
-            overlay, WARM, b.h, b.context, b.vision["max_features"], dynamic_rows=True
-        ),
-        dict(
-            Embedding="MtpEmbedding",
-            Features="Features",
-            Index="MtpFeatureIndex",
-            Position="MtpStep",
-        ),
-    )
+    b.embedding("mtp/embedding", "MtpInput", "MtpEmbedding", warm)
+    if b.vision:
+        w.fixed("MtpFeatureIndex", "i32", [b.context], "sequence")
+        emit(
+            "overlay",
+            "mtp-overlay",
+            lambda: primitive(
+                overlay, warm, b.h, b.context, b.vision["max_features"], dynamic_rows=True
+            ),
+            dict(
+                Embedding="MtpEmbedding",
+                Features="Features",
+                Index="MtpFeatureIndex",
+                Position="MtpStep",
+            ),
+        )
     emit(
         "concat",
         "mtp-concat",
@@ -194,7 +196,7 @@ def build(b):
         length="MtpSeqLength",
         output="MtpMixer",
         prefix="Mtp",
-        rows=WARM,
+        rows=warm,
     )
     quant("out_quant", b.mixdim, "MtpMixer")
     project("out", p + ".o_proj.weight", b.h, b.mixdim, "MtpMix")
@@ -214,7 +216,7 @@ def build(b):
     if b.moe:
         from tools.model.qwen35.moe import build as moe_ffn
 
-        moe_ffn(b, "mtp", "mtp.layers.0.mlp", rows=WARM, draft=True)
+        moe_ffn(b, "mtp", "mtp.layers.0.mlp", rows=warm, draft=True)
     else:
         for role, offset in [("gate", 0), ("up", b.f)]:
             project(
@@ -231,13 +233,13 @@ def build(b):
     emit(
         "advance",
         "advance",
-        lambda: primitive(control.advance, WARM, dynamic_rows=True),
+        lambda: primitive(control.advance, warm, dynamic_rows=True),
         dict(Step="MtpStep"),
     )
     emit(
         "final_norm",
         "mtp-final-norm",
-        lambda: primitive(final_norm, WARM, 1, hidden=b.h),
+        lambda: primitive(final_norm, warm, 1, hidden=b.h),
         dict(
             X="MtpHidden",
             R="MtpR0",
@@ -423,15 +425,18 @@ def build(b):
         verification_status="SequenceStatus",
         draft_logits="MtpLogits",
         verification_logits="SequenceLogits",
-        feature_index="MtpFeatureIndex",
+        feature_index="MtpFeatureIndex" if b.vision else None,
         accepted_inputs="AcceptedInputs",
         target_length="SeqLength",
         draft_program="mtp_draft",
         hidden_ring="MtpTargetHidden",
         commit_always=True,
         default_verification_tokens=4,
-        warm_plans=[dict(tokens=WARM, min_tokens=1, program="mtp_warm", head_program="mtp_head")],
-        capture_plans=[dict(tokens=1, program="capture"), dict(tokens=4096, program="capture")],
+        warm_plans=[dict(tokens=warm, min_tokens=1, program="mtp_warm", head_program="mtp_head")],
+        capture_plans=[
+            dict(tokens=1, program="capture"),
+            dict(tokens=b.capacity, program="capture"),
+        ],
         verification_plans=[
             dict(
                 tokens=VERIFY,

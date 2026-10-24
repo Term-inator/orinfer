@@ -1010,7 +1010,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                         | "qwen_rows/select"
                         | "qwen_rows/head_last" => 1,
                         "mtp_warm" | "mtp_begin" | "mtp_pre" | "mtp_private" | "mtp_post"
-                        | "mtp_advance" => 512,
+                        | "mtp_advance" => capacity.min(512),
                         "verify" | "restore" => 8,
                         name if name.starts_with("qwen_rows/state/") => LANES,
                         name if name.starts_with("qwen_rows/packet/") => LANES,
@@ -2591,9 +2591,24 @@ mod tests {
         with_mtp(request())
     }
 
+    #[test]
+    fn text_mtp_omits_media_overlay_and_rejects_a_media_index() {
+        let (_, plan) = create(mtp_request(), Policy::Int8Quality).unwrap();
+        assert!(plan.metadata.mtp.as_ref().unwrap().feature_index.is_none());
+        for name in ["mtp_warm", "mtp_draft", "mtp_begin"] {
+            assert!(!plan.metadata.programs[name].iter().any(|op| {
+                matches!(op, Operation::Kernel { name } if name.ends_with("/overlay"))
+            }));
+        }
+        let mut wrong = mtp_request();
+        wrong.metadata.mtp.as_mut().unwrap().feature_index = Some("MtpFeatureIndex".into());
+        assert!(create(wrong, Policy::Int8Quality).is_err());
+    }
+
     fn with_mtp(mut r: CreateRequest) -> CreateRequest {
         let configuration = Configuration::parse(r.config.clone()).unwrap();
         let t = configuration.text();
+        let warm_capacity = r.metadata.chunk_tokens.min(512);
         for (name, width, dtype) in [
             ("MtpEmbedding", t.hidden_size, "f16"),
             ("MtpConcat", 2 * t.hidden_size, "f16"),
@@ -2610,7 +2625,7 @@ mod tests {
         ] {
             r.metadata.buffers.push(
                 serde_json::from_value(json!({
-                    "name":name,"dtype":dtype,"shape":[512,width],"layout":"native_contiguous",
+                    "name":name,"dtype":dtype,"shape":[warm_capacity,width],"layout":"native_contiguous",
                     "alignment":256,"access":"read_write"
                 }))
                 .unwrap(),
@@ -2619,11 +2634,11 @@ mod tests {
         r.metadata.mtp=Some(serde_json::from_value(json!({
             "position":"MtpStep","input":"MtpInput","token":"MtpToken","status":"MtpStatus",
             "verification_tokens":"SequenceTokens","verification_status":"SequenceStatus",
-            "draft_logits":"MtpLogits","verification_logits":"SequenceLogits","feature_index":"MtpFeatureIndex",
+            "draft_logits":"MtpLogits","verification_logits":"SequenceLogits","feature_index":r.metadata.vision.as_ref().map(|_| "MtpFeatureIndex"),
             "accepted_inputs":"AcceptedInputs","target_length":"SeqLength","draft_program":"mtp_draft",
             "hidden_ring":"MtpTargetHidden","commit_always":true,"shared_verification_state":true,
             "default_verification_tokens":4,
-            "warm_plans":[{"tokens":512,"min_tokens":1,"program":"mtp_warm","head_program":"mtp_head"}],
+            "warm_plans":[{"tokens":warm_capacity,"min_tokens":1,"program":"mtp_warm","head_program":"mtp_head"}],
             "capture_plans":[{"tokens":4096,"program":"capture"}],
             "verification_plans":[{"tokens":8,"min_tokens":2,"program":"verify","restore_program":"restore","capture_program":"capture"}]
         })).unwrap());
@@ -2877,22 +2892,7 @@ mod tests {
     }
     #[test]
     fn declared_prefill_capacity_controls_plans_and_packet_admission() {
-        let mut request = request();
-        request.metadata.chunk_tokens = 128;
-        request.prefill_profiles[0].tokens = 128;
-        for buffer in &mut request.metadata.buffers {
-            for dimension in &mut buffer.shape {
-                if *dimension == 4096 {
-                    *dimension = 128;
-                }
-            }
-        }
-        for launch in request.metadata.dynamic_batch_kernels.values_mut() {
-            if launch.capacity == 4096 {
-                launch.capacity = 128;
-            }
-        }
-        let (adapter, plan) = create(request, Policy::Int8Quality).unwrap();
+        let (adapter, plan) = create(with_capacity(request(), 128), Policy::Int8Quality).unwrap();
         assert_eq!(plan.metadata.chunk_tokens, 128);
         assert_eq!(plan.metadata.row_execution.as_ref().unwrap().capacity, 128);
         assert!(
@@ -2917,5 +2917,83 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    fn with_capacity(mut request: CreateRequest, capacity: usize) -> CreateRequest {
+        request.metadata.chunk_tokens = capacity;
+        request.prefill_profiles[0].tokens = capacity;
+        for buffer in &mut request.metadata.buffers {
+            for dimension in &mut buffer.shape {
+                if *dimension == 4096 {
+                    *dimension = capacity;
+                }
+            }
+        }
+        for launch in request.metadata.dynamic_batch_kernels.values_mut() {
+            if launch.capacity == 4096 {
+                launch.capacity = capacity;
+            }
+        }
+        request
+    }
+
+    #[test]
+    fn mtp_warm_capacity_matches_small_prefill_workspaces() {
+        for capacity in [128, 256, 512, 4096] {
+            let (adapter, plan) = create(
+                with_mtp(with_capacity(request(), capacity)),
+                Policy::Int8Quality,
+            )
+            .unwrap();
+            let warm = capacity.min(512);
+            let spec = plan.metadata.mtp.as_ref().unwrap();
+            assert_eq!(spec.warm_plans[0].tokens, warm);
+            assert_eq!(spec.batch_warm_capacity, warm);
+            for program in [
+                "mtp_warm",
+                "mtp_begin",
+                "mtp_pre",
+                "mtp_private",
+                "mtp_post",
+                "mtp_advance",
+            ] {
+                assert_eq!(
+                    plan.metadata
+                        .row_execution
+                        .as_ref()
+                        .unwrap()
+                        .program_capacity(program),
+                    warm
+                );
+            }
+            assert_eq!(
+                plan.metadata.kv_cache.as_ref().unwrap().growth["mtp_warm"].tokens,
+                warm
+            );
+            assert!(
+                adapter
+                    .batch_operation(
+                        &[BatchSegment {
+                            slot: 0,
+                            tokens: warm
+                        }],
+                        abi::BatchOperation::Warm,
+                        true
+                    )
+                    .is_ok()
+            );
+            assert!(
+                adapter
+                    .batch_operation(
+                        &[BatchSegment {
+                            slot: 0,
+                            tokens: warm + 1
+                        }],
+                        abi::BatchOperation::Warm,
+                        true
+                    )
+                    .is_err()
+            );
+        }
     }
 }

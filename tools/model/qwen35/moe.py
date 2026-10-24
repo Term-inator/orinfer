@@ -3,7 +3,6 @@
 import inspect
 import hashlib
 import math
-import numpy as np
 from tools.model.compile import primitive
 
 
@@ -46,34 +45,15 @@ def workspace(b):
 
 
 def banks(b, prefix, draft):
-    w, e = b.weights, b.text["num_experts"]
-    if not draft:
-        return [
-            (
-                w.immutable(prefix + ".experts." + name + ".packed"),
-                w.immutable(prefix + ".experts." + name + ".scale"),
-            )
-            for name in ("gate_up_proj", "down_proj")
-        ]
-    result = []
-    for role in ("gate_up", "down"):
-        operands = []
-        scales = []
-        for i in range(e):
-            names = [
-                prefix + f".experts.{i}." + x + "_proj.weight"
-                for x in (("gate", "up") if role == "gate_up" else ("down",))
-            ]
-            operands.append(np.concatenate([w.array(n + ".int8") for n in names]))
-            scales.append(np.concatenate([w.array(n + ".scale") for n in names]))
-        name = "Runtime." + prefix + "." + role
-        result.append(
-            (
-                w.constant(name + ".int8", np.stack(operands)),
-                w.constant(name + ".scale", np.stack(scales)),
-            )
+    w = b.weights
+    suffix = ".int8" if draft else ".packed"
+    return [
+        (
+            w.immutable(prefix + ".experts." + name + suffix),
+            w.immutable(prefix + ".experts." + name + ".scale"),
         )
-    return result
+        for name in ("gate_up_proj", "down_proj")
+    ]
 
 
 def selection(b, banks):

@@ -201,7 +201,17 @@ class Builder:
     head_rows = HEAD_ROWS
 
     def __init__(
-        self, source, root, output, cache, context, lock, *, text_only=False, prefill_rows=CAPACITY
+        self,
+        source,
+        root,
+        output,
+        cache,
+        context,
+        lock,
+        *,
+        vision=True,
+        mtp=True,
+        prefill_rows=CAPACITY,
     ):
         from tools.model.qwen35.compiler import Aot
         from tools.model.frontend import prepare_chat_template
@@ -269,23 +279,23 @@ class Builder:
             output / "row-tuning", self.aot.identity, self.text, capacity=self.capacity
         )
         self.workspace()
-        from tools.model.qwen35 import vision
-
         self.vision = None
         self.audio = None
         if self.standard:
             from tools.model.qwen_asr.audio import build as build_audio
 
             build_audio(self)
-        elif not text_only:
-            vision.build(self)
+        elif vision:
+            from tools.model.qwen35.vision import build as build_vision
+
+            build_vision(self)
         self.forward()
         self.head()
-        from tools.model.qwen35 import mtp
-
         self.mtp = None
-        if not self.standard and not text_only:
-            mtp.build(self)
+        if not self.standard and mtp:
+            from tools.model.qwen35.mtp import build as build_mtp
+
+            build_mtp(self)
         from tools.model.qwen35 import parallel
 
         parallel.build(self)
@@ -1315,9 +1325,8 @@ def main():
     p.add_argument("--cache", type=Path, default=ROOT / "artifacts/build-cache/qwen35")
     p.add_argument("--context", type=int, default=4096)
     p.add_argument("--prefill-rows", type=int, default=128)
-    p.add_argument(
-        "--text-only", action="store_true", help="Publish text generation without vision or MTP"
-    )
+    p.add_argument("--no-vision", action="store_true", help="Omit vision programs and buffers")
+    p.add_argument("--no-mtp", action="store_true", help="Omit MTP programs and buffers")
     p.add_argument("--gpu-lock", type=Path, default=ROOT / "artifacts/gpu-experiment.lock")
     p.add_argument(
         "--gpu-lock-held",
@@ -1337,7 +1346,8 @@ def main():
             a.cache,
             a.context,
             None if a.gpu_lock_held else a.gpu_lock,
-            text_only=a.text_only,
+            vision=not a.no_vision,
+            mtp=not a.no_mtp,
             prefill_rows=a.prefill_rows,
         )
         digest = b.publish(a.engine.resolve(strict=True))

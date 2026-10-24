@@ -15,7 +15,7 @@ bash tools/operators/run.sh tools/model/qwen35/build.py artifacts/qwen35-build \
   --gpu-lock-held
 ```
 
-构建只接受完整量化产物，按校验身份读取已有 safetensors 分片；两级 E8P 无损重排压缩码字，其余张量保持原始字节。构建复用已有量化值，展开 W8 限定用于临时计算。必要的浮点布局转换与常量放在一个额外分片中。默认上下文 4096，通过 `--context` 设置实际容量；`--prefill-rows` 在 128–4096 行内决定物理工作区、投影 plane stride 与动态发布容量，默认 128 行。`--text-only` 发布纯文本执行包，省去视觉和 MTP 程序及其 GPU 权重/缓冲区；原始量化目录保持完整。
+构建只接受完整量化产物，按校验身份读取已有 safetensors 分片；两级 E8P 无损重排压缩码字，其余张量保持原始字节。构建复用已有量化值，展开 W8 限定用于临时计算。必要的浮点布局转换与常量放在一个额外分片中。默认上下文 4096，通过 `--context` 设置实际容量；`--prefill-rows` 在 128–4096 行内决定物理工作区、投影 plane stride 与动态发布容量，默认 128 行。视觉与 MTP 默认均发布：`--no-vision` 发布支持 MTP 的纯文本包；同时传入 `--no-vision --no-mtp` 发布普通文本生成包。`--no-mtp` 可单独省去 MTP；省略的能力不包含对应程序、权重和缓冲区。原始量化目录保持完整。ASR 沿用音频构建，不包含视觉或 MTP。
 
 RTX 5070 Ti 的 27B 单请求基线使用下面的参数。只读权重按实际 CUDA 可用显存划分常驻热集和稳定 VMM 地址的冷权重，换入期间完成旧消费者后再释放映射，使用有界读取/DMA 管线。该模式关闭 Graph。256 MiB 调度保留与请求状态、KV、工作区和冷权重预算分别计入准入；默认 1 GiB 保留可能拒绝此 16 GB 配置。完整 BF16/NLL 质量、并发、prefix、MTP 和媒体需要分别验收。
 
@@ -37,7 +37,7 @@ Prefill、普通 decode 和 MTP target 验证共享行计算模板。常见行�
 
 Prefill 在模型声明的层边界暂停，保留同一大块的真实行数；跨层存活的 Hidden 和 FP32 residual 由公共运行时保存，请求私有状态由各自的 arena 独立管理。相邻层按剩余调度时间和实测层成本连续执行，耗尽预算才暂停，层组大小随预算动态确定。分层注册、动态行调用和地址表绑定与 Flash Next 共用组件。普通 decode 的 1–128 路私有 GDN／attention 通过 `independent_rows` 包装同一单行计算体，运行时传入真实请求数。
 
-多请求 MTP 使用现有 ABI 的 Verification、Draft、Commit、Warm 和 DraftHead；混合 prefill／verification 通过 MixedRows 显式携带角色边界。共享 target 前后置计算及草稿投影，只分别处理各请求的因果状态；普通请求收集末位置，验证请求收集全部验证位置。接受后恢复 GDN 因子、卷积历史和位置，再批量推进各请求自己的草稿条件。单请求验证复用相同 verification packet，草稿上限由 CLI 配置与运行时成本模型共同约束。
+多请求 MTP 使用现有 ABI 的 Verification、Draft、Commit、Warm 和 DraftHead；混合 prefill／verification 通过 MixedRows 显式携带角色边界。Warm 容量为 `min(512, --prefill-rows)`，单请求和批量刷新按该容量分块，共享激活、scale 与 MoE 工作区保持相同边界。共享 target 前后置计算及草稿投影，只分别处理各请求的因果状态；普通请求收集末位置，验证请求收集全部验证位置。接受后恢复 GDN 因子、卷积历史和位置，再批量推进各请求自己的草稿条件。单请求验证复用相同 verification packet，草稿上限由 CLI 配置与运行时成本模型共同约束。
 
 每种矩阵几何、输出 dtype/stride 和压缩布局只发布一个动态投影 fallback。离线调优覆盖几何长度、tile 边界及其相邻行数，以代表性请求的总 GPU 时延选择一个配置；构建阶段比较候选，发布时固定一个动态投影配置。单行保留同源模板的 AOT 特化，其余行数使用统一动态模板。候选执行包仍须通过完整 Rust CLI 性能、概率、全部状态、并发及 MTP/prefix 验收。
 
