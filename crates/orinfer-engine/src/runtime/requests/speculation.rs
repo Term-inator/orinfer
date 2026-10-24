@@ -620,11 +620,7 @@ impl ModelRuntime {
             }
             if segments.len() >= 2
                 || self.deferred_verification()
-                || self
-                    .manifest
-                    .mtp
-                    .as_ref()
-                    .is_some_and(|s| s.packet_table.is_some())
+                || self.manifest.packet_table().is_some()
             {
                 self.commit_spec_packet(&segments)?;
             } else {
@@ -699,9 +695,9 @@ impl ModelRuntime {
     ) -> Result<()> {
         use orinfer_model_sdk::abi::BatchOperation;
         let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP contract")?;
-        let suffix = spec
-            .packet_table
-            .as_ref()
+        let suffix = self
+            .manifest
+            .packet_table()
             .map(|t| {
                 segments
                     .len()
@@ -715,7 +711,7 @@ impl ModelRuntime {
             .checked_sub(suffix)
             .ok_or("Truncated MTP packet bindings")?;
         let mut tables = vec![];
-        if let Some(table) = &spec.packet_table {
+        if let Some(table) = self.manifest.packet_table() {
             tables.push((table.buffer.as_str(), prefix..bindings.len()));
         }
         if prefix != 0 {
@@ -880,7 +876,9 @@ impl ModelRuntime {
                     tokens: 1,
                 });
             }
-            if !segments.is_empty() && (segments.len() >= 2 || spec.packet_table.is_some()) {
+            if !segments.is_empty()
+                && (segments.len() >= 2 || self.manifest.packet_table().is_some())
+            {
                 let (plan, bindings) = self
                     .model_package
                     .cached_batch(&segments, orinfer_model_sdk::abi::BatchOperation::Draft)?;
@@ -1222,7 +1220,7 @@ impl ModelRuntime {
                     &[],
                 )?;
                 let program = spec.draft_program.clone();
-                if spec.packet_table.is_some() {
+                if self.manifest.packet_table().is_some() {
                     self.execution.ensure_sequence_program_at(
                         req.slot,
                         &program,
@@ -1477,7 +1475,7 @@ impl ModelRuntime {
     ) -> Result<Vec<u32>> {
         self.restore_verified_cursor(req, &round, restored)?;
         let spec = self.manifest.mtp.clone().ok_or("Missing MTP adapter")?;
-        if spec.packet_table.is_some() {
+        if self.manifest.packet_table().is_some() {
             let committed = (0, round);
             self.warm_committed_batch(&mut [req], std::slice::from_ref(&committed))?;
             return self.finish_warmed_commit(req, committed.1, None);
@@ -1493,12 +1491,7 @@ impl ModelRuntime {
         round: PreparedRound,
     ) -> Result<Vec<u32>> {
         let committed = self.sample_verified_round(req, round, None)?;
-        let deferred = self.deferred_verification()
-            || self
-                .manifest
-                .mtp
-                .as_ref()
-                .is_some_and(|s| s.packet_table.is_some());
+        let deferred = self.deferred_verification() || self.manifest.packet_table().is_some();
         if deferred {
             let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP adapter")?;
             self.execution.upload_sequence_ids(

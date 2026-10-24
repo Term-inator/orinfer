@@ -2113,13 +2113,41 @@ impl ModelRuntime {
             };
             self.prepare_batch_target_inputs(req.slot, tokens, history)?;
         }
-        if let Some(table) = self.manifest.state_pointer_table.as_ref().filter(|table| {
+        let table = self.manifest.state_pointer_table.as_ref().filter(|table| {
             segments.len() <= table.max_rows && segments.iter().any(|s| s.tokens == 1)
-        }) {
+        });
+        let packet = self.manifest.packet_table();
+        if let (Some(table), None) = (table, packet) {
             self.execution.upload_sequence_addresses(
                 &table.buffer,
                 self.model_package.state_bindings(&segments)?,
             )?;
+        } else if packet.is_some() {
+            let bindings = self.model_package.state_bindings(&segments)?;
+            let suffix = packet
+                .map_or(Some(0), |p| segments.len().checked_mul(p.columns.len()))
+                .ok_or("Packet operand table size overflow")?;
+            let prefix = bindings
+                .len()
+                .checked_sub(suffix)
+                .ok_or("Truncated packet operand table")?;
+            let mut ranges = vec![];
+            if prefix != 0 {
+                ranges.push((
+                    self.manifest
+                        .state_pointer_table
+                        .as_ref()
+                        .ok_or("Missing ordinary state table")?
+                        .buffer
+                        .as_str(),
+                    0..prefix,
+                ));
+            }
+            if let Some(packet) = packet {
+                ranges.push((packet.buffer.as_str(), prefix..bindings.len()));
+            }
+            self.execution
+                .upload_sequence_address_ranges(bindings, &ranges)?;
         }
         Ok(segments)
     }

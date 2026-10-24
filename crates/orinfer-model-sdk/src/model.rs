@@ -79,6 +79,9 @@ pub struct Manifest {
     pub reranking: Option<crate::reranking::Spec>,
     #[serde(default)]
     pub mtp: Option<crate::mtp::Spec>,
+    /// Shared row operand bindings, independent of speculative decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_table: Option<std::sync::Arc<crate::packet::PacketTable>>,
     #[serde(default)]
     pub batch_profiles: Vec<usize>,
     #[serde(default)]
@@ -379,6 +382,12 @@ pub fn validate_graph_branches(manifest: &Manifest, kernels: &[Kernel]) -> Resul
 }
 
 impl Manifest {
+    pub fn packet_table(&self) -> Option<&std::sync::Arc<crate::packet::PacketTable>> {
+        self.packet_table
+            .as_ref()
+            .or_else(|| self.mtp.as_ref().and_then(|s| s.packet_table.as_ref()))
+    }
+
     pub fn independent(&self) -> bool {
         self.embedding.is_some() || self.reranking.is_some()
     }
@@ -390,6 +399,15 @@ impl Manifest {
             .min_by_key(|p| p.chunk_tokens)
     }
     pub fn validate<'a>(&'a self) -> Result<usize> {
+        if let Some(table) = self.packet_table() {
+            table.validate(self)?;
+        }
+        if self.packet_table.is_some()
+            && self.mtp.as_ref().is_some_and(|s| s.packet_table.is_some())
+        {
+            return Err("Duplicate packet operand tables".into());
+        }
+
         if self.schema_version != 2
             || self.target != "sm_87"
             || self.model.is_empty()

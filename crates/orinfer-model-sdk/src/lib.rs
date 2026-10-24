@@ -9,6 +9,7 @@ pub mod execution;
 pub mod model;
 pub mod mtp;
 pub mod operators;
+pub mod packet;
 pub mod reranking;
 pub mod vision;
 

@@ -41,7 +41,7 @@ fn validate_mtp_packet_graph_reuse() {
     )
     .unwrap();
     let spec = model.manifest.mtp.clone().unwrap();
-    assert!(spec.packet_table.is_some());
+    assert!(model.manifest.packet_table().is_some());
     let source = &f.cases[0];
     let mut retained = vec![];
     let mut evidence = vec![];

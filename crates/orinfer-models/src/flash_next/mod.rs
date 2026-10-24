@@ -26,6 +26,7 @@ use orinfer_model_sdk::{
 struct Flash {
     manifest: Manifest,
     inputs: inputs::Inputs,
+    packet_kernels: Vec<crate::artifact::Kernel>,
 }
 impl Adapter for Flash {
     fn batch_operation(
@@ -34,7 +35,7 @@ impl Adapter for Flash {
         operation: abi::BatchOperation,
         include_plan: bool,
     ) -> Result<abi::BatchPlan> {
-        match operation {
+        let result = match operation {
             abi::BatchOperation::Ordinary => self.batch(segments, include_plan),
             abi::BatchOperation::Verification => {
                 let plan = mixed::verification_plan(&self.manifest, segments)?;
@@ -83,7 +84,8 @@ impl Adapter for Flash {
                 }
                 Ok((plan, vec![]))
             }
-        }
+        }?;
+        crate::packet::indirect(&self.manifest, segments, &self.packet_kernels, result)
     }
     fn visual(
         &self,
@@ -237,6 +239,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     decode_fusions::build(&mut request.metadata, &request.kernel_contracts)?;
     parallel::build(&mut request.metadata, &request.kernel_contracts)?;
     plan::stages(&mut request.metadata, &request.kernel_contracts)?;
+    crate::packet::register_indirect(&mut request.metadata);
 
     let manifest = &mut request.metadata;
     // Source binding slots describe compiled implementations. Only the
@@ -375,6 +378,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         Box::new(Flash {
             manifest: metadata,
             inputs,
+            packet_kernels: request.kernel_contracts,
         }),
         created,
     ))

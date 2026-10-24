@@ -163,6 +163,10 @@ def rebuild(args):
         print(json.dumps(report, indent=2), flush=True)
         return
 
+    from tools.model.packet_graph import inspect as inspect_packets, compile_package
+
+    packet_layout = inspect_packets(args.model)
+
     from tools.model.projection_tuning import ProjectionTuner
     from tools.operators.common import export_kernel
     import torch
@@ -357,6 +361,16 @@ def rebuild(args):
 
                 rebuild_overlays(data, package, manifest, compiler, data["metadata"]["max_context"])
         coalesce_adjacent_selections(package)
+        compile_package(
+            data,
+            package,
+            manifest,
+            root,
+            root,
+            args.output / "packets",
+            args.cache / "packets",
+            packet_layout,
+        )
         digest = compact_package(root, package, staging / "cache/packages")
         shutil.rmtree(root)
         data["execution_package"] = digest

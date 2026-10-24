@@ -922,23 +922,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         ));
         m.programs.insert("audio_encoder".into(), ops);
     }
-    if let Some(table) = m.mtp.as_ref().and_then(|s| s.packet_table.as_ref()) {
-        let aliases = table
-            .kernels
-            .values()
-            .chain(table.copies.iter().map(|c| &c.kernel));
-        m.programs.insert(
-            "mtp_packet_indirect".into(),
-            aliases
-                .map(|name| Operation::Kernel { name: name.clone() })
-                .collect(),
-        );
-        m.mtp
-            .as_mut()
-            .unwrap()
-            .batch_programs
-            .push("mtp_packet_indirect".into());
-    }
+    crate::packet::register_indirect(m);
     let programs = m
         .programs
         .keys()
@@ -1077,11 +1061,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         Box::new(QwenRows {
             private_roles: private_roles(&metadata),
             manifest: metadata.clone(),
-            packet_kernels: if metadata
-                .mtp
-                .as_ref()
-                .is_some_and(|s| s.packet_table.is_some())
-            {
+            packet_kernels: if metadata.packet_table().is_some() {
                 request.kernel_contracts
             } else {
                 vec![]
@@ -1118,11 +1098,7 @@ impl Adapter for QwenRows {
             abi::BatchOperation::Commit => mtp::commit(&self.manifest, segments, include_plan),
             _ => Err("Unsupported Qwen packet operation".into()),
         }?;
-        if operation == abi::BatchOperation::Ordinary {
-            Ok(result)
-        } else {
-            crate::packet::indirect(&self.manifest, segments, &self.packet_kernels, result)
-        }
+        crate::packet::indirect(&self.manifest, segments, &self.packet_kernels, result)
     }
     fn prepare(
         &self,
@@ -2596,8 +2572,8 @@ mod tests {
     fn indirect_packet_rebinds_owners_and_preserves_scalar_launches_and_views() {
         let (_, built) = create(mtp_request(), Policy::Int8Quality).unwrap();
         let mut m = built.metadata;
-        m.mtp.as_mut().unwrap().packet_table = Some(serde_json::from_value(json!({
-            "buffer":"PacketPointers", "columns":["State"],
+        m.packet_table = Some(serde_json::from_value(json!({
+            "buffer":"PacketPointers", "columns":["State","SequenceLogits"],
             "kernels":{"private":"indirect"},
             "scalar_arguments":{"private":[[0,2]]},
             "copies":[{"source":"HeadLogits","destination":"SequenceLogits","kernel":"copy","row_bytes":400}]
@@ -2624,7 +2600,7 @@ mod tests {
             "name":"copy","capacity":8,"grid":[{"op":"rows"},{"op":"constant","value":1},{"op":"constant","value":1}],
             "arguments":[{"index":2,"value":{"op":"rows"}}]
         })).unwrap());
-        let lower = |slots: [usize; 2]| {
+        let lower = |m: &Manifest, slots: [usize; 2]| {
             let segments = [
                 BatchSegment {
                     slot: slots[0],
@@ -2663,32 +2639,52 @@ mod tests {
                     )]),
                     launch: None,
                 },
+                Invocation {
+                    operation: Operation::Copy {
+                        source: "SharedSource".into(),
+                        destination: "SharedDestination".into(),
+                        bytes: 32,
+                    },
+                    sequence: Some(slots[1]),
+                    views: BTreeMap::new(),
+                    launch: None,
+                },
             ];
             crate::packet::indirect(
-                &m,
+                m,
                 &segments,
                 &contracts,
                 (plan, vec![Some((slots[0], "ExistingState".into()))]),
             )
             .unwrap()
         };
-        let (first, bindings) = lower([7, 31]);
-        let (next, next_bindings) = lower([2, 19]);
+        let (first, bindings) = lower(&m, [7, 31]);
+        let (next, next_bindings) = lower(&m, [2, 19]);
         assert_eq!(first, next);
         assert_ne!(bindings, next_bindings);
         assert!(first.iter().all(|c| c.sequence.is_none()));
         assert_eq!(first[0].launch.as_ref().unwrap().arguments, [(2, 3)]);
         assert_eq!(first[1].launch.as_ref().unwrap().arguments, [(2, 2)]);
-        assert_eq!(first[1].views["PacketPointers"].offset, 8);
+        assert_eq!(first[1].views["PacketPointers"].offset, 16);
         assert_eq!(first[1].views["HeadLogits"].offset, 1200);
+        assert!(matches!(
+            &first[2].operation,
+            Operation::Copy { bytes: 32, .. }
+        ));
         assert_eq!(
             bindings,
             [
                 Some((7, "ExistingState".into())),
                 Some((7, "State".into())),
-                Some((31, "State".into()))
+                Some((7, "SequenceLogits".into())),
+                Some((31, "State".into())),
+                Some((31, "SequenceLogits".into()))
             ]
         );
+        m.mtp = None;
+        let (ordinary, ordinary_bindings) = lower(&m, [7, 31]);
+        assert_eq!(ordinary, first);
+        assert_eq!(ordinary_bindings, bindings);
     }
 
     #[test]

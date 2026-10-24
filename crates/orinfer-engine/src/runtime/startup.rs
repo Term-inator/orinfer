@@ -37,8 +37,8 @@ fn program_kernels(
     use std::collections::BTreeSet;
     let mut kernels = BTreeSet::new();
     let mut packets = BTreeSet::new();
-    let table = manifest.mtp.as_ref().and_then(|spec| {
-        let table = spec.packet_table.as_ref()?;
+    let table = manifest.packet_table();
+    if let Some(spec) = manifest.mtp.as_ref().filter(|_| table.is_some()) {
         packets.insert(spec.draft_program.as_str());
         for plan in &spec.warm_plans {
             packets.extend([plan.program.as_str(), plan.head_program.as_str()]);
@@ -46,8 +46,7 @@ fn program_kernels(
         for plan in &spec.verification_plans {
             packets.extend([plan.program.as_str(), plan.restore_program.as_str()]);
         }
-        Some(table)
-    });
+    }
     for program in programs(manifest) {
         let ops = manifest
             .programs

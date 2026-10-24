@@ -262,9 +262,10 @@ class Builder:
 
         if not self.standard:
             commit.build(self)
-            from tools.model.qwen35 import mtp_packets
+        from tools.model.qwen35 import mtp_packets
 
-            mtp_packets.build(self)
+        self.packet_spec = {}
+        mtp_packets.build(self)
 
     def workspace(self):
         w = self.weights
@@ -1174,6 +1175,7 @@ class Builder:
             vision=self.vision,
             **(dict(audio=self.audio) if self.audio else {}),
             mtp=self.mtp,
+            packet_table=self.packet_spec,
             gdn_execution=self.gdn_execution,
             batch_layout=dict(
                 layers=self.text["layer_types"],
