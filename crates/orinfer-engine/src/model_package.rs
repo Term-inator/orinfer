@@ -69,7 +69,7 @@ pub(crate) struct ModelPackage {
     batch_capabilities:
         std::cell::RefCell<std::collections::VecDeque<(abi::BatchOperation, Vec<usize>, bool)>>,
     kernel_buffers: BTreeMap<String, Vec<String>>,
-    indirect_mtp: bool,
+    indirect_packets: bool,
 }
 impl ModelPackage {
     fn open(path: &Path, image: &[u8]) -> Result<Self> {
@@ -102,7 +102,7 @@ impl ModelPackage {
             batch_plans: Default::default(),
             batch_capabilities: Default::default(),
             kernel_buffers: Default::default(),
-            indirect_mtp: false,
+            indirect_packets: false,
         })
     }
     fn describe(&self) -> Result<abi::PackageInfo> {
@@ -197,11 +197,7 @@ impl ModelPackage {
         if let Some(catalog) = &request.catalog {
             model.export_execution(catalog, &mut plan.metadata)?;
         }
-        model.indirect_mtp = plan
-            .metadata
-            .mtp
-            .as_ref()
-            .is_some_and(|s| s.packet_table.is_some());
+        model.indirect_packets = plan.metadata.packet_table().is_some();
         for kernel in &plan.metadata.kernels {
             let mut buffers: Vec<_> = kernel
                 .args
@@ -534,7 +530,7 @@ impl ModelPackage {
         // The packet-table contract makes calls a function of phase and exact
         // segment lengths. A new owner cohort needs fresh bindings, not a new
         // native plan plus a decode of thousands of identical commands.
-        if self.indirect_mtp && operation != abi::BatchOperation::Ordinary {
+        if self.indirect_packets {
             let shaped = cache.iter().find_map(|(kind, previous, (plan, _), bytes)| {
                 (*kind == operation
                     && previous.len() == key.len()
@@ -970,7 +966,7 @@ mod tests {
     fn indirect_packet_shape_reuses_commands_and_refreshes_membership_bindings() {
         let (root, spec, request) = fixture();
         let (mut model, _) = ModelPackage::create(&root, &spec, request).unwrap();
-        let phase = abi::BatchOperation::Verification;
+        let phase = abi::BatchOperation::Ordinary;
         let initial = [
             BatchSegment { slot: 0, tokens: 2 },
             BatchSegment { slot: 3, tokens: 4 },
@@ -982,7 +978,7 @@ mod tests {
         commands[0].sequence = None;
         let commands = std::rc::Rc::new(commands);
         model.batch_plans.borrow_mut().back_mut().unwrap().2.0 = commands.clone();
-        model.indirect_mtp = true;
+        model.indirect_packets = true;
         let replacement = [
             BatchSegment {
                 slot: 11,
@@ -1010,7 +1006,7 @@ mod tests {
         }
         // Without the declared table contract, exact membership remains part
         // of plan identity even when a previous plan happens to be shared.
-        model.indirect_mtp = false;
+        model.indirect_packets = false;
         let (different, _) = model
             .cached_batch(
                 &[
