@@ -34,6 +34,18 @@ Flash Next 的 HC 无损缓存指数和 QSA radix shift 通过已有 ABI 的整�
 
 动态 launch 的全行数验证只在离线构建使用的 `plan-model` 和 `validate-model` 执行，相同容量和表达式只验证一次。正常加载检查每个绑定的参数类型和容量 ABI；实际 launch 继续检查真实行数、算术溢出、除零和非零 grid，行数穷举检查限定在离线验证。该行为由引擎实现，现有执行包可直接复用。
 
+Qwen MTP 执行包可声明 `mtp.packet_table`，将验证、提交、草稿、接受后补算和草稿输出中的请求私有操作数放入固定地址表。包装保持原 kernel 的计算体、grid、标量与共享 workspace 字节视图；Rust 每轮更新当前请求地址，完整 packet Graph 按执行阶段和实际执行形状跨请求复用。提交的缓存行数按请求数计，命中仍要求实际 kernel、grid 和标量一致；验证与补算保留各段实际长度、动态参数和混合角色边界。单请求沿用相同 packet；未声明该契约的包继续使用原有执行方式。启用该能力需重新构建匹配的模型数据与执行包，并验证改变输入、替换请求和 Graph replay 后的全部私有状态。
+
+原生 Qwen 构建入口自动生成该地址表。已有 dense Qwen 执行包采用 sequential prefill、dense decode GDN 且尚无地址表时，可通过 `tools/model/qwen35/rebuild_mtp.py --model 原模型目录 --target 新模型目录` 增量构建，保留原权重与矩阵实现。该入口由 `bash tools/operators/run.sh tools/model/qwen35/rebuild_mtp.py 输出目录` 调用，并在末尾传入上述模型参数；发布前验证模型计划与实际 host ABI。
+
+地址表的列序、kernel 映射及标量映射作为共享的不可变描述保存，逐轮复制 MTP 策略时只复制其引用。实际请求地址每轮独立刷新，JSON 格式和 C ABI 保持不变。
+
+启动预加载选择实际 packet 使用的私有 kernel 和拷贝实现，并在权重读取的等待间隙由同一 CUDA worker 完成；已完成的读取优先上传，输入槽复用仍等待对应 DMA。
+
+完整 Graph 缓存保留动态 packet 执行计划的不可变引用。同一计划引用可以快速命中；其他计划仍比较完整调用、grid、标量和字节视图。声明地址表的包按阶段和有序段长复用 owner 无关的计划，新请求只生成地址绑定；混合角色边界属于阶段身份。请求状态绑定分别缓存。prefill、prefix 桥接和生成中的 warm 复用同一 packet 实现。
+
+完整 packet Graph 缓存最多保留 16 个条目，并与共享片段一起遵守 12288 个节点预算；满额时淘汰最久未使用的完整图。阶段切换后，连续执行的新形状逐步替换旧形状，历史累计命中次数不参与淘汰。
+
 创建时用 JSON 传递配置、数据契约与小型编译目录。独立入口 `orinfer_model_plans_v1` 用 C 数组导出生成的 kernel 参数绑定和 kernel/copy/zero 程序；主 `orinfer_model_v1` 表保持 ABI 1。导出接口显式声明表及记录大小，数组、字符串和嵌套参数由同一个 owner 管理并释放。逐层绑定和完整程序通过原生 C 数组直接导出。动态 batch 热路径继续使用 C 数组，一次返回指令、buffer views、动态 launch 参数和请求状态绑定。原生内存由分配方释放，库保持加载直到模型及 CUDA 资源释放完成。模型实例与 GPU 执行线程绑定。
 
 有限专家常驻模式通过创建请求的 `expert_contracts` 选择更完整的原生绑定契约。模型库返回 `expert_banks`：专家数、按专家连续存储的张量，以及消费 kernel 的 I32 路由计数参数位置。核心按实际绑定读取计数，按模型契约声明的几何管理全局 SLRU 和 CUDA VMM 页。默认全量常驻从原生模型库获取计划所需的验证契约。

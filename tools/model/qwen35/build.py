@@ -262,6 +262,9 @@ class Builder:
 
         if not self.standard:
             commit.build(self)
+            from tools.model.qwen35 import mtp_packets
+
+            mtp_packets.build(self)
 
     def workspace(self):
         w = self.weights

@@ -533,17 +533,8 @@ impl ModelRuntime {
             }
         };
         let (plan, bindings) = self.model_package.cached_batch(&segments, operation)?;
-        if !bindings.is_empty() {
-            let table = self
-                .manifest
-                .mtp
-                .as_ref()
-                .and_then(|s| s.verification_table.as_ref())
-                .ok_or("Missing verification pointer table")?;
-            self.execution
-                .upload_sequence_addresses(&table.buffer, std::rc::Rc::clone(&bindings))?;
-        }
-        self.execution.execute_batch_operation_with(
+        self.upload_spec_bindings(&segments, operation, bindings)?;
+        self.execution.execute_cached_batch_operation_with(
             operation,
             segments.iter().map(|s| (s.slot, s.tokens)).collect(),
             &plan,
@@ -627,7 +618,14 @@ impl ModelRuntime {
                     tokens: round.plan.tokens,
                 });
             }
-            if segments.len() >= 2 || self.deferred_verification() {
+            if segments.len() >= 2
+                || self.deferred_verification()
+                || self
+                    .manifest
+                    .mtp
+                    .as_ref()
+                    .is_some_and(|s| s.packet_table.is_some())
+            {
                 self.commit_spec_packet(&segments)?;
             } else {
                 let round = &committed[0].1;
@@ -684,17 +682,8 @@ impl ModelRuntime {
         let (plan, bindings) = self
             .model_package
             .cached_batch(segments, BatchOperation::Commit)?;
-        if !bindings.is_empty() {
-            let table = self
-                .manifest
-                .mtp
-                .as_ref()
-                .and_then(|s| s.commit_state_table.as_ref())
-                .ok_or("Missing commit pointer table contract")?;
-            self.execution
-                .upload_sequence_addresses(table, std::rc::Rc::clone(&bindings))?;
-        }
-        self.execution.execute_batch_operation(
+        self.upload_spec_bindings(segments, BatchOperation::Commit, bindings)?;
+        self.execution.execute_cached_batch_operation(
             BatchOperation::Commit,
             segments.iter().map(|s| (s.slot, s.tokens)).collect(),
             &plan,
@@ -702,43 +691,88 @@ impl ModelRuntime {
             true,
         )
     }
+    fn upload_spec_bindings(
+        &mut self,
+        segments: &[BatchSegment],
+        phase: orinfer_model_sdk::abi::BatchOperation,
+        bindings: std::rc::Rc<orinfer_model_sdk::abi::StateBindings>,
+    ) -> Result<()> {
+        use orinfer_model_sdk::abi::BatchOperation;
+        let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP contract")?;
+        let suffix = spec
+            .packet_table
+            .as_ref()
+            .map(|t| {
+                segments
+                    .len()
+                    .checked_mul(t.columns.len())
+                    .ok_or("MTP table size overflow")
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let prefix = bindings
+            .len()
+            .checked_sub(suffix)
+            .ok_or("Truncated MTP packet bindings")?;
+        let mut tables = vec![];
+        if let Some(table) = &spec.packet_table {
+            tables.push((table.buffer.as_str(), prefix..bindings.len()));
+        }
+        if prefix != 0 {
+            let table = if phase == BatchOperation::Commit {
+                spec.commit_state_table
+                    .as_ref()
+                    .ok_or("Missing commit pointer table")?
+            } else if matches!(
+                phase,
+                BatchOperation::Verification | BatchOperation::MixedRows { .. }
+            ) {
+                let table = spec
+                    .verification_table
+                    .as_ref()
+                    .ok_or("Missing verification pointer table")?;
+                let mut offset = 0;
+                for segment in segments {
+                    self.execution.upload_sequence_ids(
+                        segment.slot,
+                        &table.row_offset,
+                        &[offset as u32],
+                    )?;
+                    offset += segment.tokens;
+                }
+                &table.buffer
+            } else {
+                return Err("Unexpected MTP table bindings".into());
+            };
+            tables.push((table.as_str(), 0..prefix));
+        }
+        if tables.is_empty() {
+            Ok(())
+        } else {
+            self.execution
+                .upload_sequence_address_ranges(bindings, &tables)
+        }
+    }
     fn execute_spec_packet(
         &mut self,
         segments: &[BatchSegment],
         phase: orinfer_model_sdk::abi::BatchOperation,
     ) -> Result<()> {
+        self.execute_spec_packet_phase(segments, phase, ExecutionPhase::Decode)
+    }
+    pub(in crate::runtime) fn execute_spec_packet_phase(
+        &mut self,
+        segments: &[BatchSegment],
+        phase: orinfer_model_sdk::abi::BatchOperation,
+        execution_phase: ExecutionPhase,
+    ) -> Result<()> {
         let (plan, bindings) = self.model_package.cached_batch(segments, phase)?;
-        if !bindings.is_empty() {
-            let table = self
-                .manifest
-                .mtp
-                .as_ref()
-                .and_then(|s| s.verification_table.as_ref())
-                .filter(|_| {
-                    matches!(
-                        phase,
-                        orinfer_model_sdk::abi::BatchOperation::Verification
-                            | orinfer_model_sdk::abi::BatchOperation::MixedRows { .. }
-                    )
-                })
-                .ok_or("Missing speculative pointer table")?;
-            let mut offset = 0;
-            for segment in segments {
-                self.execution.upload_sequence_ids(
-                    segment.slot,
-                    &table.row_offset,
-                    &[offset as u32],
-                )?;
-                offset += segment.tokens;
-            }
-            self.execution
-                .upload_sequence_addresses(&table.buffer, std::rc::Rc::clone(&bindings))?;
-        }
-        self.execution.execute_batch_operation(
+        self.upload_spec_bindings(segments, phase, bindings)?;
+        self.execution.execute_cached_batch_operation(
             phase,
             segments.iter().map(|s| (s.slot, s.tokens)).collect(),
             &plan,
-            true,
+            execution_phase == ExecutionPhase::Decode,
             true,
         )
     }
@@ -846,14 +880,16 @@ impl ModelRuntime {
                     tokens: 1,
                 });
             }
-            if segments.len() >= 2 {
+            if !segments.is_empty() && (segments.len() >= 2 || spec.packet_table.is_some()) {
                 let (plan, bindings) = self
                     .model_package
                     .cached_batch(&segments, orinfer_model_sdk::abi::BatchOperation::Draft)?;
-                if !bindings.is_empty() {
-                    return Err("Unexpected draft state table".into());
-                }
-                self.execution.execute_batch_operation(
+                self.upload_spec_bindings(
+                    &segments,
+                    orinfer_model_sdk::abi::BatchOperation::Draft,
+                    bindings,
+                )?;
+                self.execution.execute_cached_batch_operation(
                     orinfer_model_sdk::abi::BatchOperation::Draft,
                     segments.iter().map(|s| (s.slot, s.tokens)).collect(),
                     &plan,
@@ -882,16 +918,20 @@ impl ModelRuntime {
         }
         Ok(())
     }
-    pub(super) fn refresh_request_mtp(&self, req: &mut RequestState, head: bool) -> Result<bool> {
+    pub(super) fn refresh_request_mtp(
+        &mut self,
+        req: &mut RequestState,
+        head: bool,
+    ) -> Result<bool> {
         self.refresh_request_mtp_at(req, head, None)
     }
     fn refresh_request_mtp_at(
-        &self,
+        &mut self,
         req: &mut RequestState,
         head: bool,
         cursors: Option<[i32; 2]>,
     ) -> Result<bool> {
-        let Some(spec) = &self.manifest.mtp else {
+        let Some(spec) = self.manifest.mtp.clone() else {
             return Ok(true);
         };
         let [position, draft_position] = match cursors {
@@ -924,7 +964,7 @@ impl ModelRuntime {
         if lag != 0 {
             let at = Instant::now();
             self.mtp_warm_state(
-                spec,
+                &spec,
                 &req.history[req.warm.tokens + 1..position + 1],
                 &|| false,
                 ExecutionPhase::Decode,
@@ -1181,7 +1221,24 @@ impl ModelRuntime {
                     &[*build.round.drafts.last().unwrap()],
                     &[],
                 )?;
-                self.launch_rows(&spec.draft_program, 1, ExecutionPhase::Decode)?;
+                let program = spec.draft_program.clone();
+                if spec.packet_table.is_some() {
+                    self.execution.ensure_sequence_program_at(
+                        req.slot,
+                        &program,
+                        build.round.position + build.round.drafts.len() - 1,
+                        1,
+                    )?;
+                    self.execute_spec_packet(
+                        &[BatchSegment {
+                            slot: req.slot,
+                            tokens: 1,
+                        }],
+                        orinfer_model_sdk::abi::BatchOperation::Draft,
+                    )?;
+                } else {
+                    self.launch_rows(&program, 1, ExecutionPhase::Decode)?;
+                }
             }
             self.consume_draft(req, &mut build, None)?;
         }
@@ -1420,6 +1477,11 @@ impl ModelRuntime {
     ) -> Result<Vec<u32>> {
         self.restore_verified_cursor(req, &round, restored)?;
         let spec = self.manifest.mtp.clone().ok_or("Missing MTP adapter")?;
+        if spec.packet_table.is_some() {
+            let committed = (0, round);
+            self.warm_committed_batch(&mut [req], std::slice::from_ref(&committed))?;
+            return self.finish_warmed_commit(req, committed.1, None);
+        }
         let at = Instant::now();
         self.mtp_warm(&spec, &round.tokens, &|| false, ExecutionPhase::Decode)?;
         req.mtp.refresh_s += at.elapsed().as_secs_f64();
@@ -1431,7 +1493,12 @@ impl ModelRuntime {
         round: PreparedRound,
     ) -> Result<Vec<u32>> {
         let committed = self.sample_verified_round(req, round, None)?;
-        let deferred = self.deferred_verification();
+        let deferred = self.deferred_verification()
+            || self
+                .manifest
+                .mtp
+                .as_ref()
+                .is_some_and(|s| s.packet_table.is_some());
         if deferred {
             let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP adapter")?;
             self.execution.upload_sequence_ids(
@@ -1447,6 +1514,10 @@ impl ModelRuntime {
         self.finish_verified_round(req, committed, deferred)
     }
 }
+
+#[cfg(test)]
+#[path = "tests/mtp_graph.rs"]
+mod graph_tests;
 
 #[cfg(test)]
 #[path = "tests/verification.rs"]
@@ -1689,7 +1760,13 @@ mod policy_tests {
                         true,
                     )
                     .unwrap();
-                assert!(bindings.is_empty());
+                model
+                    .upload_spec_bindings(
+                        &segments,
+                        orinfer_model_sdk::abi::BatchOperation::Draft,
+                        std::rc::Rc::new(bindings),
+                    )
+                    .unwrap();
                 model
                     .execution
                     .execute_batch_operation(

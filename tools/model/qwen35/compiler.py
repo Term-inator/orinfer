@@ -18,6 +18,7 @@ class Aot:
         self.compiler = Compiler(root, root, output, buffers)
         self.kernels, self.dynamic = [], []
         self.objects = {}
+        self.recipes = {}
         sources = []
         for directory in [
             ROOT / "kernels",
@@ -71,7 +72,9 @@ class Aot:
         dynamic=True,
         row_divisor=1,
         row_multiplier=1,
+        constants=None,
     ):
+        self.recipes[name] = (key, build, bindings, rows, dynamic, row_divisor, row_multiplier)
         if (
             row_multiplier < 1
             or rows % row_multiplier
@@ -100,6 +103,7 @@ class Aot:
             multiplier=row_multiplier,
             key=key,
             artifact=artifact,
+            constants=constants,
         )
         self.kernels.append(kernel)
         if dynamic:

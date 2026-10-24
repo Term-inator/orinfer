@@ -49,6 +49,9 @@ pub struct Spec {
     pub commit_state_table: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_table: Option<CausalTable>,
+    /// Immutable table bindings are shared across per-round policy clones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_table: Option<std::sync::Arc<PacketTable>>,
     /// Joined token rows for warm; independent request/head capacity is separate.
     #[serde(default, skip_serializing_if = "crate::model::is_zero")]
     pub batch_warm_capacity: usize,
@@ -63,6 +66,27 @@ pub struct Spec {
     /// Prefix/factor capacity is shared between widths within each owner arena.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shared_verification_state: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PacketTable {
+    pub buffer: String,
+    pub columns: Vec<String>,
+    pub kernels: std::collections::BTreeMap<String, String>,
+    /// Original host argument index -> wrapped host argument index.
+    #[serde(default)]
+    pub scalar_arguments: std::collections::BTreeMap<String, Vec<(usize, usize)>>,
+    pub copies: Vec<PacketCopy>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PacketCopy {
+    pub source: String,
+    pub destination: String,
+    pub kernel: String,
+    pub row_bytes: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -193,6 +217,39 @@ impl Spec {
             .ok_or_else(|| "No compatible MTP warm plan".into())
     }
     pub fn validate(&self, model: &Manifest) -> Result<()> {
+        if let Some(table) = &self.packet_table {
+            let columns: BTreeSet<_> = table.columns.iter().collect();
+            let runtime_buffers: BTreeSet<_> = model
+                .buffers
+                .iter()
+                .filter(|buffer| buffer.data.is_none())
+                .map(|buffer| buffer.name.as_str())
+                .collect();
+            let kernels: BTreeSet<_> = model.kernels.iter().map(|k| k.name.as_str()).collect();
+            if columns.is_empty()
+                || columns.len() != table.columns.len()
+                || !model.buffers.iter().any(|b| {
+                    b.name == table.buffer
+                        && b.dtype == Dtype::U64
+                        && b.data.is_none()
+                        && b.shape == [128 * columns.len()]
+                })
+                || table
+                    .columns
+                    .iter()
+                    .any(|name| !runtime_buffers.contains(name.as_str()))
+                || table.copies.iter().any(|copy| {
+                    copy.row_bytes == 0 || !model.dynamic_batch_kernels.contains_key(&copy.kernel)
+                })
+                || table
+                    .kernels
+                    .values()
+                    .chain(table.copies.iter().map(|c| &c.kernel))
+                    .any(|name| !kernels.contains(name.as_str()))
+            {
+                return Err("Invalid MTP packet address table".into());
+            }
+        }
         let program = |name: &str| -> Result<()> {
             if model.programs.get(name).is_none_or(Vec::is_empty) {
                 return Err(format!("Missing MTP program {name}"));
@@ -422,6 +479,35 @@ impl Spec {
 #[cfg(test)]
 mod verification_tests {
     use super::*;
+    #[test]
+    fn policy_clones_share_packet_bindings_and_preserve_the_wire_contract() {
+        let spec: Spec = serde_json::from_value(serde_json::json!({
+            "position":"Position", "input":"Input", "token":"Token", "status":"Status",
+            "verification_tokens":"VerificationTokens", "verification_status":"VerificationStatus",
+            "draft_logits":"DraftLogits", "verification_logits":"VerificationLogits",
+            "accepted_inputs":"AcceptedInputs", "target_length":"TargetLength",
+            "draft_program":"draft", "default_verification_tokens":8,
+            "warm_plans":[], "capture_plans":[], "verification_plans":[],
+            "packet_table":{
+                "buffer":"Pointers", "columns":["State"],
+                "kernels":{"original":"indirect"},
+                "scalar_arguments":{"original":[[0,2]]}, "copies":[]
+            }
+        }))
+        .unwrap();
+        let wire = serde_json::to_value(&spec).unwrap();
+        let mut policy = spec.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            spec.packet_table.as_ref().unwrap(),
+            policy.packet_table.as_ref().unwrap()
+        ));
+        assert_eq!(serde_json::to_value(&policy).unwrap(), wire);
+        policy.default_verification_tokens = 4;
+        assert_eq!(spec.default_verification_tokens, 8);
+        let restored: Spec = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), wire);
+    }
+
     #[test]
     fn one_verification_entry_preserves_every_draft_width_and_short_tail() {
         let p = VerificationPlan {

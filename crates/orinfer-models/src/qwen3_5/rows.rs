@@ -135,6 +135,7 @@ const HEAD: &[&str] = &["rotate", "project", "partials", "merge"];
 struct QwenRows {
     manifest: Manifest,
     private_roles: Vec<Option<String>>,
+    packet_kernels: Vec<crate::artifact::Kernel>,
 }
 fn private_roles(m: &Manifest) -> Vec<Option<String>> {
     let layout = m.batch_layout.as_ref().unwrap();
@@ -921,7 +922,29 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         ));
         m.programs.insert("audio_encoder".into(), ops);
     }
-    let programs = m.programs.keys().cloned().collect::<BTreeSet<_>>();
+    if let Some(table) = m.mtp.as_ref().and_then(|s| s.packet_table.as_ref()) {
+        let aliases = table
+            .kernels
+            .values()
+            .chain(table.copies.iter().map(|c| &c.kernel));
+        m.programs.insert(
+            "mtp_packet_indirect".into(),
+            aliases
+                .map(|name| Operation::Kernel { name: name.clone() })
+                .collect(),
+        );
+        m.mtp
+            .as_mut()
+            .unwrap()
+            .batch_programs
+            .push("mtp_packet_indirect".into());
+    }
+    let programs = m
+        .programs
+        .keys()
+        .filter(|name| name.as_str() != "mtp_packet_indirect")
+        .cloned()
+        .collect::<BTreeSet<_>>();
     m.row_execution = Some(RowExecution {
         capacity: m
             .vision
@@ -1054,6 +1077,15 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         Box::new(QwenRows {
             private_roles: private_roles(&metadata),
             manifest: metadata.clone(),
+            packet_kernels: if metadata
+                .mtp
+                .as_ref()
+                .is_some_and(|s| s.packet_table.is_some())
+            {
+                request.kernel_contracts
+            } else {
+                vec![]
+            },
         }),
         CreatedPlan {
             metadata,
@@ -1070,7 +1102,7 @@ impl Adapter for QwenRows {
         operation: abi::BatchOperation,
         include_plan: bool,
     ) -> Result<abi::BatchPlan> {
-        match operation {
+        let result = match operation {
             abi::BatchOperation::Ordinary => self.packet(segments, None, include_plan),
             abi::BatchOperation::Verification => self.packet(segments, Some(0), include_plan),
             abi::BatchOperation::MixedRows { prefills }
@@ -1085,6 +1117,11 @@ impl Adapter for QwenRows {
             }
             abi::BatchOperation::Commit => mtp::commit(&self.manifest, segments, include_plan),
             _ => Err("Unsupported Qwen packet operation".into()),
+        }?;
+        if operation == abi::BatchOperation::Ordinary {
+            Ok(result)
+        } else {
+            crate::packet::indirect(&self.manifest, segments, &self.packet_kernels, result)
         }
     }
     fn prepare(
@@ -2552,6 +2589,105 @@ mod tests {
                 true
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn indirect_packet_rebinds_owners_and_preserves_scalar_launches_and_views() {
+        let (_, built) = create(mtp_request(), Policy::Int8Quality).unwrap();
+        let mut m = built.metadata;
+        m.mtp.as_mut().unwrap().packet_table = Some(serde_json::from_value(json!({
+            "buffer":"PacketPointers", "columns":["State"],
+            "kernels":{"private":"indirect"},
+            "scalar_arguments":{"private":[[0,2]]},
+            "copies":[{"source":"HeadLogits","destination":"SequenceLogits","kernel":"copy","row_bytes":400}]
+        })).unwrap());
+        let kernel = |name, args| {
+            serde_json::from_value(json!({
+            "name":name,"module":{"file":"x","sha256":"0".repeat(64)},
+            "source":{"file":"x","sha256":"0".repeat(64)},
+            "host_abi":{"file":"x","sha256":"0".repeat(64)},"symbol":"kernel",
+            "grid":[1,1,1],"block":[32,1,1],"shared_memory_bytes":0,"cooperative":false,"args":args
+        })).unwrap()
+        };
+        let contracts = vec![
+            kernel(
+                "private",
+                json!([{"kind":"i32","value":8},{"kind":"buffer","name":"State"}]),
+            ),
+            kernel(
+                "indirect",
+                json!([{"kind":"buffer","name":"PacketPointers"},{"kind":"i32","value":0},{"kind":"i32","value":8}]),
+            ),
+        ];
+        m.dynamic_batch_kernels.insert("copy".into(), serde_json::from_value(json!({
+            "name":"copy","capacity":8,"grid":[{"op":"rows"},{"op":"constant","value":1},{"op":"constant","value":1}],
+            "arguments":[{"index":2,"value":{"op":"rows"}}]
+        })).unwrap());
+        let lower = |slots: [usize; 2]| {
+            let segments = [
+                BatchSegment {
+                    slot: slots[0],
+                    tokens: 3,
+                },
+                BatchSegment {
+                    slot: slots[1],
+                    tokens: 8,
+                },
+            ];
+            let plan = vec![
+                Invocation {
+                    operation: Operation::Kernel {
+                        name: "private".into(),
+                    },
+                    sequence: Some(slots[0]),
+                    views: BTreeMap::new(),
+                    launch: Some(orinfer_model_sdk::operators::dynamic::RowLaunch {
+                        grid: [3, 1, 1],
+                        arguments: vec![(0, 3)],
+                    }),
+                },
+                Invocation {
+                    operation: Operation::Copy {
+                        source: "HeadLogits".into(),
+                        destination: "SequenceLogits".into(),
+                        bytes: 800,
+                    },
+                    sequence: Some(slots[1]),
+                    views: BTreeMap::from([(
+                        "HeadLogits".into(),
+                        BufferView {
+                            buffer: "HeadLogits".into(),
+                            offset: 1200,
+                        },
+                    )]),
+                    launch: None,
+                },
+            ];
+            crate::packet::indirect(
+                &m,
+                &segments,
+                &contracts,
+                (plan, vec![Some((slots[0], "ExistingState".into()))]),
+            )
+            .unwrap()
+        };
+        let (first, bindings) = lower([7, 31]);
+        let (next, next_bindings) = lower([2, 19]);
+        assert_eq!(first, next);
+        assert_ne!(bindings, next_bindings);
+        assert!(first.iter().all(|c| c.sequence.is_none()));
+        assert_eq!(first[0].launch.as_ref().unwrap().arguments, [(2, 3)]);
+        assert_eq!(first[1].launch.as_ref().unwrap().arguments, [(2, 2)]);
+        assert_eq!(first[1].views["PacketPointers"].offset, 8);
+        assert_eq!(first[1].views["HeadLogits"].offset, 1200);
+        assert_eq!(
+            bindings,
+            [
+                Some((7, "ExistingState".into())),
+                Some((7, "State".into())),
+                Some((31, "State".into()))
+            ]
         );
     }
 

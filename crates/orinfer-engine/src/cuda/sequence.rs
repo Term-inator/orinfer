@@ -9,6 +9,35 @@ use std::time::Instant;
 // Oversized plans retain direct execution rather than exceeding this budget.
 const BATCH_GRAPH_NODES: usize = 12288;
 
+#[derive(Clone, Copy)]
+struct BatchOperations<'a> {
+    calls: &'a [Invocation],
+    retained: Option<&'a std::rc::Rc<Vec<Invocation>>>,
+}
+impl BatchOperations<'_> {
+    fn matches(&self, cached: &std::rc::Rc<Vec<Invocation>>) -> bool {
+        self.retained
+            .is_some_and(|plan| std::rc::Rc::ptr_eq(plan, cached))
+            || cached.as_slice() == self.calls
+    }
+    fn retain(&self) -> std::rc::Rc<Vec<Invocation>> {
+        self.retained
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::new(self.calls.to_vec()))
+    }
+}
+
+fn packet_graph_rows(
+    operation: orinfer_model_sdk::abi::BatchOperation,
+    segments: &[(usize, usize)],
+) -> usize {
+    if operation == orinfer_model_sdk::abi::BatchOperation::Commit {
+        segments.len()
+    } else {
+        segments.iter().map(|(_, tokens)| tokens).sum()
+    }
+}
+
 fn fixed_resize_cost(current: usize, needed: usize, limited: bool) -> usize {
     if current < needed {
         needed - current
@@ -74,14 +103,13 @@ fn batch_graph_victim(
     incoming: usize,
 ) -> Option<super::executor::BatchGraphKey> {
     if cache.len() < 16
-        && cache.values().map(|(_, _, nodes, _)| nodes).sum::<usize>() + incoming
-            <= BATCH_GRAPH_NODES
+        && cache.values().map(|(_, _, nodes)| nodes).sum::<usize>() + incoming <= BATCH_GRAPH_NODES
     {
         return None;
     }
     cache
         .iter()
-        .min_by_key(|(_, (_, last, _, hits))| (*hits, *last))
+        .min_by_key(|(_, (_, last, _))| *last)
         .map(|(key, _)| key.clone())
 }
 
@@ -103,6 +131,19 @@ pub(super) struct IdleSelection {
 }
 
 impl Executor {
+    pub(crate) fn active_request_slot(&self) -> Option<usize> {
+        self.sequences
+            .get(self.active_sequence)
+            .filter(|s| s.leased && !s.quarantined)
+            .map(|_| self.active_sequence)
+    }
+    #[cfg(test)]
+    pub(crate) fn set_graph_mode_for_test(
+        &mut self,
+        mode: crate::execution::CudaGraphMode,
+    ) -> crate::execution::CudaGraphMode {
+        std::mem::replace(&mut self.cuda_graph, mode)
+    }
     /// Bind each source arena and a disjoint transient scratch row. No request
     /// address is supplied by a caller outside this retained executor.
     pub(crate) fn upload_scratch_rows(
@@ -235,6 +276,33 @@ impl Executor {
             .borrow_mut()
             .resolve(bindings, &self.sequences)?;
         self.upload_bytes(name, &bytes)
+    }
+    pub(crate) fn upload_sequence_address_ranges(
+        &self,
+        bindings: std::rc::Rc<orinfer_model_sdk::abi::StateBindings>,
+        tables: &[(&str, std::ops::Range<usize>)],
+    ) -> Result<()> {
+        let bytes = self
+            .state_table
+            .borrow_mut()
+            .resolve(bindings, &self.sequences)?;
+        for (name, range) in tables {
+            let start = range
+                .start
+                .checked_mul(8)
+                .ok_or("Address table range overflow")?;
+            let end = range
+                .end
+                .checked_mul(8)
+                .ok_or("Address table range overflow")?;
+            self.upload_bytes(
+                name,
+                bytes
+                    .get(start..end)
+                    .ok_or("Address table range exceeds bindings")?,
+            )?;
+        }
+        Ok(())
     }
     /// Read controls from leased arenas without rebinding the active sequence.
     /// All producers and copies share the worker stream; a cohort needs only
@@ -1624,17 +1692,17 @@ impl Executor {
                     Some(Victim::Batch(key))
                 } else if shared && pieces.len() >= 256 {
                     oldest_piece()
-                } else if batches.values().map(|(_, _, n, _)| n).sum::<usize>()
+                } else if batches.values().map(|(_, _, n)| n).sum::<usize>()
                     + pieces.keys().map(|k| k.operations.len()).sum::<usize>()
                     + incoming
                     <= BATCH_GRAPH_NODES
                 {
                     None
                 } else {
-                    let oldest_batch = batches.iter().min_by_key(|(_, (_, last, _, _))| *last);
+                    let oldest_batch = batches.iter().min_by_key(|(_, (_, last, _))| *last);
                     let oldest_shared = pieces.iter().min_by_key(|(_, (_, last))| *last);
                     match (oldest_batch, oldest_shared) {
-                        (Some((key, (_, last, _, _))), Some((_, (_, plast)))) if last <= plast => {
+                        (Some((key, (_, last, _))), Some((_, (_, plast)))) if last <= plast => {
                             Some(Victim::Batch(key.clone()))
                         }
                         (_, Some((key, _))) => Some(Victim::Shared(key.clone())),
@@ -1730,7 +1798,7 @@ impl Executor {
                 continue;
             }
             let key = SharedGraphKey {
-                operations: piece.to_vec(),
+                operations: std::rc::Rc::new(piece.to_vec()),
                 addresses,
             };
             let tick = self.batch_graph_clock.get().wrapping_add(1);
@@ -1800,7 +1868,7 @@ impl Executor {
         &self,
         operation: orinfer_model_sdk::abi::BatchOperation,
         segments: &[(usize, usize)],
-        operations: &[Invocation],
+        operations: BatchOperations<'_>,
         decode: bool,
         overlap: &mut dyn FnMut(),
     ) -> Result<bool> {
@@ -1809,7 +1877,7 @@ impl Executor {
         {
             return Ok(false);
         }
-        let rows = segments.iter().map(|(_, n)| n).sum::<usize>();
+        let rows = packet_graph_rows(operation, segments);
         let graph = self
             .batch_graphs
             .borrow_mut()
@@ -1819,18 +1887,13 @@ impl Executor {
                     && key.rows == rows
                     && match &key.shared {
                         None => key.segments == segments,
-                        Some(shared) => {
-                            decode
-                                && segments.iter().all(|(_, n)| *n == 1)
-                                && shared.operations == operations
-                        }
+                        Some(shared) => operations.matches(&shared.operations),
                     }
             })
-            .map(|(_, (graph, last, _, hits))| {
+            .map(|(_, (graph, last, _))| {
                 let tick = self.batch_graph_clock.get().wrapping_add(1);
                 self.batch_graph_clock.set(tick);
                 *last = tick;
-                *hits = hits.saturating_add(1);
                 *graph
             });
         let Some(graph) = graph else { return Ok(false) };
@@ -1877,6 +1940,66 @@ impl Executor {
         allow_capture: bool,
         overlap: &mut dyn FnMut(),
     ) -> Result<()> {
+        self.execute_batch_operations(
+            operation,
+            segments,
+            BatchOperations {
+                calls: operations,
+                retained: None,
+            },
+            decode,
+            allow_capture,
+            overlap,
+        )
+    }
+    pub(crate) fn execute_cached_batch_operation(
+        &mut self,
+        operation: orinfer_model_sdk::abi::BatchOperation,
+        segments: Vec<(usize, usize)>,
+        operations: &std::rc::Rc<Vec<Invocation>>,
+        decode: bool,
+        allow_capture: bool,
+    ) -> Result<()> {
+        self.execute_cached_batch_operation_with(
+            operation,
+            segments,
+            operations,
+            decode,
+            allow_capture,
+            &mut || {},
+        )
+    }
+    pub(crate) fn execute_cached_batch_operation_with(
+        &mut self,
+        operation: orinfer_model_sdk::abi::BatchOperation,
+        segments: Vec<(usize, usize)>,
+        operations: &std::rc::Rc<Vec<Invocation>>,
+        decode: bool,
+        allow_capture: bool,
+        overlap: &mut dyn FnMut(),
+    ) -> Result<()> {
+        self.execute_batch_operations(
+            operation,
+            segments,
+            BatchOperations {
+                calls: operations,
+                retained: Some(operations),
+            },
+            decode,
+            allow_capture,
+            overlap,
+        )
+    }
+    fn execute_batch_operations(
+        &mut self,
+        operation: orinfer_model_sdk::abi::BatchOperation,
+        segments: Vec<(usize, usize)>,
+        prepared: BatchOperations<'_>,
+        decode: bool,
+        allow_capture: bool,
+        overlap: &mut dyn FnMut(),
+    ) -> Result<()> {
+        let operations = prepared.calls;
         if operations.is_empty() && decode && segments.iter().all(|(_, n)| *n == 1) {
             let cached = {
                 let mut cache = self.batch_graphs.borrow_mut();
@@ -1887,11 +2010,10 @@ impl Executor {
                             && key.operation == operation
                             && key.rows == segments.len()
                     })
-                    .map(|(_, (graph, last, _, hits))| {
+                    .map(|(_, (graph, last, _))| {
                         let tick = self.batch_graph_clock.get().wrapping_add(1);
                         self.batch_graph_clock.set(tick);
                         *last = tick;
-                        *hits = hits.saturating_add(1);
                         *graph
                     })
             };
@@ -1950,15 +2072,12 @@ impl Executor {
                 self.ensure_writable_range(name, offset, bytes)?;
             }
         }
-        if self.replay_cached_batch(operation, &segments, operations, decode, overlap)? {
+        if self.replay_cached_batch(operation, &segments, prepared, decode, overlap)? {
             return Ok(());
         }
         // A fully indirect plan captures only session-owned table/workspace
         // addresses. Changing request membership cannot invalidate those pointers.
-        let shared = if !operations.is_empty()
-            && decode
-            && segments.iter().all(|(_, tokens)| *tokens == 1)
-        {
+        let shared = if !operations.is_empty() {
             let mut addresses = Vec::new();
             let mut indirect = true;
             for call in operations {
@@ -1971,7 +2090,7 @@ impl Executor {
             }
             if indirect {
                 Some(super::executor::SharedGraphKey {
-                    operations: operations.to_vec(),
+                    operations: prepared.retain(),
                     addresses,
                 })
             } else {
@@ -1980,7 +2099,7 @@ impl Executor {
         } else {
             None
         };
-        let rows = segments.iter().map(|(_, tokens)| tokens).sum();
+        let rows = packet_graph_rows(operation, &segments);
         let segments = if shared.is_some() {
             Vec::new()
         } else {
@@ -2022,9 +2141,8 @@ impl Executor {
                 .batch_graphs
                 .borrow_mut()
                 .get_mut(&key)
-                .map(|(g, last, _, hits)| {
+                .map(|(g, last, _)| {
                     *last = tick;
-                    *hits = hits.saturating_add(1);
                     *g
                 });
             let graph = if let Some(graph) = cached {
@@ -2048,7 +2166,7 @@ impl Executor {
                 self.batch_statistics.set(statistics);
                 self.batch_graphs
                     .borrow_mut()
-                    .insert(key, (graph, tick, operations.len(), 1));
+                    .insert(key, (graph, tick, operations.len()));
                 graph
             };
             let at = Instant::now();
@@ -2432,7 +2550,7 @@ mod graph_cache_tests {
     fn indirect_graph_identity_tracks_shape_and_workspace_not_request_slots() {
         use super::super::executor::{BatchGraphKey, SharedGraphKey};
         let graph = SharedGraphKey {
-            operations: vec![],
+            operations: std::rc::Rc::new(vec![]),
             addresses: vec![42],
         };
         let first = BatchGraphKey {
@@ -2454,6 +2572,66 @@ mod graph_cache_tests {
     }
 
     #[test]
+    fn cached_graph_plans_retain_storage_and_recheck_changed_launches_and_views() {
+        let original = std::rc::Rc::new(vec![Invocation {
+            operation: Operation::Kernel {
+                name: "indirect".into(),
+            },
+            sequence: None,
+            launch: Some(orinfer_model_sdk::operators::dynamic::RowLaunch {
+                grid: [2, 1, 1],
+                arguments: vec![(0, 2)],
+            }),
+            views: BTreeMap::from([(
+                "Pointers".into(),
+                crate::execution::BufferView {
+                    buffer: "Pointers".into(),
+                    offset: 16,
+                },
+            )]),
+        }]);
+        let prepared = BatchOperations {
+            calls: &original,
+            retained: Some(&original),
+        };
+        let retained = prepared.retain();
+        assert!(std::rc::Rc::ptr_eq(&original, &retained));
+        assert!(prepared.matches(&retained));
+        let key = super::super::executor::SharedGraphKey {
+            operations: retained.clone(),
+            addresses: vec![42],
+        };
+        let mut equal = key.clone();
+        assert_eq!(key.cmp(&equal), std::cmp::Ordering::Equal);
+        equal.operations = std::rc::Rc::new(original.as_ref().clone());
+        assert_eq!(key.cmp(&equal), std::cmp::Ordering::Equal);
+        equal.addresses[0] = 43;
+        assert_eq!(key.cmp(&equal), std::cmp::Ordering::Less);
+        let borrowed = BatchOperations {
+            calls: &original,
+            retained: None,
+        };
+        assert!(borrowed.matches(&retained));
+        assert!(!std::rc::Rc::ptr_eq(&borrowed.retain(), &retained));
+        for field in 0..4 {
+            let mut changed = original.as_ref().clone();
+            match field {
+                0 => changed[0].launch.as_mut().unwrap().grid[0] = 3,
+                1 => changed[0].launch.as_mut().unwrap().arguments[0].1 = 3,
+                2 => changed[0].views.get_mut("Pointers").unwrap().offset = 24,
+                _ => changed[0].sequence = Some(7),
+            }
+            let changed = std::rc::Rc::new(changed);
+            assert!(!prepared.matches(&changed));
+            let changed_key = super::super::executor::SharedGraphKey {
+                operations: changed,
+                addresses: key.addresses.clone(),
+            };
+            assert_ne!(key.cmp(&changed_key), std::cmp::Ordering::Equal);
+        }
+    }
+
+    #[test]
     fn verification_graphs_cannot_alias_ordinary_batches() {
         use super::super::executor::BatchGraphKey;
         use orinfer_model_sdk::abi::BatchOperation;
@@ -2465,26 +2643,26 @@ mod graph_cache_tests {
             shared: None,
         };
         let mut cache = super::super::executor::BatchGraphCache::new();
-        cache.insert(ordinary.clone(), (ptr::null_mut(), 1, 1, 1));
+        cache.insert(ordinary.clone(), (ptr::null_mut(), 1, 1));
         assert!(!cache.contains_key(&verification));
-        cache.insert(verification, (ptr::null_mut(), 2, 1, 1));
+        cache.insert(verification, (ptr::null_mut(), 2, 1));
         assert_eq!(cache.len(), 2);
         assert!(cache.contains_key(&ordinary));
     }
     #[test]
-    fn node_budget_evicts_coldest_before_entry_limit() {
+    fn node_budget_evicts_least_recently_used_before_entry_limit() {
         let mut cache = super::super::executor::BatchGraphCache::new();
         let large = BATCH_GRAPH_NODES * 2 / 3;
         let small = BATCH_GRAPH_NODES / 4;
         let remaining = BATCH_GRAPH_NODES - large - small;
-        cache.insert(vec![(2, 1)].into(), (ptr::null_mut(), 8, large, 1));
-        cache.insert(vec![(0, 1)].into(), (ptr::null_mut(), 3, small, 1));
+        cache.insert(vec![(2, 1)].into(), (ptr::null_mut(), 8, large));
+        cache.insert(vec![(0, 1)].into(), (ptr::null_mut(), 3, small));
         assert_eq!(batch_graph_victim(&cache, remaining), None);
         assert_eq!(
             batch_graph_victim(&cache, remaining + 1),
             Some(vec![(0, 1)].into())
         );
-        cache.get_mut(&vec![(0, 1)].into()).unwrap().3 = 10;
+        cache.get_mut(&vec![(0, 1)].into()).unwrap().1 = 10;
         assert_eq!(
             batch_graph_victim(&cache, remaining + 1),
             Some(vec![(2, 1)].into())
@@ -2495,8 +2673,24 @@ mod graph_cache_tests {
     #[test]
     fn entry_limit_bounds_small_graphs() {
         let cache = (0..16)
-            .map(|slot| (vec![(slot, 1)].into(), (ptr::null_mut(), slot as u64, 1, 1)))
+            .map(|slot| (vec![(slot, 1)].into(), (ptr::null_mut(), slot as u64, 1)))
             .collect();
         assert_eq!(batch_graph_victim(&cache, 1), Some(vec![(0, 1)].into()));
+    }
+    #[test]
+    fn commit_graph_shape_counts_owners_while_target_counts_token_rows() {
+        use orinfer_model_sdk::abi::BatchOperation;
+        assert_eq!(
+            packet_graph_rows(BatchOperation::Commit, &[(7, 3), (31, 8)]),
+            2
+        );
+        assert_eq!(
+            packet_graph_rows(BatchOperation::Commit, &[(2, 2), (19, 4)]),
+            2
+        );
+        assert_eq!(
+            packet_graph_rows(BatchOperation::Verification, &[(7, 3), (31, 8)]),
+            11
+        );
     }
 }

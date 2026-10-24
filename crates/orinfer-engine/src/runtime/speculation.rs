@@ -51,7 +51,7 @@ impl ModelRuntime {
         self.launch_rows(&plan.program, tokens, phase)
     }
     pub(super) fn mtp_warm(
-        &self,
+        &mut self,
         spec: &crate::mtp::Spec,
         shifted_ids: &[u32],
         cancelled: &impl Fn() -> bool,
@@ -60,27 +60,59 @@ impl ModelRuntime {
         self.mtp_warm_state(spec, shifted_ids, cancelled, phase, true)
     }
     pub(super) fn mtp_warm_state(
-        &self,
+        &mut self,
         spec: &crate::mtp::Spec,
         shifted_ids: &[u32],
         cancelled: &impl Fn() -> bool,
         phase: ExecutionPhase,
         produce_head: bool,
     ) -> Result<()> {
+        let owner = spec
+            .packet_table
+            .as_ref()
+            .and_then(|_| self.execution.active_request_slot());
+        let capacity = spec
+            .batch_warm_capacity
+            .max(spec.batch_draft_profiles.last().copied().unwrap_or(0));
         let mut offset = 0;
         while offset < shifted_ids.len() {
             if cancelled() {
                 return Err("Request cancelled during MTP warm/refresh".into());
             }
             let remaining = shifted_ids.len() - offset;
-            let (plan, tokens) = spec.warm_plan(remaining)?;
+            let (plan, tokens) = spec.warm_plan(if owner.is_some() {
+                remaining.min(capacity)
+            } else {
+                remaining
+            })?;
             let ids = &shifted_ids[offset..offset + tokens];
             self.upload_ids(&spec.input, ids)?;
             self.prepare_program_inputs(&plan.program, ids, &[])?;
-            self.launch_rows(&plan.program, tokens, phase)?;
+            if let Some(slot) = owner {
+                // Preparation publishes the logical length before KV mapping.
+                // Prefill, prefix bridges and decode refresh share the same
+                // private kernels and stable-address packet implementation.
+                self.execution
+                    .ensure_sequence_program(slot, &plan.program)?;
+                self.execute_spec_packet_phase(
+                    &[orinfer_model_sdk::architecture::BatchSegment { slot, tokens }],
+                    orinfer_model_sdk::abi::BatchOperation::Warm,
+                    phase,
+                )?;
+            } else {
+                self.launch_rows(&plan.program, tokens, phase)?;
+            }
             offset += tokens;
             if produce_head && offset == shifted_ids.len() {
-                self.launch_rows(&plan.head_program, 1, phase)?;
+                if let Some(slot) = owner {
+                    self.execute_spec_packet_phase(
+                        &[orinfer_model_sdk::architecture::BatchSegment { slot, tokens: 1 }],
+                        orinfer_model_sdk::abi::BatchOperation::DraftHead,
+                        phase,
+                    )?;
+                } else {
+                    self.launch_rows(&plan.head_program, 1, phase)?;
+                }
             }
         }
         Ok(())

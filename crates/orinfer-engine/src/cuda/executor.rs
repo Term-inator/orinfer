@@ -23,14 +23,29 @@ impl BatchGraphKey {
         self.segments.iter()
     }
 }
-pub(super) type BatchGraphCache = BTreeMap<BatchGraphKey, (Handle, u64, usize, u64)>;
+pub(super) type BatchGraphCache = BTreeMap<BatchGraphKey, (Handle, u64, usize)>;
 
 /// Shared pieces are keyed by program and resolved views, never membership.
 /// Their session-owned addresses stay fixed; request state uses indirect tables.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SharedGraphKey {
-    pub operations: Vec<crate::execution::Invocation>,
+    pub operations: std::rc::Rc<Vec<crate::execution::Invocation>>,
     pub addresses: Vec<u64>,
+}
+impl Ord for SharedGraphKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let operations = if std::rc::Rc::ptr_eq(&self.operations, &other.operations) {
+            std::cmp::Ordering::Equal
+        } else {
+            self.operations.cmp(&other.operations)
+        };
+        operations.then_with(|| self.addresses.cmp(&other.addresses))
+    }
+}
+impl PartialOrd for SharedGraphKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 pub(super) type SharedGraphCache = BTreeMap<SharedGraphKey, (Handle, u64)>;
 
@@ -572,22 +587,56 @@ impl Executor {
             }
         }
         drop(weights);
-        let t = Instant::now();
-        let upload_stats = super::weight_upload::upload(&s, uploads, load_workers)?;
+        let mut catalog = None;
+        let mut functions = BTreeMap::new();
+        let mut pending_modules = manifest
+            .kernels
+            .iter()
+            .filter(|k| preload.contains(&k.name))
+            .peekable();
+        let mut initialization_s = 0.;
+        let upload_stats;
+        {
+            let mut initialize = || -> Result<bool> {
+                if catalog.is_some() && pending_modules.peek().is_none() {
+                    return Ok(false);
+                }
+                let at = Instant::now();
+                if catalog.is_none() {
+                    let assets_at = Instant::now();
+                    catalog = Some(super::kernels::Catalog::new(
+                        &s,
+                        kernel_base,
+                        &manifest.kernels,
+                    )?);
+                    load_stages.kernel_assets_s = assets_at.elapsed().as_secs_f64();
+                }
+                let worked = if let Some(kernel) = pending_modules.next() {
+                    let function = catalog.as_mut().unwrap().resolve(&s, kernel)?;
+                    functions.insert(kernel.name.clone(), function);
+                    true
+                } else {
+                    false
+                };
+                initialization_s += at.elapsed().as_secs_f64();
+                Ok(worked)
+            };
+            let t = Instant::now();
+            upload_stats =
+                super::weight_upload::upload_with_idle(&s, uploads, load_workers, &mut initialize)?;
+            weight_upload_s += (t.elapsed().as_secs_f64() - upload_stats.idle_work_s).max(0.);
+            // Empty/small models may finish reading before all modules load.
+            // Complete initialization on the same CUDA owner before execution.
+            while initialize()? {}
+        }
         load_stages.weight_read_wait_s = upload_stats.read_wait_s;
         load_stages.weight_dma_wait_s = upload_stats.dma_wait_s;
         load_stages.weight_upload_chunks = upload_stats.chunks;
-        weight_upload_s += t.elapsed().as_secs_f64();
+        let catalog = catalog.ok_or("Missing initialized kernel catalog")?;
         let module_started = Instant::now();
-        let mut catalog = super::kernels::Catalog::new(&s, kernel_base, &manifest.kernels)?;
-        load_stages.kernel_assets_s = module_started.elapsed().as_secs_f64();
         let mut launches = BTreeMap::new();
         for k in &manifest.kernels {
-            let function = if preload.contains(&k.name) {
-                Some(catalog.resolve(&s, k)?)
-            } else {
-                None
-            };
+            let function = functions.remove(&k.name);
             let values = k
                 .args
                 .iter()
@@ -615,7 +664,7 @@ impl Executor {
         }
         let preloaded_modules = catalog.loaded_modules();
         let registered_modules = catalog.registered_modules();
-        let module_load_bind_s = module_started.elapsed().as_secs_f64();
+        let module_load_bind_s = initialization_s + module_started.elapsed().as_secs_f64();
         let sync_started = Instant::now();
         // SAFETY: Flush all default-stream uploads and workspace initialization
         // before capture on a nonblocking stream. No allocation occurs in graphs.

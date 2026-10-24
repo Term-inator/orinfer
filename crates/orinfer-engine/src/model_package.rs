@@ -53,9 +53,9 @@ type CachedBatch = (
     std::rc::Rc<Vec<Invocation>>,
     std::rc::Rc<abi::StateBindings>,
 );
-type PlanCache = std::cell::RefCell<
-    std::collections::VecDeque<(abi::BatchOperation, Vec<(usize, usize)>, CachedBatch, usize)>,
->;
+type PlanEntries =
+    std::collections::VecDeque<(abi::BatchOperation, Vec<(usize, usize)>, CachedBatch, usize)>;
+type PlanCache = std::cell::RefCell<PlanEntries>;
 
 pub(crate) struct ModelPackage {
     handle: *mut c_void,
@@ -69,6 +69,7 @@ pub(crate) struct ModelPackage {
     batch_capabilities:
         std::cell::RefCell<std::collections::VecDeque<(abi::BatchOperation, Vec<usize>, bool)>>,
     kernel_buffers: BTreeMap<String, Vec<String>>,
+    indirect_mtp: bool,
 }
 impl ModelPackage {
     fn open(path: &Path, image: &[u8]) -> Result<Self> {
@@ -101,6 +102,7 @@ impl ModelPackage {
             batch_plans: Default::default(),
             batch_capabilities: Default::default(),
             kernel_buffers: Default::default(),
+            indirect_mtp: false,
         })
     }
     fn describe(&self) -> Result<abi::PackageInfo> {
@@ -195,6 +197,11 @@ impl ModelPackage {
         if let Some(catalog) = &request.catalog {
             model.export_execution(catalog, &mut plan.metadata)?;
         }
+        model.indirect_mtp = plan
+            .metadata
+            .mtp
+            .as_ref()
+            .is_some_and(|s| s.packet_table.is_some());
         for kernel in &plan.metadata.kernels {
             let mut buffers: Vec<_> = kernel
                 .args
@@ -524,6 +531,28 @@ impl ModelPackage {
             cache.push_back(entry);
             return Ok(result);
         }
+        // The packet-table contract makes calls a function of phase and exact
+        // segment lengths. A new owner cohort needs fresh bindings, not a new
+        // native plan plus a decode of thousands of identical commands.
+        if self.indirect_mtp && operation != abi::BatchOperation::Ordinary {
+            let shaped = cache.iter().find_map(|(kind, previous, (plan, _), bytes)| {
+                (*kind == operation
+                    && previous.len() == key.len()
+                    && previous.iter().zip(&key).all(|(a, b)| a.1 == b.1)
+                    && plan.iter().all(|call| call.sequence.is_none()))
+                .then(|| (std::rc::Rc::clone(plan), *bytes))
+            });
+            if let Some((plan, bytes)) = shaped {
+                let (commands, bindings) = self.batch_operation(segments, operation, false)?;
+                if !commands.is_empty() {
+                    return Err("Bindings-only packet returned execution commands".into());
+                }
+                let result = (plan, std::rc::Rc::new(bindings));
+                return Ok(Self::retain_batch(
+                    &mut cache, operation, key, result, bytes,
+                ));
+            }
+        }
         let (plan, bindings) = self.batch_operation(segments, operation, true)?;
         let bytes: usize = plan
             .iter()
@@ -550,7 +579,33 @@ impl ModelPackage {
                         .sum::<usize>()
             })
             .sum();
-        let result = (std::rc::Rc::new(plan), std::rc::Rc::new(bindings));
+        // Owner-independent calls can share their immutable plan while each
+        // membership retains its own state bindings. Keep phase identity exact.
+        let shared = plan
+            .iter()
+            .all(|call| call.sequence.is_none())
+            .then(|| {
+                cache.iter().find_map(|(kind, _, (cached, _), _)| {
+                    (*kind == operation && cached.as_slice() == plan)
+                        .then(|| std::rc::Rc::clone(cached))
+                })
+            })
+            .flatten();
+        let result = (
+            shared.unwrap_or_else(|| std::rc::Rc::new(plan)),
+            std::rc::Rc::new(bindings),
+        );
+        Ok(Self::retain_batch(
+            &mut cache, operation, key, result, bytes,
+        ))
+    }
+    fn retain_batch(
+        cache: &mut PlanEntries,
+        operation: abi::BatchOperation,
+        key: Vec<(usize, usize)>,
+        result: CachedBatch,
+        bytes: usize,
+    ) -> CachedBatch {
         const BUDGET: usize = 16 << 20;
         if bytes <= BUDGET {
             while cache.len() >= 32
@@ -560,7 +615,7 @@ impl ModelPackage {
             }
             cache.push_back((operation, key, result.clone(), bytes));
         }
-        Ok(result)
+        result
     }
     pub(crate) fn state_bindings(
         &self,
@@ -910,6 +965,70 @@ mod tests {
         assert_eq!(a[0].sequence, Some(7));
         assert_eq!(a[0].views["Input"].offset, 128);
         assert_eq!(a[0].launch.as_ref().unwrap().arguments, [(2, 3)]);
+    }
+    #[test]
+    fn indirect_packet_shape_reuses_commands_and_refreshes_membership_bindings() {
+        let (root, spec, request) = fixture();
+        let (mut model, _) = ModelPackage::create(&root, &spec, request).unwrap();
+        let phase = abi::BatchOperation::Verification;
+        let initial = [
+            BatchSegment { slot: 0, tokens: 2 },
+            BatchSegment { slot: 3, tokens: 4 },
+        ];
+        let (commands, old_bindings) = model.cached_batch(&initial, phase).unwrap();
+        // Install an owner-independent fixture plan, as certified by a real
+        // packet-table adapter; the C fixture returns fresh owner bindings.
+        let mut commands = commands.as_ref().clone();
+        commands[0].sequence = None;
+        let commands = std::rc::Rc::new(commands);
+        model.batch_plans.borrow_mut().back_mut().unwrap().2.0 = commands.clone();
+        model.indirect_mtp = true;
+        let replacement = [
+            BatchSegment {
+                slot: 11,
+                tokens: 2,
+            },
+            BatchSegment { slot: 9, tokens: 4 },
+        ];
+        let (reused, new_bindings) = model.cached_batch(&replacement, phase).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&commands, &reused));
+        assert!(!std::rc::Rc::ptr_eq(&old_bindings, &new_bindings));
+        assert_eq!(old_bindings[1], Some((0, "PrivateState".into())));
+        assert_eq!(new_bindings[1], Some((11, "PrivateState".into())));
+        for (lengths, operation) in [
+            ([2, 3], phase),
+            ([4, 2], phase),
+            ([2, 4], abi::BatchOperation::Commit),
+            ([2, 4], abi::BatchOperation::MixedRows { prefills: 1 }),
+        ] {
+            let segments = std::array::from_fn::<_, 2, _>(|i| BatchSegment {
+                slot: replacement[i].slot,
+                tokens: lengths[i],
+            });
+            let (different, _) = model.cached_batch(&segments, operation).unwrap();
+            assert!(!std::rc::Rc::ptr_eq(&commands, &different));
+        }
+        // Without the declared table contract, exact membership remains part
+        // of plan identity even when a previous plan happens to be shared.
+        model.indirect_mtp = false;
+        let (different, _) = model
+            .cached_batch(
+                &[
+                    BatchSegment {
+                        slot: 12,
+                        tokens: 2,
+                    },
+                    BatchSegment {
+                        slot: 13,
+                        tokens: 4,
+                    },
+                ],
+                phase,
+            )
+            .unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&commands, &different));
+        drop(model);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn native_bulk_export_preserves_parameter_bits_and_program_commands() {

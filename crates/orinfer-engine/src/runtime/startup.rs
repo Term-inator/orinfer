@@ -4,18 +4,7 @@ pub(super) fn kernels(
     package: &crate::model_package::ModelPackage,
 ) -> crate::artifact::Result<std::collections::BTreeSet<String>> {
     use std::collections::BTreeSet;
-    let programs = programs(manifest);
-    let mut kernels = BTreeSet::new();
-    for name in programs {
-        let ops = manifest
-            .programs
-            .get(&name)
-            .ok_or_else(|| format!("Missing startup program {name}"))?;
-        kernels.extend(ops.iter().filter_map(|op| match op {
-            crate::model::Operation::Kernel { name } => Some(name.clone()),
-            _ => None,
-        }));
-    }
+    let mut kernels = program_kernels(manifest)?;
     if !manifest.batch_profiles.is_empty() {
         let mut shapes: BTreeSet<_> = manifest
             .batch_profiles
@@ -36,6 +25,61 @@ pub(super) fn kernels(
                     _ => None,
                 }
             }));
+        }
+    }
+    Ok(kernels)
+}
+
+fn program_kernels(
+    manifest: &crate::model::Manifest,
+) -> crate::artifact::Result<std::collections::BTreeSet<String>> {
+    use crate::model::Operation;
+    use std::collections::BTreeSet;
+    let mut kernels = BTreeSet::new();
+    let mut packets = BTreeSet::new();
+    let table = manifest.mtp.as_ref().and_then(|spec| {
+        let table = spec.packet_table.as_ref()?;
+        packets.insert(spec.draft_program.as_str());
+        for plan in &spec.warm_plans {
+            packets.extend([plan.program.as_str(), plan.head_program.as_str()]);
+        }
+        for plan in &spec.verification_plans {
+            packets.extend([plan.program.as_str(), plan.restore_program.as_str()]);
+        }
+        Some(table)
+    });
+    for program in programs(manifest) {
+        let ops = manifest
+            .programs
+            .get(&program)
+            .ok_or_else(|| format!("Missing startup program {program}"))?;
+        let indirect = table.filter(|_| packets.contains(program.as_str()));
+        for operation in ops {
+            match operation {
+                Operation::Kernel { name } => {
+                    kernels.insert(
+                        indirect
+                            .and_then(|table| table.kernels.get(name))
+                            .unwrap_or(name)
+                            .clone(),
+                    );
+                }
+                Operation::Copy {
+                    source,
+                    destination,
+                    ..
+                } => {
+                    if let Some(copy) = indirect.and_then(|table| {
+                        table
+                            .copies
+                            .iter()
+                            .find(|copy| &copy.source == source && &copy.destination == destination)
+                    }) {
+                        kernels.insert(copy.kernel.clone());
+                    }
+                }
+                _ => {}
+            }
         }
     }
     Ok(kernels)
@@ -94,6 +138,65 @@ fn programs(manifest: &crate::model::Manifest) -> std::collections::BTreeSet<Str
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn packet_preload_uses_indirect_kernels_and_copies_and_retains_direct_consumers() {
+        let mut manifest: crate::model::Manifest = serde_json::from_str(r#"{
+            "schema_version":1,"target":"sm_87","model":"unknown-family","chunk_tokens":1,
+            "max_context":64,"vocab":32,"toolchain":{},"buffers":[],"reset_buffers":[],
+            "input":"i","token":"t","status":"s","logits":"l","position":"p",
+            "weight_bytes":0,"weight_parameters":1,"weight_scope":"test",
+            "programs":{
+                "decode":[{"kind":"kernel","name":"common_private"}],
+                "head":[{"kind":"kernel","name":"shared_head"}],
+                "prefill":[{"kind":"kernel","name":"shared_prefill"}],
+                "draft":[{"kind":"kernel","name":"private_draft"}],
+                "warm":[{"kind":"kernel","name":"private_warm"}],
+                "warm_head":[{"kind":"copy","source":"Output","destination":"PrivateOutput","bytes":4}],
+                "verify":[{"kind":"kernel","name":"common_private"}],
+                "restore":[{"kind":"kernel","name":"private_restore"}],
+                "capture":[{"kind":"kernel","name":"private_capture"}],
+                "snapshot":[{"kind":"kernel","name":"private_snapshot"}]
+            },
+            "mtp":{
+                "position":"p","input":"i","token":"t","status":"s","verification_tokens":"v",
+                "verification_status":"vs","draft_logits":"d","verification_logits":"vl",
+                "accepted_inputs":"a","target_length":"tl","draft_program":"draft",
+                "draft_snapshot_program":"snapshot","default_verification_tokens":2,
+                "warm_plans":[{"tokens":1,"program":"warm","head_program":"warm_head"}],
+                "capture_plans":[{"tokens":1,"program":"capture"}],
+                "verification_plans":[{"tokens":2,"program":"verify","restore_program":"restore","capture_program":"capture"}],
+                "packet_table":{
+                    "buffer":"Addresses","columns":["State"],
+                    "kernels":{"common_private":"packet_common","private_draft":"packet_draft",
+                        "private_warm":"packet_warm","private_restore":"packet_restore",
+                        "private_capture":"packet_capture","private_snapshot":"packet_snapshot"},
+                    "copies":[{"source":"Output","destination":"PrivateOutput","kernel":"packet_copy","row_bytes":4}]
+                }
+            }
+        }"#).unwrap();
+        assert_eq!(
+            program_kernels(&manifest).unwrap(),
+            [
+                "common_private",
+                "shared_head",
+                "shared_prefill",
+                "packet_common",
+                "packet_draft",
+                "packet_warm",
+                "packet_restore",
+                "packet_copy",
+                "private_capture",
+                "private_snapshot",
+            ]
+            .map(str::to_owned)
+            .into_iter()
+            .collect()
+        );
+        manifest.mtp.as_mut().unwrap().packet_table = None;
+        let direct = program_kernels(&manifest).unwrap();
+        assert!(direct.contains("private_draft") && direct.contains("private_warm"));
+        assert!(!direct.iter().any(|name| name.starts_with("packet_")));
+    }
     #[test]
     fn common_profiles_and_smallest_fallback_keep_architecture_program_names() {
         let mut manifest: crate::model::Manifest = serde_json::from_value(json!({

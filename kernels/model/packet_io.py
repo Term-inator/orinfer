@@ -58,3 +58,24 @@ def outputs(vocab):
                 write_selected(Pair, Token, Status, 0)
 
     return kernel
+
+
+@orin_jit
+def copy_rows(width):
+    rows = T.dynamic("m")
+
+    @T.prim_func
+    def kernel(
+        Source: T.Tensor((rows, width), T.uint8), Destination: T.Tensor((rows, width), T.uint8)
+    ):
+        with T.Kernel(T.ceildiv(rows * width, 256), threads=128) as block:
+            for i in T.Parallel(256):
+                offset = block * 256 + i
+                if offset < rows * width:
+                    Destination[offset // width, offset % width] = Source[
+                        offset // width, offset % width
+                    ]
+
+    from kernels.model.rows import explicit_rows
+
+    return explicit_rows(kernel)

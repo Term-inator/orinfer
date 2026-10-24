@@ -24,7 +24,32 @@ pub(super) struct Upload {
 pub(super) struct Statistics {
     pub read_wait_s: f64,
     pub dma_wait_s: f64,
+    pub idle_work_s: f64,
     pub chunks: usize,
+}
+
+/// Ready reads have priority. While disk readers are busy, the CUDA owner may
+/// finish bounded initialization work; no CUDA handle crosses into a reader.
+fn receive<T>(
+    completed: &mpsc::Receiver<T>,
+    idle: &mut dyn FnMut() -> Result<bool>,
+) -> Result<(T, f64, f64)> {
+    let mut idle_s = 0.;
+    loop {
+        match completed.try_recv() {
+            Ok(value) => return Ok((value, 0., idle_s)),
+            Err(mpsc::TryRecvError::Disconnected) => return Err("Weight readers stopped".into()),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let at = Instant::now();
+        let worked = idle()?;
+        idle_s += at.elapsed().as_secs_f64();
+        if !worked {
+            let at = Instant::now();
+            let value = completed.recv().map_err(|_| "Weight readers stopped")?;
+            return Ok((value, at.elapsed().as_secs_f64(), idle_s));
+        }
+    }
 }
 
 struct ReadFile {
@@ -38,8 +63,10 @@ struct Reader {
 }
 
 struct Slot {
+    memory: Option<memmap2::MmapMut>,
     pointer: *mut std::ffi::c_void,
     event: sys::CUevent,
+    registered: bool,
 }
 struct Staging<'a> {
     session: &'a Session,
@@ -58,9 +85,14 @@ impl Drop for Staging<'_> {
                     "CUDA weight staging cleanup: synchronize error {}",
                     code as i32
                 );
+                for slot in &mut self.slots {
+                    if let Some(memory) = slot.memory.take() {
+                        std::mem::forget(memory);
+                    }
+                }
                 return;
             }
-            for slot in &self.slots {
+            for slot in &mut self.slots {
                 if !slot.event.is_null()
                     && let Err(error) = check(
                         sys::cuEventDestroy_v2(slot.event),
@@ -69,11 +101,16 @@ impl Drop for Staging<'_> {
                 {
                     eprintln!("CUDA weight staging cleanup: {error}");
                 }
-                if let Err(error) = check(
-                    sys::cuMemFreeHost(slot.pointer),
-                    "weight staging memory cleanup",
-                ) {
+                if slot.registered
+                    && let Err(error) = check(
+                        sys::cuMemHostUnregister(slot.pointer),
+                        "weight staging unregister",
+                    )
+                {
                     eprintln!("CUDA weight staging cleanup: {error}");
+                    if let Some(memory) = slot.memory.take() {
+                        std::mem::forget(memory);
+                    }
                 }
             }
         }
@@ -86,19 +123,25 @@ impl<'a> Staging<'a> {
             slots: Vec::with_capacity(count),
         };
         for _ in 0..count {
-            let mut pointer = ptr::null_mut();
-            // SAFETY: Live owner context; allocation is owned before another
-            // fallible call and will only be freed by this CUDA thread.
-            unsafe {
-                check(
-                    sys::cuMemHostAlloc(&mut pointer, SLOT_BYTES, 0),
-                    "weight staging allocation",
-                )?;
-            }
+            // Ordinary page-aligned CPU mappings keep direct file I/O on the
+            // normal page path. Register once for the existing asynchronous DMA.
+            let mut memory = memmap2::MmapMut::map_anon(SLOT_BYTES).map_err(|e| e.to_string())?;
+            let pointer = memory.as_mut_ptr().cast();
             pool.slots.push(Slot {
+                memory: Some(memory),
                 pointer,
                 event: ptr::null_mut(),
+                registered: false,
             });
+            // SAFETY: The pool owns this complete page-aligned mapping and
+            // retains it until readers join, DMA completes and registration ends.
+            unsafe {
+                check(
+                    sys::cuMemHostRegister_v2(pointer, SLOT_BYTES, 0),
+                    "weight staging register",
+                )?;
+            }
+            pool.slots.last_mut().unwrap().registered = true;
             // SAFETY: Event immediately belongs to the pool; timing is disabled.
             unsafe {
                 check(
@@ -222,8 +265,17 @@ impl Reader {
 
 pub(super) fn upload(
     session: &Session,
+    uploads: Vec<Upload>,
+    workers: usize,
+) -> Result<Statistics> {
+    upload_with_idle(session, uploads, workers, &mut || Ok(false))
+}
+
+pub(super) fn upload_with_idle(
+    session: &Session,
     mut uploads: Vec<Upload>,
     workers: usize,
+    idle: &mut dyn FnMut() -> Result<bool>,
 ) -> Result<Statistics> {
     if !(1..=32).contains(&workers) {
         return Err("Weight reader count must be 1..32".into());
@@ -339,9 +391,9 @@ pub(super) fn upload(
                     break;
                 }
                 debug_assert_ne!(reading, 0);
-                let at = Instant::now();
-                let (job, result) = done_rx.recv().map_err(|_| "Weight readers stopped")?;
-                statistics.read_wait_s += at.elapsed().as_secs_f64();
+                let ((job, result), wait_s, idle_s) = receive(&done_rx, idle)?;
+                statistics.read_wait_s += wait_s;
+                statistics.idle_work_s += idle_s;
                 reading -= 1;
                 let skip = result?;
                 let slot = &pool.slots[job.slot];
@@ -382,6 +434,38 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn ready_reads_take_priority_and_initialization_errors_propagate() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(7).unwrap();
+        assert_eq!(
+            receive(&rx, &mut || panic!("ready read must not wait"))
+                .unwrap()
+                .0,
+            7
+        );
+        let mut calls = 0;
+        let (value, _, idle_s) = receive(&rx, &mut || {
+            calls += 1;
+            if calls == 3 {
+                tx.send(9).unwrap();
+            }
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!((value, calls), (9, 3));
+        assert!(idle_s >= 0.);
+        assert_eq!(
+            receive(&rx, &mut || Err("module initialization failed".into())).unwrap_err(),
+            "module initialization failed"
+        );
+        drop(tx);
+        assert_eq!(
+            receive(&rx, &mut || panic!("closed readers must stop")).unwrap_err(),
+            "Weight readers stopped"
+        );
+    }
 
     #[test]
     fn direct_reads_preserve_header_offsets_chunks_and_eof_tails() {
@@ -483,7 +567,7 @@ mod gpu_tests {
                             destination
                         }
                     ],
-                    workers
+                    workers,
                 )
                 .is_err()
             );

@@ -7,6 +7,144 @@ use crate::{
 use orinfer_model_sdk::{abi::StateBindings, architecture::BatchSegment};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Keep speculative packet addresses stable while rebinding each owner in data.
+/// Existing causal/commit table bindings precede the boundary table's bindings.
+pub(crate) fn indirect(
+    m: &Manifest,
+    segments: &[BatchSegment],
+    contracts: &[crate::artifact::Kernel],
+    (mut plan, mut bindings): orinfer_model_sdk::abi::BatchPlan,
+) -> Result<orinfer_model_sdk::abi::BatchPlan> {
+    let Some(table) = m.mtp.as_ref().and_then(|s| s.packet_table.as_ref()) else {
+        return Ok((plan, bindings));
+    };
+    let stride = table
+        .columns
+        .len()
+        .checked_mul(8)
+        .ok_or("Packet table stride overflow")?;
+    let owners: BTreeMap<_, _> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.slot, i))
+        .collect();
+    let kernels: BTreeMap<_, _> = contracts.iter().map(|k| (k.name.as_str(), k)).collect();
+    let arguments = |name: &str| -> Result<Vec<crate::artifact::Argument>> {
+        if let Some(kernel) = kernels.get(name) {
+            Ok(kernel.args.clone())
+        } else {
+            crate::bindings::kernel_arguments(name)
+        }
+    };
+    for call in &mut plan {
+        let Some(owner) = call.sequence else { continue };
+        let lane = *owners
+            .get(&owner)
+            .ok_or("Packet invocation owner is absent")?;
+        let mut indirect = false;
+        match &call.operation {
+            Operation::Kernel { name } => {
+                if let Some(target) = table.kernels.get(name) {
+                    let scalar_indices = |args: &[crate::artifact::Argument]| {
+                        args.iter()
+                            .enumerate()
+                            .filter_map(|(i, a)| {
+                                matches!(a, crate::artifact::Argument::I32 { .. }).then_some(i)
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let mapping = if let Some(mapping) = table.scalar_arguments.get(name) {
+                        mapping.clone()
+                    } else {
+                        let before = scalar_indices(&arguments(name)?);
+                        let after = scalar_indices(&arguments(target)?);
+                        if before.len() != after.len() {
+                            return Err("Missing indirect scalar ABI mapping".into());
+                        }
+                        before.into_iter().zip(after).collect()
+                    };
+                    let target_arguments = arguments(target)?;
+                    if !target_arguments.iter().any(|a| matches!(a,
+                        crate::artifact::Argument::Buffer { name } | crate::artifact::Argument::BufferSlice { name, .. } if name == &table.buffer))
+                        || target_arguments.iter().any(|a| matches!(a,
+                        crate::artifact::Argument::Buffer { name } | crate::artifact::Argument::BufferSlice { name, .. } if table.columns.contains(name)))
+                        || mapping.iter().any(|(_,index)| !matches!(target_arguments.get(*index),Some(crate::artifact::Argument::I32{..})))
+                    { return Err("Invalid indirect packet ABI".into()); }
+                    if let Some(launch) = &mut call.launch {
+                        for (index, _) in &mut launch.arguments {
+                            *index = mapping
+                                .iter()
+                                .find(|(original, _)| original == index)
+                                .map(|(_, target)| *target)
+                                .ok_or("Unknown packet scalar")?;
+                        }
+                    }
+                    call.operation = Operation::Kernel {
+                        name: target.clone(),
+                    };
+                    indirect = true;
+                } else {
+                    if arguments(name)?.iter().any(|a| match a {
+                        crate::artifact::Argument::Buffer { name }
+                        | crate::artifact::Argument::BufferSlice { name, .. } => {
+                            let target = call
+                                .views
+                                .get(name)
+                                .map_or(name.as_str(), |v| v.buffer.as_str());
+                            table.columns.iter().any(|column| column == target)
+                        }
+                        _ => false,
+                    }) {
+                        return Err(format!("Missing indirect packet implementation {name}"));
+                    }
+                }
+            }
+            Operation::Copy {
+                source,
+                destination,
+                bytes,
+            } => {
+                let copy = table
+                    .copies
+                    .iter()
+                    .find(|c| &c.source == source && &c.destination == destination)
+                    .ok_or("Missing indirect packet copy")?;
+                if copy.row_bytes == 0 || !bytes.is_multiple_of(copy.row_bytes) {
+                    return Err("Unaligned indirect packet copy".into());
+                }
+                call.launch = Some(
+                    m.dynamic_batch_kernels
+                        .get(&copy.kernel)
+                        .ok_or("Missing packet copy launch")?
+                        .launch(bytes / copy.row_bytes)?,
+                );
+                call.operation = Operation::Kernel {
+                    name: copy.kernel.clone(),
+                };
+                indirect = true;
+            }
+            Operation::Zero { .. } => {
+                return Err("Private packet zero requires an indirect implementation".into());
+            }
+        }
+        if indirect {
+            call.views.insert(
+                table.buffer.clone(),
+                BufferView {
+                    buffer: table.buffer.clone(),
+                    offset: lane
+                        .checked_mul(stride)
+                        .ok_or("Packet table view overflow")?,
+                },
+            );
+        }
+        call.sequence = None;
+    }
+    let roles: Vec<_> = table.columns.iter().cloned().map(Some).collect();
+    bindings.extend(private_bindings(segments, segments.len(), &roles));
+    Ok((plan, bindings))
+}
+
 /// Contiguous live rows, independent of the model's computation or state layout.
 pub(crate) struct Rows {
     pub starts: Vec<usize>,

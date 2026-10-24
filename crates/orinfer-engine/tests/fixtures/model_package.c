@@ -46,10 +46,11 @@ static void free_visual(OrinferVisual v) {(void)v;}
 static const OrinferArgument args[]={{2,3}};
 static const OrinferView views[]={{SPAN("Input"),SPAN("Scratch"),128}};
 static const OrinferCommand commands[]={{0,SPAN("projection"),SPAN(""),0,7,1,{3,1,1},args,1,views,1}};
-static const OrinferBinding bindings[]={{0,0,SPAN("")},{1,7,SPAN("PrivateState")}};
+static OrinferBinding bindings[]={{0,0,SPAN("")},{1,7,SPAN("PrivateState")}};
 static int32_t batch(void *model,const OrinferSegment *s,size_t n,uint32_t plan,OrinferBatch *out,OrinferOwnedBytes *error) {
-    (void)model;(void)s;(void)n; memset(out,0,sizeof(*out));
-    out->commands=commands;out->command_count=plan?1:0;out->bindings=bindings;out->binding_count=2;
+    (void)model; memset(out,0,sizeof(*out));
+    bindings[1].sequence=n?s[0].slot:7;
+    out->commands=commands;out->command_count=(plan & ORINFER_BATCH_INCLUDE_PLAN)?1:0;out->bindings=bindings;out->binding_count=2;
     return bytes(error,"");
 }
 static int32_t visual(void *model,const uint32_t *t,size_t n,const OrinferImageGrid *g,size_t m,size_t c,OrinferVisual *out,OrinferOwnedBytes *error) {

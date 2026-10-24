@@ -21,6 +21,131 @@ __device__ __forceinline__ void* orin_row_offset(const void* base, unsigned long
 """
 
 
+def indirect_parameters(function, columns, operands, offsets=None):
+    """Replace private pointer parameters, preserving the original launch and scalars.
+
+    The caller selects one owner by slicing the fixed pointer table. Shared
+    row pointers keep their original byte views; this wrapper adds no row axis.
+    """
+    offsets = offsets or {}
+    pointer_param = tir.Var("Pointers_handle", "handle")
+    pointers = tir.decl_buffer((len(columns),), "uint64", name="Pointers")
+    params, buffers, identities = [pointer_param], {pointer_param: pointers}, [None]
+    aliases, data, bindings, flat = {}, {}, [], {}
+    column_params = []
+    for param in function.params:
+        original = function.buffer_map.get(param)
+        operand = (
+            None
+            if original is None
+            else (original.name if original.name in operands else "live_" + original.name.lower())
+        )
+        if original is None or operand not in operands:
+            params.append(param)
+            identities.append(original.name if original is not None else param.name)
+            if original is not None:
+                buffers[param] = original
+            continue
+        pointer = tir.Var(
+            original.name + "_indirect", tvm.ir.PointerType(tvm.ir.PrimType(original.dtype))
+        )
+        if operands[operand] not in columns:
+            raise ValueError("Unknown indirect operand column")
+        column = tir.Var("column_" + operand, "int32")
+        column_params.append(column)
+        value = tir.call_extern(
+            "handle",
+            "orin_row_pointer",
+            tir.BufferLoad(pointers, [column]) + offsets.get(operand, 0),
+        )
+        alias = tir.decl_buffer(
+            original.shape,
+            original.dtype,
+            name=original.name,
+            data=pointer,
+            strides=original.strides,
+            elem_offset=original.elem_offset,
+            data_alignment=original.data_alignment,
+            offset_factor=original.offset_factor,
+        )
+        aliases[original] = alias
+        data[original.data] = pointer
+        bindings.extend([tir.Bind(pointer, value), tir.DeclBuffer(alias)])
+        flat[original.data] = tir.decl_buffer(
+            (math.prod(original.shape),), original.dtype, name=original.name + "_flat", data=pointer
+        )
+
+    def indirect_buffer(buffer):
+        if buffer not in aliases and buffer.data in data:
+            aliases[buffer] = tir.decl_buffer(
+                buffer.shape,
+                buffer.dtype,
+                name=buffer.name,
+                data=data[buffer.data],
+                strides=buffer.strides,
+                elem_offset=buffer.elem_offset,
+                data_alignment=buffer.data_alignment,
+                offset_factor=buffer.offset_factor,
+            )
+        return aliases.get(buffer, buffer)
+
+    def region(value):
+        return tir.BufferRegion(indirect_buffer(value.buffer), value.region)
+
+    def replace(node):
+        if (
+            isinstance(node, tir.Call)
+            and getattr(node.op, "name", "") == "tirx.tvm_access_ptr"
+            and node.args[1] in flat
+        ):
+            return tir.Call(
+                node.dtype,
+                tvm.ir.Op.get("tl.access_ptr"),
+                [tir.BufferLoad(flat[node.args[1]], [node.args[2]]), node.args[3], node.args[4]],
+            )
+        if isinstance(node, tir.BufferLoad) and node.buffer.data in data:
+            return tir.BufferLoad(indirect_buffer(node.buffer), node.indices, node.predicate)
+        if isinstance(node, tir.BufferStore) and node.buffer.data in data:
+            return tir.BufferStore(
+                indirect_buffer(node.buffer), node.value, node.indices, node.predicate
+            )
+        if isinstance(node, tir.DeclBuffer) and node.buffer.data in data:
+            return tir.DeclBuffer(indirect_buffer(node.buffer))
+        return None
+
+    def root(node):
+        if isinstance(node, tir.SBlock):
+            annotations = dict(node.annotations)
+            body = node.body
+            if node.name_hint == "tilelang_root":
+                annotations["pragma_import_c"] = (
+                    str(annotations.get("pragma_import_c", "")) + POINTER_SOURCE
+                )
+                body = tir.SeqStmt(bindings + [body])
+            return tir.SBlock(
+                node.iter_vars,
+                [region(value) for value in node.reads],
+                [region(value) for value in node.writes],
+                node.name_hint,
+                body,
+                node.init,
+                node.alloc_buffers,
+                [
+                    tir.MatchBufferRegion(indirect_buffer(value.buffer), region(value.source))
+                    for value in node.match_buffers
+                ],
+                annotations,
+            )
+        return None
+
+    body = tir.stmt_functor.ir_transform(function.body, None, replace)
+    body = tir.stmt_functor.substitute(body, data)
+    body = tir.stmt_functor.ir_transform(body, None, root)
+    params.extend(column_params)
+    identities.extend(param.name for param in column_params)
+    return tir.PrimFunc(params, body, function.ret_type, buffers, function.attrs), identities
+
+
 def independent_rows(
     function,
     rows,
