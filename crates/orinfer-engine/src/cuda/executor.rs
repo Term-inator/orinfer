@@ -434,6 +434,10 @@ impl Executor {
             - initial_workspace_reduction;
         let weight_budget = free
             .saturating_sub(nonweights)
+            // Deferred scratch saves startup allocation, not inference capacity.
+            // Keep its payload out of the hot weight set so the request reserve
+            // remains available for KV, mapping overhead and admission margin.
+            .saturating_sub(deferred_workspace_bytes)
             .saturating_sub(super::weight_cache::REQUEST_RESERVE);
         let weight_plan = if expert_plan.is_none() && prepared.expert_banks.is_empty() {
             super::weight_cache::Plan::new(
