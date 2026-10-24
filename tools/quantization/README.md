@@ -67,3 +67,15 @@ bash tools/operators/run.sh tools/quantization/check_e8p_q2.py artifacts/check-e
 ```
 
 Q2 输出使用独立目录，构建复用 `tools/model/qwen35/build.py`。生产基线以独立质量和完整请求验收结果为准。
+
+## Qwen MoE 主干 Q4、专家 Q2
+
+`qwen_moe_mix` 从同一原始 checkpoint 的已完成 Q4/Q2 转换中组合权重：普通主干、embedding/head 与视觉使用 Q4 转换，target 路由专家的码字和 scale 使用 Q2 转换，原有 W8/BF16 例外沿用 Q4 转换。工具验证完整源分片 hash、配置、来源版本、码表与旋转符号，流式复制张量字节并原子发布新目录；每个专家只保存一份编码，不读取原始浮点权重或重新量化。
+
+```bash
+.venv/bin/python -m tools.quantization.qwen_moe_mix \
+  --q4 Q4_CONVERTED_DIR --q2 Q2_CONVERTED_DIR \
+  --output artifacts/quantization/qwen-moe-dense-q4-experts-q2/converted
+```
+
+配置使用全局 `quant_method=orinfer_e8p_q4_int8` 与 `experts=e8p_q2`。共享 FFN 属于主干，路由专家单独声明精度；单级和两级 E8P 共享相同的基础码表与 selector 数据。原生构建及模型校验分别检查主干 U32 和专家 U16 的 K128 bank。质量恢复、显存和完整请求性能需要使用该新包独立测量。
