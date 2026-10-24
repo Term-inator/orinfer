@@ -1,6 +1,7 @@
 """Exact single-query arithmetic across short causal widths and owner packets."""
 
 import argparse
+from tools.build.target import CUDA_TARGET, COMPILER_PASSES
 import json
 from pathlib import Path
 
@@ -147,7 +148,8 @@ def main():
                     fn,
                     out_idx=[],
                     execution_backend="nvrtc",
-                    target={"kind": "cuda", "arch": "sm_87"},
+                    target=CUDA_TARGET,
+                    pass_configs=COMPILER_PASSES,
                 ),
                 names,
             )

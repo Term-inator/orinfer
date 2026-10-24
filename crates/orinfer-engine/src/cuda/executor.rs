@@ -344,18 +344,6 @@ impl Executor {
                 sum.checked_add(b.bytes()?)
                     .ok_or_else(|| "Expert weight sum overflow".to_string())
             })?;
-        let weight_layout =
-            super::weight_arena::ArenaLayout::new(manifest.buffers.iter().filter(|b| {
-                b.data.is_some()
-                    && b.access == crate::artifact::Access::Read
-                    && used.contains(b.name.as_str())
-                    && !expert_plan
-                        .as_ref()
-                        .is_some_and(|p| p.names.contains(&b.name))
-            }))?;
-        let capacity_bytes = capacity_bytes
-            .checked_add(weight_layout.padding_bytes)
-            .ok_or("Model allocation sum overflow")?;
         let deferred_workspace_bytes = manifest.buffers.iter().try_fold(0usize, |sum, b| {
             let existing = lazy.is_some_and(|kv| kv.prefill_workspace.contains_key(&b.name));
             sum.checked_add(if !existing && deferred_workspace(b, scopes[&b.name])? {
@@ -365,16 +353,6 @@ impl Executor {
             })
             .ok_or_else(|| "Workspace sum overflow".to_string())
         })?;
-        let buffer_bytes = capacity_bytes
-            - lazy_bytes
-            - unused_weights
-            - paged_bytes
-            - deferred_workspace_bytes
-            - manifest.buffers.iter().try_fold(0usize, |sum, b| {
-                Ok::<_, String>(
-                    sum + b.bytes()? - initial_buffer_bytes(manifest, b, scopes[&b.name])?,
-                )
-            })?;
         let init_started = Instant::now();
         let mut s = Session::new(Driver::load()?);
         let mut pointers = BTreeMap::new();
@@ -445,7 +423,15 @@ impl Executor {
                 n.checked_add(b.bytes()?)
                     .ok_or("Weight sum overflow".into())
             })?;
-        let nonweights = capacity_bytes - lazy_bytes - unused_weights - weight_bytes;
+        let initial_workspace_reduction = manifest.buffers.iter().try_fold(0usize, |sum, b| {
+            Ok::<_, String>(sum + b.bytes()? - initial_buffer_bytes(manifest, b, scopes[&b.name])?)
+        })?;
+        let nonweights = capacity_bytes
+            - lazy_bytes
+            - unused_weights
+            - weight_bytes
+            - deferred_workspace_bytes
+            - initial_workspace_reduction;
         let weight_budget = free
             .saturating_sub(nonweights)
             .saturating_sub(super::weight_cache::REQUEST_RESERVE);
@@ -485,6 +471,8 @@ impl Executor {
             - lazy_bytes
             - unused_weights
             - paged_bytes
+            - deferred_workspace_bytes
+            - initial_workspace_reduction
             - weight_plan.as_ref().map_or(0, |p| p.cold_bytes)
             + weight_plan.as_ref().map_or(0, |p| p.capacity);
         if buffer_bytes > free {

@@ -236,7 +236,7 @@ Flash Next 的 batch 包共享投影、MoE 路由、专家和输出头计算，G
 
 prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计费。有 decoder 时根据距上次提交 token 的时间决定下一轮工作；至少定期推进一个 prefill token，目标不可满足时计入 `prefill_progress_overrides`。`--target-tpot-ms` 是引擎提交 token 间隔的软目标；输出预算独立设置，视觉编码、缓存保存或冷启动可能使流式间隔超出该目标。`max_decode_gap_s` 和 `decode_budget_overruns` 记录引擎提交 token 的间隔，HTTP chunk 间隔需另行测量。
 
-实际活跃数还结合已测量的相邻 batch 耗时与吞吐决定，未知档位允许探索。Graph 首次遇到新成员组合时直接执行，重复出现且仍有输出预算时捕获；已有图可用于最后几步。共享计算段还可按算子、行数、视图和实际地址复用 Graph，私有状态段按请求执行，换成员前更新地址表。整批与共享段共用 12288 个操作节点的缓存预算；CPU 执行计划有独立的有界缓存，并只保留各算子实际使用的缓冲视图。`batch_execution.shared_graph_hits` 与 `shared_graph_captures` 报告共享段复用。`decode_only` 仍只在 decode/MTP 阶段使用 Graph，混合 prefill 的图需要 `full`。
+实际活跃数还结合已测量的相邻 batch 耗时与吞吐决定，未知档位允许探索。Graph 首次遇到新执行形状时直接执行，重复出现且仍有输出预算时捕获；已有图可用于最后几步。声明 MTP operand table 的包通过稳定地址表绑定请求私有状态，按操作、行数及 workspace 形状复用整批 Graph；换成员前更新表内容。共享计算段还可按算子、行数、视图和实际地址复用 Graph，其他私有状态段按请求执行，换成员前更新地址表。整批与共享段共用 12288 个操作节点的缓存预算，整批另限 16 条目，共享段另限 256 条目；按最近使用时间淘汰，成员或 MTP 阶段变化后可逐步替换旧工作集；CPU 执行计划有独立的有界缓存，并只保留各算子实际使用的缓冲视图。`batch_execution.shared_graph_hits` 与 `shared_graph_captures` 报告共享段复用。`decode_only` 仍只在 decode/MTP 阶段使用 Graph，混合 prefill 的图需要 `full`。
 
 模型包决定实际上下文容量，上限可配置为 262144 tokens。长提示分块计算，首次 dense attention 仍完整计算所需上下文。INT8 group-64 KV 包含 FP16 scale，CUDA VMM 按已执行位置映射物理页，同时保持 Graph 地址稳定；prefill 的单层 FP16 临时 KV workspace 可共享并按需增长。持续 GDN 状态保持 FP32。上下文扩展、KV 优化和验证见[模型构建](../tools/model/README.md)。
 

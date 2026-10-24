@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 from safetensors.numpy import load_file, save_file
 
-from tools.model.publication import file_hash
+from tools.build.files import file_hash
 from tools.quantization.qwen_moe_mix import compose
 
 

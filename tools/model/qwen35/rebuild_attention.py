@@ -5,6 +5,7 @@ are reused. Run through tools/operators/run.sh with the fixed compiler image.
 """
 
 import argparse
+from tools.build.target import CUDA_TARGET
 import hashlib
 import json
 from pathlib import Path
@@ -111,7 +112,7 @@ def rebuild(args):
         if geometry["head_group"] != qh // kvh:
             raise ValueError("Expected the measured complete GQA head group")
         compiler_identity = dict(
-            tilelang=tilelang.__version__, cuda=torch.version.cuda, target="sm_87"
+            tilelang=tilelang.__version__, cuda=torch.version.cuda, target=CUDA_TARGET["arch"]
         )
         identity = hashlib.sha256(
             json.dumps(

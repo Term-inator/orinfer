@@ -115,7 +115,7 @@ mod tests {
         })
         .collect();
         serde_json::from_value(json!({
-            "schema_version":2,"target":"sm_87","model":"embedding-test","chunk_tokens":512,
+            "schema_version":2,"target":crate::target::CUDA_ARCH,"model":"embedding-test","chunk_tokens":512,
             "max_context":512,"vocab":16,"toolchain":{"test":"1"},"buffers":buffers,
             "reset_buffers":[],"input":"Input","token":"Control","status":"Control",
             "position":"Control","logits":"Output","weight_bytes":0,"weight_parameters":1,"weight_scope":"test",

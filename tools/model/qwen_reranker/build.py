@@ -1,6 +1,7 @@
 """Build a complete-sequence causal Qwen3-Reranker E8P execution package."""
 
 import argparse
+from tools.build.target import CUDA_TARGET
 import hashlib
 import json
 from pathlib import Path
@@ -214,7 +215,7 @@ class Builder(Projections):
         )
         metadata = dict(
             schema_version=2,
-            target="sm_87",
+            target=CUDA_TARGET["arch"],
             model="Qwen3-Reranker-0.6B-E8P-Q4A8",
             chunk_tokens=self.capacity,
             max_context=self.capacity,
@@ -235,7 +236,7 @@ class Builder(Projections):
         package = dict(
             schema_version=1,
             runtime_abi=1,
-            target="sm_87",
+            target=CUDA_TARGET["arch"],
             architecture="qwen3_reranker",
             compute_policy="int8_quality",
             config_signature=signature(self.config),

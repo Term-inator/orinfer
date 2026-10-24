@@ -11,6 +11,7 @@ import time as clock
 from pathlib import Path
 
 from tools.build.files import atomic_json, source_hash
+from tools.build.target import COMPILER_PASSES, CUDA_TARGET
 from tools.model.tuning import compile_candidates, measure, read_record, record_path
 
 from tools.model.projection_policy import (
@@ -27,7 +28,7 @@ from tools.model.expert_tuning import (
 )
 
 
-TARGET = {"kind": "cuda", "arch": "sm_87"}
+TARGET = CUDA_TARGET
 
 
 def profile_rows(capacity):
@@ -308,12 +309,14 @@ class ProjectionTuner:
         elif dynamic:
             candidates, legal, rejected = compile_candidates(
                 configs,
-                lambda cfg: tilelang.compile(
-                    make_prim(spec, cfg),
-                    out_idx=[],
-                    execution_backend="nvrtc",
-                    target=TARGET,
-                    pass_configs={**COMPILER_PASSES, **(passes or {})},
+                lambda cfg: validate_kernel_resources(
+                    tilelang.compile(
+                        make_prim(spec, cfg),
+                        out_idx=[],
+                        execution_backend="nvrtc",
+                        target=TARGET,
+                        pass_configs=passes,
+                    )
                 ),
                 tolerate_failures=True,
             )
@@ -426,8 +429,7 @@ class ProjectionTuner:
         candidates, rather than a hand-written batch threshold.
         """
         import tilelang
-        from tools.build.target import COMPILER_PASSES, CUDA_TARGET
-from tools.model.row_selection import choices, ranges
+        from tools.model.row_selection import choices, ranges
 
         if not kwargs.get("dynamic"):
             raise ValueError("Bounded choices require runtime row arguments")

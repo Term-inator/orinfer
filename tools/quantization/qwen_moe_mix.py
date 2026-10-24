@@ -13,7 +13,8 @@ from pathlib import Path
 import shutil
 
 from tools.model.compact import write_shard
-from tools.model.publication import file_hash, staged_directory, write_json
+from tools.build.files import file_hash, write_json
+from tools.model.publication import staged_directory
 from tools.model.safetensors_source import local_header
 
 

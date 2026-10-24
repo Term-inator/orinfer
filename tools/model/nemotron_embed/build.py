@@ -1,6 +1,7 @@
 """Build the native E8P Q4A8 Nemotron-3.5-Embed-1B execution package."""
 
 import argparse
+from tools.build.target import CUDA_TARGET
 import hashlib
 import json
 from pathlib import Path
@@ -372,7 +373,7 @@ class Builder(Projections):
         )
         metadata = dict(
             schema_version=2,
-            target="sm_87",
+            target=CUDA_TARGET["arch"],
             model="Nemotron-3.5-Embed-1B-E8P-Q4A8",
             chunk_tokens=self.capacity,
             max_context=self.capacity,
@@ -393,7 +394,7 @@ class Builder(Projections):
         package = dict(
             schema_version=1,
             runtime_abi=1,
-            target="sm_87",
+            target=CUDA_TARGET["arch"],
             architecture="nemotron_embed",
             compute_policy="int8_quality",
             config_signature=signature(self.config),

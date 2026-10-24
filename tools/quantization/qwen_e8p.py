@@ -171,7 +171,7 @@ def encode(args):
     model_policy = {
         "mistral3": "nemotron35-embed-e8p-q4a8-v1",
         "qwen3": "qwen3-reranker-e8p-q4a8-v1",
-    }.get(config["model_type"], "qwen35-dense-e8p-q4a8-v2")
+    }.get(config["model_type"], f"qwen35-e8p-q{bits}a8-v3")
     origin = json.loads((source_dir / "source.json").read_text())
     source = Source(source_dir / "model.safetensors.index.json", directory=source_dir)
     out.mkdir(parents=True, exist_ok=True)

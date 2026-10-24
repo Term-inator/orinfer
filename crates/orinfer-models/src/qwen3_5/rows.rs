@@ -1258,7 +1258,7 @@ impl QwenRows {
             segments.to_vec()
         };
         let segments = ordered.as_slice();
-        let rows = crate::packet::Rows::packet(segments, LANES, CAPACITY)?;
+        let rows = crate::packet::Rows::packet(segments, LANES, self.manifest.chunk_tokens)?;
         let total = rows.total;
         let verified = |lane: usize| prefills.is_some_and(|n| lane >= n);
         let causal = prefills.and_then(|_| m.mtp.as_ref()?.verification_table.as_ref());

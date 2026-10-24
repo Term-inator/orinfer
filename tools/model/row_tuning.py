@@ -12,7 +12,7 @@ from pathlib import Path
 from tools.model.compile import primitive
 from tools.model.row_selection import aggregate_winner, ranges
 from tools.build.files import atomic_json
-from tools.model.tuning import compile_candidates, measure, read_record, record_path
+from tools.model.tuning import measure, read_record, record_path
 
 ROTATION_TILES = (256, 512, 1024)
 ATTENTION_PIPELINES = [
@@ -63,7 +63,7 @@ class RowTuner:
         relative_tolerance=0.0,
         validation_inputs=None,
     ):
-        from tools.operators.common import SEED
+        from tools.operators.common import SEED, KernelResourceError
         import torch
 
         measured = (
@@ -87,7 +87,18 @@ class RowTuner:
         cached = read_record(path, identity)
         if cached is not None:
             return cached
-        kernels, configs, rejected = compile_candidates(configs, build, tolerate_failures=True)
+        kernels, legal, rejected = [], [], []
+        for config in configs:
+            try:
+                kernel = build(config)
+            except KernelResourceError as error:
+                rejected.append(dict(config=config, reason=str(error)))
+                continue
+            kernels.append(kernel)
+            legal.append(config)
+        if not legal:
+            raise ValueError(f"No resource-eligible row configuration for {spec}: {rejected}")
+        configs = legal
         records = []
         for rows in measured:
             times = {str(i): [] for i in range(len(configs))}
@@ -137,7 +148,9 @@ class RowTuner:
                 for r in records
             ]
         chosen = ranges(decisions, capacity=self.capacity)
-        result = dict(identity=identity, configs=configs, rejected=rejected, measurements=records, **chosen)
+        result = dict(
+            identity=identity, configs=configs, rejected=rejected, measurements=records, **chosen
+        )
         atomic_json(path, result)
         return result
 
