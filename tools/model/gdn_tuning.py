@@ -158,7 +158,7 @@ def select(tuner, dense):
     # Logs cannot change representation when batch membership changes. Select
     # one whole strategy by relative geometric mean, retaining the measured
     # dense policy if no log strategy wins across these cohorts.
-    chosen = configs[int(aggregate_winner(result["measurements"]))]
+    chosen = result["configs"][int(aggregate_winner(result["measurements"]))]
     if not chosen["deferred"]:
         return dense
     return dict(configs=[chosen], default="0", selections=[])
@@ -275,7 +275,7 @@ def chunked(tuner):
     # additional runtime dispatch boundaries or per-length implementations.
     costs = {
         str(i): sum(row["times"][str(i)] for row in result["measurements"])
-        for i in range(len(configs))
+        for i in range(len(result["configs"]))
     }
     selected = dict(result, default=min(costs, key=costs.get), selections=[])
     tuner.records[key] = selected

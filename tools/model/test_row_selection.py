@@ -32,6 +32,103 @@ class AggregateSelectionTests(unittest.TestCase):
 
 
 class ValidationOnlyTuningTests(unittest.TestCase):
+    def test_consumers_use_filtered_configuration_indices(self):
+        from tools.model import gdn_tuning
+        from tools.model.qwen35 import attention
+
+        def inputs(rows):
+            def fixture(kernel, config):
+                def run():
+                    pass
+
+                run.ms = 1.0 if config == winner else 2.0
+                return run, lambda: None, lambda: None
+
+            yield fixture
+
+        def benchmark(run, **kwargs):
+            return dict(median_ms=run.ms), SimpleNamespace(replay=run)
+
+        modules = {
+            "torch": SimpleNamespace(manual_seed=lambda _: None),
+            "tilelang": SimpleNamespace(compile=lambda *a, **kw: None),
+            "tools.operators.common": SimpleNamespace(
+                benchmark=benchmark,
+                SEED=20261002,
+                KernelResourceError=RuntimeError,
+                validate_kernel_resources=lambda kernel: kernel,
+            ),
+            "tools.model.qwen35.parallel": SimpleNamespace(
+                geometry=None,
+                factory=lambda *a: SimpleNamespace(buffer_map={}),
+            ),
+            "kernels.model.independent_rows": SimpleNamespace(
+                independent_rows=lambda fn, *a, **kw: (fn, []),
+            ),
+            "kernels.model.gdn_sequence": SimpleNamespace(_gdn_sequence=None),
+            "kernels.model.gdn_deferred": SimpleNamespace(recurrent=None),
+            "kernels.model.gdn_chunk": SimpleNamespace(),
+        }
+        for consumer in (attention.select, gdn_tuning.select, gdn_tuning.chunked):
+            with (
+                self.subTest(consumer=consumer.__module__ + "." + consumer.__name__),
+                tempfile.TemporaryDirectory() as output,
+                patch.dict("sys.modules", modules),
+                patch("tools.model.compile.primitive", return_value=None),
+            ):
+                measured = []
+
+                def select(spec, configs, *args, **kwargs):
+                    nonlocal winner
+                    winner = configs[-1]
+
+                    def build(config):
+                        if config == configs[1]:
+                            raise RuntimeError("shared-memory limit")
+                        return config
+
+                    result = RowTuner(output, {}, capacity=128).select(
+                        spec,
+                        configs,
+                        build,
+                        inputs,
+                        measure_rows=[1],
+                    )
+                    measured.append(result)
+                    return result
+
+                winner = None
+                tuner = SimpleNamespace(
+                    select=select,
+                    records={},
+                    capacity=128,
+                    hk=16,
+                    hv=48,
+                    qh=24,
+                    kvh=4,
+                    dimension=256,
+                    gated=True,
+                )
+                if consumer is attention.select:
+                    actual = consumer(
+                        tuner,
+                        4096,
+                        dict(
+                            block_m=32,
+                            block_n=64,
+                            head_group=1,
+                            max_splits=8,
+                        ),
+                    )
+                elif consumer is gdn_tuning.select:
+                    actual = consumer(tuner, dict(configs=[{}], default="0", selections=[]))
+                else:
+                    actual = consumer(tuner)
+                if consumer is not attention.select:
+                    actual = actual["configs"][int(actual["default"])]
+                self.assertEqual(len(measured[0]["rejected"]), 1)
+                self.assertEqual(actual, winner)
+
     def test_small_workspace_tunes_only_its_published_row_capacity(self):
         def inputs(rows):
             def fixture(kernel, config):

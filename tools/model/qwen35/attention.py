@@ -200,4 +200,4 @@ def select(tuner, context, reference):
         measure_rows=list(OWNERS),
     )
     # One measured geometry serves every owner count; no runtime batch ranges.
-    return configs[int(aggregate_winner(measured["measurements"]))]
+    return measured["configs"][int(aggregate_winner(measured["measurements"]))]
