@@ -637,7 +637,7 @@ class BuildTests(unittest.TestCase):
         builder.weights = SimpleNamespace(
             immutable=lambda n: n, packed_k=128, index={"weight_map": {}}, buffers={}
         )
-        builder.q4_codec, builder.book = "e8p_q4", "book"
+        builder.q4_codec, builder.head_codec, builder.book = "e8p_q4", "e8p_q4", "book"
         launches = []
         builder.emit = lambda name, key, build, bindings, rows, **options: launches.append(bindings)
         builder.projection(

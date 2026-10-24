@@ -137,6 +137,9 @@ def configuration(config, context):
     if any(rope.get(k) != v for k, v in expected_rope.items()):
         raise ValueError("Unsupported dense Qwen RoPE contract")
     q = config.get("quantization_config", {})
+    from tools.quantization.qwen_e8p import rotated_w8_matrices
+
+    rotated_w8_matrices(config)
     if any(
         q.get(k) != v or type(q.get(k)) is not type(v)
         for k, v in dict(
@@ -186,6 +189,13 @@ def configuration(config, context):
         raise ValueError("Tied embedding/head requires the shared E8P bank")
     if any(q.get(role) not in (None, codec) for role in ("embedding", "vision")):
         raise ValueError("Unsupported embedding or vision codec")
+    if "output_head" in q and (
+        config["model_type"] != "qwen3_5"
+        or t["tie_word_embeddings"]
+        or q["output_head"] != "e8p_q4"
+        or q["quant_method"] not in ("orinfer_e8p_q2_int8", "orinfer_e8p_q4_int8")
+    ):
+        raise ValueError("Separate Q4 output head requires an untied dense E8P model")
     if (
         any(q.get(role) for role in ("embedding", "vision"))
         and q["quant_method"] == "orinfer_q4_int8"
@@ -254,6 +264,7 @@ class Builder:
             else "q4"
         )
         self.expert_codec = self.config["quantization_config"].get("experts") or self.q4_codec
+        self.head_codec = self.config["quantization_config"].get("output_head", self.q4_codec)
         state = json.loads((source / "progress.json").read_text())
         if not state.get("complete"):
             raise ValueError("Quantization is still running; no partial model may be published")
@@ -756,6 +767,8 @@ class Builder:
             kind = (
                 "w8"
                 if weight + ".int8" in w.index["weight_map"] or weight + ".int8" in w.buffers
+                else self.head_codec
+                if head
                 else self.q4_codec
             )
         compressed = kind in ("q4", "e8p_q4", "e8p_q2")

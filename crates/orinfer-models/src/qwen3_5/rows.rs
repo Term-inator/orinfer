@@ -196,6 +196,7 @@ fn validate_weights(
     q2: bool,
     expert_q2: bool,
     embedding_q4: bool,
+    head_q2: bool,
 ) -> Result<()> {
     let t = config.text();
     let capacity = m.chunk_tokens;
@@ -383,11 +384,6 @@ fn validate_weights(
         Ok(())
     };
     let codec = if q2 { "e8p_q2" } else { "e8p_q4" };
-    let packed_layout = if q2 {
-        "e8p-q2-k128-u16"
-    } else {
-        "e8p-q4-k128-u32"
-    };
     if e8p {
         check(format!("orinfer.{codec}.basis"), Dtype::I8, vec![256, 8])?;
         check(
@@ -397,10 +393,21 @@ fn validate_weights(
         )?;
     }
     let q4 = |name: String, n: usize, k: usize| -> Result<()> {
-        if config
-            .rotated_w8_layers
-            .iter()
-            .any(|layer| name.starts_with(&format!("model.language_model.layers.{layer}.")))
+        let matrix_q2 = if name == "lm_head.weight" {
+            head_q2
+        } else {
+            q2
+        };
+        let packed_layout = if matrix_q2 {
+            "e8p-q2-k128-u16"
+        } else {
+            "e8p-q4-k128-u32"
+        };
+        if config.rotated_w8_matrices.contains(&name)
+            || config
+                .rotated_w8_layers
+                .iter()
+                .any(|layer| name.starts_with(&format!("model.language_model.layers.{layer}.")))
         {
             check(format!("{name}.int8"), Dtype::I8, vec![n, k])?;
             check(format!("{name}.scale"), Dtype::F16, vec![n])?;
@@ -411,13 +418,16 @@ fn validate_weights(
         }
         let (dtype, shape) = if e8p {
             (
-                if q2 { Dtype::U16 } else { Dtype::U32 },
+                if matrix_q2 { Dtype::U16 } else { Dtype::U32 },
                 vec![k / 128, n, 16],
             )
         } else {
             (Dtype::U8, vec![n, k / 2])
         };
         let packed = format!("{name}.packed");
+        if map.contains_key(format!("{name}.int8").as_str()) {
+            return Err(format!("Undeclared W8 projection: {name}"));
+        }
         check(packed.clone(), dtype, shape)?;
         if e8p && map[packed.as_str()].layout != packed_layout {
             return Err(format!("Invalid Qwen E8P physical layout: {packed}"));
@@ -639,12 +649,26 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         }
     }
     let expert_precision = quant["experts"].clone();
+    let output_head = quant.get("output_head").cloned();
     let c = Configuration::parse(request.config)?;
     let architecture = if c.standard { "qwen3_asr" } else { "qwen3_5" };
     if request.architecture != architecture || c.signature != request.expected_signature {
         return Err("Qwen row architecture or signature differs".into());
     }
     let t = c.text();
+    let head_q2 = match output_head {
+        None => q2,
+        Some(value)
+            if value == "e8p_q4"
+                && e8p
+                && !c.standard
+                && t.num_experts == 0
+                && !t.tie_word_embeddings =>
+        {
+            false
+        }
+        _ => return Err("Separate Q4 output head requires an untied dense E8P model".into()),
+    };
     let expert_q2 = match expert_precision.as_str() {
         None if expert_precision.is_null() => q2,
         Some("e8p_q2") if e8p && t.num_experts > 0 => true,
@@ -707,7 +731,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         return Err("Expected dense Qwen compact prefill capacity contract".into());
     }
     let m = &mut request.metadata;
-    validate_weights(m, &c, e8p, q2, expert_q2, embedding_q4)?;
+    validate_weights(m, &c, e8p, q2, expert_q2, embedding_q4, head_q2)?;
     m.programs.clear();
     let begin = if m.vision.is_some() || m.audio.is_some() {
         vec!["prepare", "embedding", "overlay"]
@@ -2123,6 +2147,39 @@ mod tests {
     }
 
     #[test]
+    fn dense_rotated_w8_requires_declared_single_correctly_shaped_bank() {
+        let name = "model.language_model.layers.3.self_attn.k_proj.weight";
+        let mut request = dense_request((5120, 17408, 64, 48, 24, 4, false), true);
+        request.config["quantization_config"]["rotated_w8_matrices"] = json!([name]);
+        let original = request
+            .metadata
+            .buffers
+            .iter()
+            .find(|b| b.name == format!("{name}.packed"))
+            .unwrap()
+            .clone();
+        let bank = request
+            .metadata
+            .buffers
+            .iter_mut()
+            .find(|b| b.name == original.name)
+            .unwrap();
+        bank.name = format!("{name}.int8");
+        bank.dtype = Dtype::I8;
+        bank.shape = vec![1024, 5120];
+        bank.layout = "native_contiguous".into();
+        bank.data.as_mut().unwrap().tensor = bank.name.clone();
+        let copy =
+            |r: &CreateRequest| serde_json::from_value(serde_json::to_value(r).unwrap()).unwrap();
+        assert!(create(copy(&request), Policy::Int8Quality).is_ok());
+        let mut undeclared: CreateRequest = copy(&request);
+        undeclared.config["quantization_config"]["rotated_w8_matrices"] = json!([]);
+        assert!(create(undeclared, Policy::Int8Quality).is_err());
+        request.metadata.buffers.push(original);
+        assert!(create(request, Policy::Int8Quality).is_err());
+    }
+
+    #[test]
     fn moe_reuses_dense_causal_rows_with_compressed_expert_banks() {
         let mut request = dense_request((2048, 512, 40, 32, 16, 2, false), true);
         request.config["model_type"] = json!("qwen3_5_moe");
@@ -2450,6 +2507,33 @@ mod tests {
         let mut wrong = candidate();
         wrong.config["quantization_config"]["coefficients"] = json!([4, 1]);
         assert!(create(wrong, Policy::Int8Quality).is_err());
+        let mut mixed = candidate();
+        mixed.config["quantization_config"]["output_head"] = json!("e8p_q4");
+        let head = mixed
+            .metadata
+            .buffers
+            .iter_mut()
+            .find(|b| b.name == "lm_head.weight.packed")
+            .unwrap();
+        head.dtype = Dtype::U32;
+        head.layout = "e8p-q4-k128-u32".into();
+        let copy =
+            |r: &CreateRequest| serde_json::from_value(serde_json::to_value(r).unwrap()).unwrap();
+        assert!(create(copy(&mixed), Policy::Int8Quality).is_ok());
+        let mut undeclared: CreateRequest = copy(&mixed);
+        undeclared.config["quantization_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("output_head");
+        assert!(create(undeclared, Policy::Int8Quality).is_err());
+        mixed
+            .metadata
+            .buffers
+            .iter_mut()
+            .find(|b| b.name == "lm_head.weight.packed")
+            .unwrap()
+            .dtype = Dtype::U16;
+        assert!(create(mixed, Policy::Int8Quality).is_err());
     }
 
     #[test]

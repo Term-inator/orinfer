@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import shutil
 import time
@@ -24,6 +25,37 @@ from tools.build.files import atomic_json as write_json
 from tools.model.safetensors_source import Source, local_header
 from tools.quantization.flash_next_aux import int8_rows
 from tools.build.gpu import gpu_lock
+
+
+def rotated_w8_matrices(config, matrices=None):
+    """Validate explicit dense text projections in the existing rotated input basis."""
+    selected = (
+        config.get("quantization_config", {}).get("rotated_w8_matrices", [])
+        if matrices is None
+        else matrices
+    )
+    if not isinstance(selected, list) or any(not isinstance(n, str) for n in selected):
+        raise ValueError("rotated_w8_matrices must be a list of projection names")
+    if len(set(selected)) != len(selected):
+        raise ValueError("Duplicate rotated W8 projection")
+    text = config.get("text_config", config)
+    for name in selected:
+        match = re.fullmatch(
+            r"model\.language_model\.layers\.(\d+)\.(self_attn\.[qkv]_proj|linear_attn\.in_proj_(qkv|z)|mlp\.(gate|up|down)_proj)\.weight",
+            name,
+        )
+        if config.get("model_type") != "qwen3_5" or not match:
+            raise ValueError(f"Unsupported rotated W8 projection: {name}")
+        layer = int(match[1])
+        if str(layer) != match[1] or layer >= text["num_hidden_layers"]:
+            raise ValueError(f"Rotated W8 layer out of range: {name}")
+        role = match[2]
+        kind = text["layer_types"][layer]
+        if (role.startswith("self_attn.") and kind != "full_attention") or (
+            role.startswith("linear_attn.") and kind != "linear_attention"
+        ):
+            raise ValueError(f"Rotated W8 projection differs from layer kind: {name}")
+    return selected
 
 
 def rotated_w8_layers(config):

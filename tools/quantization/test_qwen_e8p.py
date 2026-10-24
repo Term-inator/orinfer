@@ -1,10 +1,40 @@
 """Precision policy for shared dense Qwen encoders and tied embeddings."""
 
 import unittest
-from tools.quantization.qwen_e8p import canonical_name, policy, text_configuration
+from tools.quantization.qwen_e8p import (
+    canonical_name,
+    policy,
+    text_configuration,
+    rotated_w8_matrices,
+)
 
 
 class DensePolicyTests(unittest.TestCase):
+    def test_explicit_rotated_w8_selection_checks_role_layer_and_duplicates(self):
+        config = dict(
+            model_type="qwen3_5",
+            text_config=dict(
+                num_hidden_layers=4, layer_types=["linear_attention"] * 3 + ["full_attention"]
+            ),
+        )
+        key = "model.language_model.layers.3.self_attn.k_proj.weight"
+        self.assertEqual(rotated_w8_matrices(config, [key]), [key])
+        for selected in [
+            [key, key],
+            [key.replace(".3.", ".0.")],
+            [key.replace(".3.", ".4.")],
+            [key.replace("k_proj", "o_proj")],
+            [key.replace(".3.", ".03.")],
+            None,
+        ]:
+            if selected is None:
+                config["quantization_config"] = dict(rotated_w8_matrices=None)
+                with self.assertRaises(ValueError):
+                    rotated_w8_matrices(config)
+            else:
+                with self.assertRaises(ValueError):
+                    rotated_w8_matrices(config, selected)
+
     def test_protected_projections_keep_the_shared_input_rotation(self):
         info = dict(dtype="BF16", shape=[2048, 2048])
         self.assertEqual(

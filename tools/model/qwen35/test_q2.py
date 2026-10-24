@@ -18,6 +18,40 @@ from tools.model.qwen35.test_build import config
 
 
 class Q2Tests(unittest.TestCase):
+    def test_q4_output_head_keeps_the_q2_trunk_codec(self):
+        from tools.model.qwen35.build import Builder
+
+        builder = Builder.__new__(Builder)
+        builder.weights = SimpleNamespace(
+            immutable=lambda n: n, packed_k=128, index={"weight_map": {}}, buffers={}
+        )
+        builder.q4_codec, builder.head_codec, builder.book = "e8p_q2", "e8p_q4", "selectors"
+        builder.compile_projection = lambda weight, kind, *args: kind
+        emitted = []
+        builder.emit = lambda name, key, build, bindings, *args, **kwargs: emitted.append(
+            (build(), bindings)
+        )
+        builder.projection("trunk", "trunk.weight", 128, 128, "out", rows=1, dynamic=False)
+        builder.projection(
+            "head", "lm_head.weight", 128, 128, "out", rows=1, dynamic=False, head=True
+        )
+        self.assertEqual([x[0] for x in emitted], ["e8p_q2", "e8p_q4"])
+        self.assertEqual(emitted[0][1]["Book"], emitted[1][1]["Book"])
+        candidate = config()
+        candidate["quantization_config"].update(
+            quant_method="orinfer_e8p_q2_int8",
+            coefficients=[1],
+            basis_tensor="orinfer.e8p_q2.basis",
+            layout="u16-e8p",
+            embedding="e8p_q2",
+            output_head="e8p_q4",
+        )
+        self.assertEqual(configuration(candidate, 4096)["hidden_size"], 5120)
+        for value in ["w8", "e8p_q2", None]:
+            candidate["quantization_config"]["output_head"] = value
+            with self.assertRaises(ValueError):
+                configuration(candidate, 4096)
+
     def test_null_expert_precision_uses_the_global_codec(self):
         from tools.model.qwen35.build import Builder
 

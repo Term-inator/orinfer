@@ -59,6 +59,23 @@ ORINFER_CHECKPOINT_DIR=/path/to/original \
 
 `qwen_e8p --bits 2` 从原始 BF16 使用单级整数 E8P 编码，U16 保存八个权重，每个输出行保留一个 FP16 scale。它与 Q4 使用相同 signed-block128 旋转和精度例外策略；主干、专家、embedding/head 和可量化视觉矩阵使用 Q2，敏感输出投影与 MTP 保留 W8。实际平均位数包含这些例外和全部元数据。
 
+Dense Qwen 可用 `qwen_promote` 将明确选中的主干投影升级为 W8。`--matrices` 指向 JSON 字符串数组，元素为完整原始权重名，例如 `model.language_model.layers.3.self_attn.k_proj.weight`。支持 Q/K/V、GDN QKV/Z 和 FFN gate/up/down；输出投影沿用现有 W8。工具从同一来源 BF16 分块重新量化，保留原 signed-block128 输入基与行 scale，替换选中压缩 bank，其余编码值保持不变。配置中的 `rotated_w8_matrices` 是转换、构建与原生校验共同使用的精度清单；层号、角色、dtype、shape 和单份权重均校验。
+
+```bash
+.venv/bin/python -m tools.quantization.qwen_promote \
+  --source-dir ORIGINAL_BF16_DIR --upgrade-from E8P_CONVERTED_DIR \
+  --matrices selected-projections.json --output PROMOTED_CONVERTED_DIR
+```
+
+将输出交给[原生构建器](../model/qwen35/README.md)生成独立执行包。选择清单需要通过该包的任务质量、固定历史概率和完整请求性能验证；局部投影重建误差用于筛选候选。
+
+对于具有独立输出头的 dense 模型，`qwen_head_mix` 可组合 Q2 主干和同一来源的 Q4 输出头。工具校验完整源分片、模型来源、几何、码表与旋转符号，仅替换 `lm_head.weight` 的码字和 scale，其余编码值保持不变。`quantization_config.output_head=e8p_q4` 显式声明输出头精度；embedding 仍使用全局 Q2 bank。原生构建和校验按输出头声明选择 U32/K128 与 Q4 投影，复用相同 E8P 基表。该选项适用于 untied dense E8P 模型。
+
+```bash
+.venv/bin/python -m tools.quantization.qwen_head_mix \
+  --q2 Q2_CONVERTED_DIR --q4 Q4_CONVERTED_DIR --output HEAD_Q4_CONVERTED_DIR
+```
+
 ```bash
 ORINFER_CHECKPOINT_DIR=/path/to/original \
   bash tools/quantization/run.sh qwen_e8p --source-dir /path/to/original \

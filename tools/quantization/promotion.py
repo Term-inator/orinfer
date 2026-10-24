@@ -14,7 +14,7 @@ from tools.quantization.flash_next_aux import int8_rows
 from tools.quantization.vq import rotate
 
 
-def upgrade(args, *, configuration, signature, layers, layer_prefix):
+def upgrade(args, *, configuration, signature, layers, layer_prefix, matrices=None):
     """Retain existing E8P values and re-read only protected matrices from BF16."""
     original, source = args.source_dir.resolve(strict=True), args.upgrade_from.resolve(strict=True)
     config = json.loads((source / "config.json").read_text())
@@ -35,23 +35,30 @@ def upgrade(args, *, configuration, signature, layers, layer_prefix):
         if file_hash(source / filename) != index["metadata"]["orinfer.sha256"][filename]:
             raise ValueError("Encoded source shard checksum changed")
     bf16 = Source(original / "model.safetensors.index.json", directory=original)
-    selected = [
-        name
-        for name in bf16.weight_map
-        if any(name.startswith(f"{layer_prefix}{layer}.") for layer in layers)
-        and name.endswith(
-            (
-                "q_proj.weight",
-                "k_proj.weight",
-                "v_proj.weight",
-                "gate_proj.weight",
-                "up_proj.weight",
-                "down_proj.weight",
+    selected = (
+        matrices
+        if matrices is not None
+        else [
+            name
+            for name in bf16.weight_map
+            if any(name.startswith(f"{layer_prefix}{layer}.") for layer in layers)
+            and name.endswith(
+                (
+                    "q_proj.weight",
+                    "k_proj.weight",
+                    "v_proj.weight",
+                    "gate_proj.weight",
+                    "up_proj.weight",
+                    "down_proj.weight",
+                )
             )
-        )
-    ]
-    if len(selected) != len(layers) * 6:
+        ]
+    )
+    if not selected or (matrices is None and len(selected) != len(layers) * 6):
         raise ValueError("Protected matrices are incomplete")
+    for name in selected:
+        if name + ".packed" not in index["weight_map"] or name + ".int8" in index["weight_map"]:
+            raise ValueError(f"Expected one compressed source projection: {name}")
     from safetensors import safe_open
 
     text = original_config.get("text_config", original_config)
@@ -67,6 +74,7 @@ def upgrade(args, *, configuration, signature, layers, layer_prefix):
             source=origin,
             precision="rotated-w8",
             layers=layers,
+            matrices=matrices,
             implementation=file_hash(Path(__file__)),
         ),
         sort_keys=True,
@@ -173,7 +181,12 @@ def upgrade(args, *, configuration, signature, layers, layer_prefix):
                 not in ("config.json", "progress.json", "model.safetensors.index.json")
             ):
                 shutil.copyfile(path, out / path.name)
-        config["quantization_config"]["rotated_w8_layers"] = list(layers)
+        if matrices is None:
+            config["quantization_config"]["rotated_w8_layers"] = list(layers)
+        else:
+            config["quantization_config"]["rotated_w8_matrices"] = sorted(
+                set(config["quantization_config"].get("rotated_w8_matrices", []) + matrices)
+            )
         state.update(contract=contract, complete=True, weight_bytes=size, shards=shards)
         state["quantized"].update(statistics)
         write_json(out / "config.json", config)

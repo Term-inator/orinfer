@@ -107,6 +107,7 @@ pub(crate) struct Configuration {
     pub vision_depth: usize,
     pub standard: bool,
     pub rotated_w8_layers: Vec<usize>,
+    pub rotated_w8_matrices: Vec<String>,
     pub signature: Value,
 }
 
@@ -169,6 +170,43 @@ impl Configuration {
         } else {
             Vec::new()
         };
+        let rotated_w8_matrices: Vec<String> = config["quantization_config"]
+            .get("rotated_w8_matrices")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|e| format!("Invalid rotated W8 projections: {e}"))?
+            .unwrap_or_default();
+        let mut seen = std::collections::BTreeSet::new();
+        for name in &rotated_w8_matrices {
+            let (layer, role) = name
+                .strip_prefix("model.language_model.layers.")
+                .and_then(|s| s.split_once('.'))
+                .ok_or("Invalid rotated W8 projection name")?;
+            let index = layer
+                .parse::<usize>()
+                .map_err(|_| "Invalid rotated W8 layer")?;
+            if standard
+                || text.num_experts > 0
+                || index >= text.num_hidden_layers
+                || layer != index.to_string()
+                || !seen.insert(name)
+            {
+                return Err("Invalid or duplicate dense rotated W8 projection".into());
+            }
+            let valid = match role {
+                "self_attn.q_proj.weight"
+                | "self_attn.k_proj.weight"
+                | "self_attn.v_proj.weight" => text.layer_types[index] == "full_attention",
+                "linear_attn.in_proj_qkv.weight" | "linear_attn.in_proj_z.weight" => {
+                    text.layer_types[index] == "linear_attention"
+                }
+                "mlp.gate_proj.weight" | "mlp.up_proj.weight" | "mlp.down_proj.weight" => true,
+                _ => false,
+            };
+            if !valid {
+                return Err(format!("Unsupported rotated W8 projection: {name}"));
+            }
+        }
         let text_keys = contract["families"][family]["text_keys"]
             .as_array()
             .ok_or("Missing architecture signature contract")?;
@@ -189,6 +227,7 @@ impl Configuration {
         Ok(Self {
             standard,
             rotated_w8_layers,
+            rotated_w8_matrices,
             text,
             vision_depth,
             signature,
@@ -199,6 +238,24 @@ impl Configuration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dense_rotated_w8_selection_rejects_unknown_roles_and_duplicates() {
+        let name = "model.language_model.layers.1.self_attn.k_proj.weight";
+        let mut raw = config();
+        raw["quantization_config"] = serde_json::json!({"rotated_w8_matrices":[name]});
+        let parsed = Configuration::parse(raw.clone()).unwrap();
+        assert_eq!(parsed.rotated_w8_matrices, [name]);
+        for selected in [
+            serde_json::json!([name, name]),
+            serde_json::json!(["model.language_model.layers.0.self_attn.k_proj.weight"]),
+            serde_json::json!(["model.language_model.layers.2.self_attn.k_proj.weight"]),
+            serde_json::json!(["model.language_model.layers.1.self_attn.o_proj.weight"]),
+            serde_json::json!(null),
+        ] {
+            raw["quantization_config"]["rotated_w8_matrices"] = selected;
+            assert!(Configuration::parse(raw.clone()).is_err());
+        }
+    }
     fn config() -> Value {
         serde_json::json!({"model_type":"qwen3_5_text","hidden_size":8,"intermediate_size":16,"vocab_size":16,
             "num_hidden_layers":2,"layer_types":["linear_attention","full_attention"],
