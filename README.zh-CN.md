@@ -92,6 +92,7 @@ make check
 - [服务指南](docs/serving.md) · [离线 JSONL](docs/batch.md) · [性能参考](docs/performance.md)。
 - [构建与发布](tools/build/README.md) · [模型执行包](docs/model-packages.md)。
 - [模型构建](tools/model/README.md) · [GPU 算子](kernels/README.md) · [质量评测](tools/eval/README.md)。
+- [量化技术 Wiki](docs/quantization.md)：E8P Q2 码本、编解码与 Tensor Core 算子，Q2_K 对比及两级 Q4 扩展。
 
 详细指南目前以中文提供。
 
