@@ -30,7 +30,7 @@ check: lint
 	$(PYTHON) -m unittest discover -s tools/vision -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/quantization -p 'test_*.py' -v
 	$(PYTHON) -m unittest tools.model.test_safetensors_source -v
-	$(PYTHON) -m unittest tools.model.test_compile tools.model.flash_next.tests.test_storage tools.model.flash_next.tests.test_precision -v
+	$(PYTHON) -m unittest tools.model.test_compile tools.model.flash_next.tests.test_storage tools.model.flash_next.tests.test_precision tools.model.flash_next.tests.test_hc -v
 	$(PYTHON) -m unittest tools.model.qwen35.test_build tools.model.qwen35.test_parallel tools.model.qwen35.test_attention tools.model.qwen35.test_q2 tools.model.qwen35.test_rebuild_attention tools.model.qwen35.test_rebuild_mtp -v
 	$(PYTHON) -m unittest tools.model.nemotron_embed.test_config tools.model.qwen_reranker.test_config -v
 	$(PYTHON) -m unittest tools.model.test_compact -v

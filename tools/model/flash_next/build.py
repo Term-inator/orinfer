@@ -103,6 +103,7 @@ def read_weights(model, operands, buffers):
             "u16": torch.uint16,
             "u32": torch.uint32,
             "f16": torch.float16,
+            "bf16": torch.bfloat16,
         }
         if value.dtype != expected[buffer["dtype"]]:
             raise ValueError(f"Real tuning weight dtype mismatch: {tensor}")
@@ -348,7 +349,9 @@ def rebuild(args):
         append_sampling(data, package, root, args.output / "sampling")
         if not partial:
             from tools.model.auxiliary_tuning import publish as publish_auxiliary
+            from tools.model.flash_next.hc import publish as publish_hc
 
+            publish_hc(args.model, package, compiler, args.output / "hc", args.cache)
             publish_auxiliary(data, package, manifest, compiler, args.output / "auxiliary")
             if (
                 data["metadata"].get("vision")
@@ -406,6 +409,11 @@ def main():
         help="Rebuild compressed expert address tables with unchanged row/arithmetic contracts",
     )
     p.add_argument(
+        "--hc-only",
+        action="store_true",
+        help="Measure and rebuild HC down row selections with unchanged arithmetic",
+    )
+    p.add_argument(
         "--prefill-only",
         action="store_true",
         help="Rebuild only declared prefill projections; preserve other certified bindings",
@@ -426,6 +434,20 @@ def main():
         help="Restrict rebuilds to these output/input dimensions; repeat for multiple geometries",
     )
     args = p.parse_args()
+    if args.hc_only:
+        if (
+            args.checkpoint
+            or args.expert_storage_only
+            or args.plan_only
+            or args.prefill_only
+            or args.projection_kinds
+            or args.projection_shape
+        ):
+            p.error("hc-only requires --model and a complete HC down rebuild")
+        from tools.model.flash_next.hc import rebuild as rebuild_hc
+
+        rebuild_hc(args)
+        return
     if args.expert_storage_only:
         if (
             args.checkpoint
