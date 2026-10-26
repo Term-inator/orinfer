@@ -2,6 +2,32 @@
 
 在线推理由 Rust 执行，TileLang 只参与离线编译。部署目录使用 HF 配置与 tokenizer、`cache/model.json`、标准 safetensors 权重，以及由 digest 固定的执行包。数据格式与 C ABI 均为版本 1。
 
+## 首次构建文本模型
+
+自有分片量化 checkpoint 可直接组装原生文本包。默认先发布 4K 上下文、关闭 MTP 和视觉的版本：
+
+```bash
+make build
+bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-initial \
+  --checkpoint /path/to/quantized-checkpoint \
+  --source-index /path/to/original/model.safetensors.index.json \
+  --model-output artifacts/models/flash-text
+```
+
+构建器逐块拼接已量化专家，不展开完整权重。选定 Q4 主干矩阵从 checkpoint 声明的同一 ModelScope/HF 提交读取原始 BF16 行，逐块释放；原始模型索引必须与该提交一致。首次构建允许下载这些字节范围，容器内存及内存加 swap 上限均为 6 GiB。编译使用形状张量，完整模型不载入 CUDA。输出目录保存可验证的权重转换和编译缓存。
+
+最终目录通过 Rust 原生计划校验后原子发布。生成成功、质量及完整请求 TPS 另行验收；构建完成仅表示原生包通过构造校验。有限专家模式使用 `--resident-experts N --cuda-graph off` 试跑。
+
+首次以单请求启动文本包，可显式限制常驻专家，并关闭 MTP 与前缀缓存：
+
+```bash
+./target/release/orinfer serve artifacts/models/flash-text \
+  --model qwen3.8-flash-next --resident-experts 8 --cuda-graph off \
+  --mtp-drafts 0 --prefix-cache-mib 0 --max-active-requests 1
+```
+
+常驻数限制的是专家数量；CUDA VMM 页粒度、临时路由集合及工作区还会占用显存。构建器无损合并 CPU 表分片，避免运行时为量化阶段的每个小分片保留文件句柄。
+
 ## 重建当前原生模型
 
 已有当前格式的模型，用一个入口重新调优整数投影并发布匹配的执行包：
@@ -51,6 +77,8 @@ PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.build \
 
 专家使用自有整数 E8P Q2A8；GDN QKV/Z、QSA Q/gate 和 target/MTP 共享输出头采用 signed-block128 旋转、输出行 scale 的码表 Q4A8。GDN/QSA 输出投影、共享 FFN 与草稿 Q/O 保留 W8，其余敏感部分维持混合精度。E8P 的完整 A8 位平面分解用两个 INT4 Tensor Core 点积恢复完整 A8 的 INT32 点积。权重只保留一份压缩 bank。
 
+专家路由的 offsets/tiles 与 gate/up、down 投影使用同一行 tile。构造器从实际投影配置读取 tile，检查各 bank 的一致性，并按该 tile 为完整 prefill arena 预留路由表容量。原生计划回归覆盖 1、31、4096 行；完整模型回归覆盖同一专家接收超过 8 行的输入，比较不同分块及 arena 复用后的 logits 与全部已提交状态。
+
 prefill 模板接受 1–4096 行，更长输入分块。普通 decode、混合 batch 与 MTP 验证共享最大 1024 行的 target 计算；draft/warm 共享最大 512 行。完整模型共用执行流程，局部 launch 按真实行数执行。局部实现由离线测量选择。辅助算子统一动态模板，HC 无损指数、QSA radix shift 等标量参数在运行时传入，保持同一计算几何。
 
 QSA KV 为 group-64 INT8，GDN 持续状态为 FP32。KV、pending、压缩索引、卷积/PLE 历史、位置与 MTP 隐藏环均为请求私有状态。改变分块、恢复、捕获或提交时必须比较全部状态。混合 packet 显式记录 prefill/验证角色，角色边界也参与 Graph 身份。
@@ -68,6 +96,10 @@ MTP 包支持 1–7 个草稿；`0` 关闭，`auto` 沿用包默认。随机采�
 服务、请求默认参数、图片和多图输入见[服务说明](../../../docs/serving.md)。文本重建保留输入模型声明的视觉与上下文容量。
 
 ## 原始权重与参考工具
+
+从 ModelScope 官方仓库量化时，指定 `--repo modelscope:Qwen/Qwen3.8-Flash-Next` 和该仓库的固定 40 位 commit。索引、配置及 tokenizer 同样取自该 ModelScope commit。工具严格检查 HTTP 206 与 Content-Range，按专家或矩阵行读取需要的 BF16 字节；原始块只暂存于有界内存，量化结果原子写盘并记录范围 hash，重跑相同命令可续跑。`--chunk-experts` 与 `--workers` 控制单块专家数及同时读取的块数。磁盘保存量化权重、前端文件及 header 元数据。
+
+Flash Next 量化容器的主机内存上限为 6 GiB，包含容器计费的文件缓存，且不使用 swap。超限时由容器内存限制回收或终止任务，已提交的量化块可续跑。该限制独立于显存；GPU 操作仍通过共享锁串行执行。
 
 CPU 依赖由 `make python-env` 创建的 uv 环境管理。GPU 工具统一使用固定编译镜像和共享 GPU 锁；原始 BF16 固定 revision，按矩阵或专家分块读取和释放：
 

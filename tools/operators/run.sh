@@ -28,6 +28,20 @@ extra_mounts=()
 group_args=()
 for group_id in $(id -G); do group_args+=(--group-add "$group_id"); done
 reference_env=()
+network=none
+resource_limits=()
+# Initial Flash construction reads bounded BF16 ranges from its pinned source.
+# Its downloader/compiler and charged file cache share a bounded OOM domain.
+if [[ "$runner" == tools/model/flash_next/build.py ]]; then
+    for argument in "$@"; do
+        if [[ "$argument" == --checkpoint ]]; then
+            network=host
+            resource_limits=(--memory 6g --memory-swap 6g)
+            reference_env+=(-e CARGO_BUILD_JOBS=2)
+            break
+        fi
+    done
+fi
 # Native binding finalization uses the same pinned host Rust toolchain and
 # cached dependencies. Only compiler/registry assets are mounted, no credentials.
 native_cargo_binary="$(rustup which cargo)"
@@ -116,7 +130,8 @@ rm -f "$output_dir/sampler.stop"
 "${PYTHON:-$repo_dir/.venv/bin/python}" tools/bench/sample_continuous.py --output "$output_dir/machine.jsonl" \
     --phase "$output_dir/phase.txt" --stop "$output_dir/sampler.stop" &
 sampler_pid=$!
-docker run --rm --name "$container_name" --gpus all --network none \
+docker run --rm --name "$container_name" --gpus all --network "$network" \
+    "${resource_limits[@]}" \
     --user "$(id -u):$(id -g)" "${group_args[@]}" \
     --entrypoint "$entrypoint" --shm-size 2g -v "$repo_dir:$repo_dir" -v "$output_dir:$output_dir" \
     "${extra_mounts[@]}" "${reference_env[@]}" -w "$repo_dir" -e OMP_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \

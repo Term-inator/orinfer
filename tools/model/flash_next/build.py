@@ -383,7 +383,20 @@ def rebuild(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    for name in ("model", "model-output", "output"):
+    source = p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--model", type=Path)
+    source.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="Construct the initial native text package from our sliced checkpoint",
+    )
+    p.add_argument(
+        "--source-index",
+        type=Path,
+        help="Original safetensors index for bounded BF16 Q4 reads at the checkpoint's pinned source",
+    )
+    p.add_argument("--context", type=int, default=4096)
+    for name in ("model-output", "output"):
         p.add_argument("--" + name, required=True, type=Path)
     p.add_argument("--cache", type=Path, default=ROOT / "artifacts/build-cache/flash-next")
     p.add_argument("--plan-only", action="store_true")
@@ -408,6 +421,15 @@ def main():
         help="Restrict rebuilds to these output/input dimensions; repeat for multiple geometries",
     )
     args = p.parse_args()
+    if args.checkpoint:
+        if not args.source_index:
+            p.error("--checkpoint requires --source-index")
+        if args.prefill_only or args.projection_kinds or args.projection_shape:
+            p.error("Initial construction includes all projections")
+        from tools.model.flash_next.bootstrap import build
+
+        build(args)
+        return
     if args.model.resolve() == args.model_output.resolve():
         p.error("model-output must differ from the immutable input")
     if any(r < 1 for r in args.prefill_tuning_rows):

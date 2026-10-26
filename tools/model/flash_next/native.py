@@ -60,10 +60,7 @@ from kernels.operators.op30_activation_quantization import (
     launch as launch_quant,
 )
 from tools.model.flash_next.checkpoint import Checkpoint
-from tools.model.flash_next.kernel_policy import (
-    expert_tile_config,
-    expert_projection_config,
-)
+from tools.model.flash_next.kernel_policy import expert_projection_config
 from tools.model.flash_next.chunks import chunks
 from tools.model.flash_next.speculation import DEFAULT_DRAFTS
 from tools.model.flash_next.lookup import RowCache
@@ -92,6 +89,7 @@ class Model:
         if type(decode_w8_optimized) is not bool:
             raise ValueError("Invalid decode W8 policy")
         self.decode_w8_optimized = decode_w8_optimized
+        self.batch_body = False
         self.draft_vocab = None
         self.is_mtp = source.config["quantization_config"].get("component") == "mtp"
         if self.is_mtp:
@@ -549,7 +547,7 @@ class Model:
                     mixed,
                 )
             else:
-                if m >= 256:
+                if m >= 256 and not self.batch_body:
                     projection(
                         "hc-down-silu",
                         normed.flatten(1),
@@ -651,14 +649,26 @@ class Model:
         # Larger row tiles amortize expert decoding on long prompts; short
         # requests need the smaller tile to bound padding and register costs.
         expert_rows = getattr(self, "expert_profile_rows", {}).get(m, m)
-        expert_config = expert_tile_config(expert_rows)
+        # Routing and both expert projections must partition rows identically.
+        # The codec can select BM8 even when the portable reference uses BM64.
+        expert_configs = [
+            expert_projection_config(
+                expert_rows,
+                width,
+                parity_xor=self.weights[f"blk.{layer}.{name}"]["parity_xor"],
+            )
+            for layer in self.layer_ids
+            for name, width in (("ffn_gate_up_exps.weight", h), ("ffn_down_exps.weight", f))
+        ]
+        expert_config = expert_configs[0]
         expert_bm = expert_config["block_m"]
+        if any(config["block_m"] != expert_bm for config in expert_configs):
+            raise ValueError("Expert route and projection row tiles must agree across banks")
         byte_permute = expert_config["byte_permute"]
         tiles = (assignments + expert_bm - 1) // expert_bm + min(e, assignments)
-        # Route tile count is not monotonic in request length. A conservative
-        # BM32 full-workspace bound covers the BM64 and shorter BM16/BM32
-        # profiles; empty() also reserves at least this profile's live tiles.
-        arena_block_m = 32
+        # Reserve the full arena for the actual coupled route/projection tile.
+        # In particular BM8 needs more entries than a BM32/BM64 route bound.
+        arena_block_m = expert_bm
         arena_assignments = self.prefill_workspace_rows * k
         route_reserve = (
             ((arena_assignments + arena_block_m - 1) // arena_block_m + min(e, arena_assignments))
@@ -1028,7 +1038,7 @@ class Model:
             shortbook = expert_config["shortbook"]
             selectorbook = expert_config["selectorbook"]
             book_key = "selector_table" if selectorbook else "short_table" if shortbook else "table"
-            if m >= 256:
+            if m >= 256 and not self.batch_body:
                 call(
                     f"histogram-local-{m}",
                     lambda: expert_histogram_local(m, e, k),
