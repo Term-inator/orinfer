@@ -261,17 +261,9 @@ impl Executor {
         let decode_programs = &prepared.decode_programs;
         let fingerprint = prepared.fingerprint.clone();
         let expert_plan = super::experts::Plan::new(prepared, options.resident_experts)?;
-        let mut cuda_graph = if expert_plan.is_some() {
-            if options.cuda_graph != CudaGraphMode::Off {
-                eprintln!(
-                    "Finite expert residency uses direct execution for route-dependent SSD paging (requested CUDA graph mode: {})",
-                    options.cuda_graph
-                );
-            }
-            CudaGraphMode::Off
-        } else {
-            options.cuda_graph
-        };
+        // Finite experts keep route-dependent host paging outside capture;
+        // safe GPU pieces still honor the requested graph phase.
+        let mut cuda_graph = options.cuda_graph;
         let load_workers = options.weight_workers()?;
         if decode_programs
             .iter()
@@ -1148,6 +1140,28 @@ impl Executor {
                     _ => {}
                 }
             }
+        }
+        if self.expert_cache.borrow().is_some() {
+            let ops = self
+                .direct
+                .as_ref()
+                .ok_or("Missing finite bindings")?
+                .programs
+                .get(name)
+                .ok_or("Missing finite program")?;
+            let calls = ops
+                .iter()
+                .cloned()
+                .map(|operation| crate::execution::Invocation {
+                    operation,
+                    sequence: None,
+                    launch: None,
+                    views: BTreeMap::new(),
+                })
+                .collect::<Vec<_>>();
+            self.ensure_invocation_kernels(&calls)?;
+            return self
+                .finite_operations(&calls, self.cuda_graph.uses_graph(phase).then_some(true));
         }
         if self.cuda_graph.uses_graph(phase) {
             // Capture resolves all functions once; replay retains its modules

@@ -253,7 +253,12 @@ impl Executor {
                 _ => {}
             }
         }
-        if self.cuda_graph.uses_graph(phase) {
+        if self.expert_cache.borrow().is_some() {
+            self.finite_operations(
+                &operations,
+                self.cuda_graph.uses_graph(phase).then_some(true),
+            )
+        } else if self.cuda_graph.uses_graph(phase) {
             self.invoke_shared_pieces(&operations, true)
         } else {
             for invocation in operations.iter() {
@@ -1345,8 +1350,23 @@ impl Executor {
         Ok(())
     }
     fn capture(&self, operations: &[Invocation]) -> Result<Handle> {
+        self.capture_on(operations, self.session.stream, true)
+    }
+    fn capture_on(
+        &self,
+        operations: &[Invocation],
+        stream: sys::CUstream,
+        parallel: bool,
+    ) -> Result<Handle> {
+        if self.expert_cache.borrow().as_ref().is_some_and(|pager| {
+            operations.iter().any(
+                |op| matches!(&op.operation, Operation::Kernel { name } if pager.consumes(name)),
+            )
+        }) {
+            return Err("Expert route preparation must remain outside graph capture".into());
+        }
         self.ensure_invocation_kernels(operations)?;
-        if !self.parallel_regions.borrow().is_empty() {
+        if parallel && !self.parallel_regions.borrow().is_empty() {
             self.ensure_parallel_handles()?;
         }
         // SAFETY: All bindings and backing allocations outlive graph execution;
@@ -1354,18 +1374,24 @@ impl Executor {
         unsafe {
             check(
                 sys::cuStreamBeginCapture_v2(
-                    self.session.stream,
+                    stream,
                     sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
                 ),
                 "begin request capture",
             )?;
         }
-        let result = self.parallel_operations(operations, false);
+        let result = if parallel {
+            self.parallel_operations(operations, false, None)
+        } else {
+            operations
+                .iter()
+                .try_for_each(|op| self.invoke_on(op, stream))
+        };
         let mut graph = ptr::null_mut();
         // SAFETY: Always end capture, including a failed recorded operation.
         let end = unsafe {
             check(
-                sys::cuStreamEndCapture(self.session.stream, &mut graph),
+                sys::cuStreamEndCapture(stream, &mut graph),
                 "end request capture",
             )
         };
@@ -1378,7 +1404,11 @@ impl Executor {
             }
             return Err(error);
         }
-        let flags = match self.prioritize_parallel_graph(graph, operations) {
+        let flags = match if parallel {
+            self.prioritize_parallel_graph(graph, operations)
+        } else {
+            Ok(0)
+        } {
             Ok(flags) => flags,
             Err(error) => {
                 // SAFETY: Local graph has not been instantiated or published.
@@ -1550,7 +1580,36 @@ impl Executor {
         };
         Ok(handles)
     }
-    fn parallel_operations(&self, operations: &[Invocation], expert_only: bool) -> Result<()> {
+    pub(super) fn finite_operations(
+        &self,
+        operations: &[Invocation],
+        pieces: Option<bool>,
+    ) -> Result<()> {
+        if self.weight_cache.borrow().is_some() {
+            return operations.iter().try_for_each(|op| self.invoke(op));
+        }
+        self.parallel_operations(operations, true, pieces)
+    }
+    fn piece_on(
+        &self,
+        operations: &[Invocation],
+        stream: sys::CUstream,
+        pieces: Option<bool>,
+    ) -> Result<()> {
+        if let Some(allow_capture) = pieces {
+            self.invoke_shared_pieces_on(operations, allow_capture, stream)
+        } else {
+            operations
+                .iter()
+                .try_for_each(|op| self.invoke_on(op, stream))
+        }
+    }
+    fn parallel_operations(
+        &self,
+        operations: &[Invocation],
+        expert_only: bool,
+        pieces: Option<bool>,
+    ) -> Result<()> {
         let mut regions = parallel_regions(
             operations,
             &self.parallel_regions.borrow(),
@@ -1574,12 +1633,15 @@ impl Executor {
             });
         }
         if regions.is_empty() {
-            return operations.iter().try_for_each(|op| self.invoke(op));
+            return self.piece_on(operations, self.session.stream, pieces);
         }
         let (side, fork_event, join_event) = self.ensure_parallel_handles()?;
         let result = (|| {
-            for (i, op) in operations.iter().enumerate() {
+            let mut first = 0;
+            for (i, _) in operations.iter().enumerate() {
                 if let Some(&[_, start, last, _]) = regions.iter().find(|r| r[0] == i) {
+                    self.piece_on(&operations[first..i], self.session.stream, pieces)?;
+                    first = i;
                     // SAFETY: Work forks from the main stream's completed prefix;
                     // adapter-certified branches have disjoint writable buffers.
                     unsafe {
@@ -1602,9 +1664,7 @@ impl Executor {
                             self.invoke_on(operation, side)?;
                         }
                     } else {
-                        for operation in &operations[start..=last] {
-                            self.invoke_on(operation, side)?;
-                        }
+                        self.piece_on(&operations[start..=last], side, pieces)?;
                     }
                     // SAFETY: The side event follows every producer in the branch.
                     unsafe {
@@ -1615,9 +1675,13 @@ impl Executor {
                     }
                 }
                 if regions.iter().any(|r| r[1] <= i && i <= r[2]) {
+                    self.piece_on(&operations[first..i], self.session.stream, pieces)?;
+                    first = i + 1;
                     continue;
                 }
                 if regions.iter().any(|r| r[3] == i) {
+                    self.piece_on(&operations[first..i], self.session.stream, pieces)?;
+                    first = i;
                     // SAFETY: Join before consumers and before the next layer reuses scratch.
                     unsafe {
                         check(
@@ -1626,9 +1690,8 @@ impl Executor {
                         )?;
                     }
                 }
-                self.invoke(op)?;
             }
-            Ok(())
+            self.piece_on(&operations[first..], self.session.stream, pieces)
         })();
         if expert_only {
             if result.is_err() {
@@ -1682,8 +1745,9 @@ impl Executor {
     /// Query after ensuring every segment's KV mapping: arena growth invalidates
     /// captures. The sole worker cannot change the cache between this and replay.
     pub(crate) fn has_batch_graph(&self, key: &[(usize, usize)], decode: bool) -> bool {
-        (self.cuda_graph == crate::execution::CudaGraphMode::Full
-            || (decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly))
+        self.expert_cache.borrow().is_none()
+            && (self.cuda_graph == crate::execution::CudaGraphMode::Full
+                || (decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly))
             && self.batch_graphs.borrow().keys().any(|cached| {
                 cached == &key.to_vec().into()
                     || cached.shared.is_some()
@@ -1749,6 +1813,13 @@ impl Executor {
             let Some(victim) = victim else { return Ok(()) };
             let at = Instant::now();
             self.sync()?;
+            if let Some((side, _, _)) = *self.session.parallel_handles.borrow() {
+                // SAFETY: A finite expert side piece can be live independently
+                // of the main stream until its explicit join.
+                unsafe {
+                    check(sys::cuStreamSynchronize(side), "drain evicted side graph")?;
+                }
+            }
             let graph = match victim {
                 Victim::Batch(key) => self.batch_graphs.borrow_mut().remove(&key).unwrap().0,
                 Victim::Shared(key) => self.shared_graphs.borrow_mut().remove(&key).unwrap().0,
@@ -1766,6 +1837,14 @@ impl Executor {
         }
         let names: Vec<&str> = match &op.operation {
             Operation::Kernel { name } => {
+                if self
+                    .expert_cache
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|pager| pager.consumes(name))
+                {
+                    return Ok(None);
+                }
                 let direct = self.direct.as_ref().ok_or("Missing direct bindings")?;
                 let kernels = direct.kernels.borrow();
                 let kernel = kernels.get(name).ok_or("Missing shared kernel")?;
@@ -1807,6 +1886,14 @@ impl Executor {
     /// Share stateless pieces across changing request membership. Private stages
     /// remain direct; pointer-table contents are uploaded before any replay.
     fn invoke_shared_pieces(&self, operations: &[Invocation], allow_capture: bool) -> Result<()> {
+        self.invoke_shared_pieces_on(operations, allow_capture, self.session.stream)
+    }
+    fn invoke_shared_pieces_on(
+        &self,
+        operations: &[Invocation],
+        allow_capture: bool,
+        stream: sys::CUstream,
+    ) -> Result<()> {
         use super::executor::SharedGraphKey;
         let mut cursor = 0;
         while cursor < operations.len() {
@@ -1820,7 +1907,7 @@ impl Executor {
                 cursor += 1;
             }
             if cursor == start {
-                self.invoke(&operations[cursor])?;
+                self.invoke_on(&operations[cursor], stream)?;
                 cursor += 1;
                 continue;
             }
@@ -1828,7 +1915,7 @@ impl Executor {
             // Tiny pieces do not amortize instantiation or an extra graph launch.
             if !(8..=BATCH_GRAPH_NODES).contains(&piece.len()) {
                 for op in piece {
-                    self.invoke(op)?;
+                    self.invoke_on(op, stream)?;
                 }
                 continue;
             }
@@ -1863,7 +1950,7 @@ impl Executor {
                 } else {
                     self.reserve_graph_nodes(piece.len(), true)?;
                     let at = Instant::now();
-                    let graph = self.capture(piece)?;
+                    let graph = self.capture_on(piece, stream, stream == self.session.stream)?;
                     let mut stats = self.batch_statistics.get();
                     stats.capture_s += at.elapsed().as_secs_f64();
                     stats.captured_operations += piece.len();
@@ -1878,10 +1965,7 @@ impl Executor {
                 // SAFETY: All piece addresses are weights/workspace, retained by
                 // the session. Current resolved addresses are part of the key.
                 unsafe {
-                    check(
-                        sys::cuGraphLaunch(graph, self.session.stream),
-                        "shared batch piece",
-                    )?;
+                    check(sys::cuGraphLaunch(graph, stream), "shared batch piece")?;
                 }
                 let mut stats = self.batch_statistics.get();
                 stats.graph_hits += usize::from(cached.is_some());
@@ -1889,7 +1973,7 @@ impl Executor {
                 self.batch_statistics.set(stats);
             } else {
                 for op in piece {
-                    self.invoke(op)?;
+                    self.invoke_on(op, stream)?;
                 }
             }
         }
@@ -2107,6 +2191,21 @@ impl Executor {
                 self.ensure_writable_range(name, offset, bytes)?;
             }
         }
+        if self.expert_cache.borrow().is_some() {
+            self.ensure_invocation_kernels(operations)?;
+            let enabled = self.cuda_graph == crate::execution::CudaGraphMode::Full
+                || decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly;
+            let at = Instant::now();
+            self.finite_operations(operations, enabled.then_some(allow_capture))?;
+            overlap();
+            self.sync()?;
+            let mut stats = self.batch_statistics.get();
+            stats.direct_s += at.elapsed().as_secs_f64();
+            stats.dynamic_direct_iterations +=
+                usize::from(operations.iter().any(|op| op.launch.is_some()));
+            self.batch_statistics.set(stats);
+            return Ok(());
+        }
         if self.replay_cached_batch(operation, &segments, prepared, decode, overlap)? {
             return Ok(());
         }
@@ -2221,11 +2320,6 @@ impl Executor {
             let at = Instant::now();
             if configured {
                 self.invoke_shared_pieces(operations, allow_capture)?;
-            } else if self.expert_cache.borrow().is_some() && self.weight_cache.borrow().is_none() {
-                // Reuse adapter-certified fork/join regions without capture.
-                // The resident shared FFN is submitted before the expert route
-                // barrier, allowing it to run during host reads and uploads.
-                self.parallel_operations(operations, true)?;
             } else {
                 for op in operations {
                     self.invoke(op)?;

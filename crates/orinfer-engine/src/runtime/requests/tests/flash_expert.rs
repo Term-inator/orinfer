@@ -14,7 +14,7 @@ fn validate_flash_expert_route_consistency() {
         LoadOptions {
             resident_experts: crate::execution::ResidentExperts::Count(8),
             host_weight_cache_bytes: 16usize << 30,
-            cuda_graph: crate::execution::CudaGraphMode::Off,
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..Default::default()
@@ -137,6 +137,9 @@ fn validate_flash_compact_expert_owners() {
         0
     );
     *model.execution.parallel_regions.borrow_mut() = regions;
+    model
+        .execution
+        .set_graph_mode_for_test(fixture.cuda_graph.parse().unwrap());
     for order in [[0, 1], [1, 0]] {
         // A cancelled owner must release its arena before the reversed admission.
         let mut cancelled = model
@@ -189,6 +192,16 @@ fn validate_flash_compact_expert_owners() {
         branches > 0,
         "Finite expert validation must execute independent branches"
     );
+    let stats = model.execution.batch_statistics.get();
+    if fixture.cuda_graph != "off" {
+        assert!(
+            stats.shared_graph_captures > 0,
+            "No finite GPU pieces captured"
+        );
+        assert!(stats.shared_graph_hits > 0, "No finite GPU pieces replayed");
+        assert_eq!(stats.dynamic_graph_captures, 0);
+        assert!(model.execution.graphs.borrow().is_empty());
+    }
     std::fs::write(fixture.output,serde_json::to_vec_pretty(&json!({"owners":2,"reverse_admission":true,"cancelled_arena_reuse":true,"batch_shrink":true,"logits_and_committed_state_exact":true,"serial_reference":true,"expert_parallel_branches":branches})).unwrap()).unwrap();
 }
 
@@ -205,7 +218,7 @@ fn validate_flash_expert_parallel_read_failure() {
         LoadOptions {
             resident_experts: crate::execution::ResidentExperts::Count(1),
             host_weight_cache_bytes: 0,
-            cuda_graph: crate::execution::CudaGraphMode::Off,
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..Default::default()
@@ -216,7 +229,18 @@ fn validate_flash_expert_parallel_read_failure() {
         .start_request(input(&fixture.cases[0], 8), &|| false)
         .unwrap();
     prefill_reference(&mut model, &mut request);
-    assert!(model.execution.session.parallel_handles.borrow().is_none());
+    if fixture.cuda_graph != "off" {
+        for _ in 0..3 {
+            model
+                .advance_requests(&mut [&mut request], &scheduler::Options::default())
+                .unwrap();
+        }
+        let stats = model.execution.batch_statistics.get();
+        assert!(stats.shared_graph_captures > 0);
+        assert!(stats.shared_graph_hits > 0);
+    } else {
+        assert!(model.execution.session.parallel_handles.borrow().is_none());
+    }
     let directory = tempfile::tempdir().unwrap();
     model.execution.fail_expert_reads_for_test(directory.path());
     let error = model
