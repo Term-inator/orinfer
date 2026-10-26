@@ -91,10 +91,15 @@ def swiglu_activation_quantization(
 
 
 def _build(K, group_size, masked, fused, threads):
+    from tools.model.compile import construction_call
+
     assert isinstance(K, int) and K > 0
     group = K if group_size is None else group_size
     assert isinstance(group, int) and 0 < group <= K
     assert threads in (128, 256, 512)
+    primitive = construction_call(_compile, (K, group, masked, fused, threads), {}, {})
+    if primitive is not None:
+        return primitive
     kernel = _compile(K, group, masked, fused, threads)
     kernel.adapter.kernels = dict(kernel.adapter.kernels)
     return kernel

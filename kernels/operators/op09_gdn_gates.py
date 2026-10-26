@@ -84,6 +84,16 @@ def gdn_gates(
     beta_round_fp16=False,
 ):
     """Compile/load one dynamic-M cubin, isolating TileLang's entry mapping."""
+    from tools.model.compile import construction_call
+
+    primitive = construction_call(
+        _compile_gates,
+        (dtype, block, threads, parameter_mode, packed_ab, beta_round_fp16),
+        {},
+        {},
+    )
+    if primitive is not None:
+        return primitive
     kernel = _compile_gates(dtype, block, threads, parameter_mode, packed_ab, beta_round_fp16)
     kernel.adapter.kernels = dict(kernel.adapter.kernels)
     return kernel

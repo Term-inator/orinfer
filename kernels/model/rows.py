@@ -20,11 +20,11 @@ def explicit_rows(function):
     variables = set()
 
     def visit(node):
-        if isinstance(node, tir.Var) and node.name == "m":
+        if isinstance(node, tir.Var) and node.name in ("m", "rows", "tokens", "batch"):
             variables.add(node)
 
     for parameter in function.params:
-        if parameter.name == "m" and parameter.dtype != "handle":
+        if parameter.name in ("m", "rows", "tokens", "batch") and parameter.dtype != "handle":
             return function
     for buffer in function.buffer_map.values():
         for expression in [*buffer.shape, *buffer.strides]:

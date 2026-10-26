@@ -39,6 +39,11 @@ def orin_jit(function=None, *, pass_configs=None):
 
     @wraps(function)
     def build(*args, **kwargs):
+        from tools.model.compile import construction_call
+
+        primitive = construction_call(function, args, kwargs, pass_configs or {})
+        if primitive is not None:
+            return primitive
         kernel = validate_kernel_resources(compiled(*args, **kwargs))
         kernel.adapter.kernels = dict(kernel.adapter.kernels)
 
