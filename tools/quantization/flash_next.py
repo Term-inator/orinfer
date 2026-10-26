@@ -115,7 +115,11 @@ def verify(path, task, record, contract):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--index", type=Path, required=True)
-    p.add_argument("--repo", default="Qwen/Qwen3.8-Flash-Next")
+    p.add_argument(
+        "--repo",
+        default="Qwen/Qwen3.8-Flash-Next",
+        help="Repository ID; prefix modelscope: to read exclusively from ModelScope",
+    )
     p.add_argument("--revision", required=True)
     p.add_argument("--source-dir", type=Path)
     p.add_argument("--output", type=Path, required=True)

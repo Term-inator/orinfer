@@ -102,11 +102,13 @@ class Source:
         self.weight_map = json.loads(Path(index).read_text())["weight_map"]
         self.directory = Path(directory) if directory else None
         self.repo, self.revision = repo, revision
+        self.modelscope = bool(repo and repo.startswith("modelscope:"))
+        self.repository = repo.removeprefix("modelscope:") if self.modelscope else repo
         self.cache = Path(cache) if cache else None
         if self.directory is None:
             if (
                 not repo
-                or len(repo.split("/")) != 2
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository)
                 or not re.fullmatch(r"[0-9a-f]{40}", revision or "")
             ):
                 raise ValueError("Remote weights require repository and pinned commit")
@@ -127,7 +129,17 @@ class Source:
             return data
         encoded = urllib.parse.quote(filename, safe="/")
         # Distinct query prevents a CDN from reusing a different cached range.
-        url = f"https://huggingface.co/{self.repo}/resolve/{self.revision}/{encoded}?download=true&orinfer_range={offset}-{count}"
+        if self.modelscope:
+            query = urllib.parse.urlencode(
+                {
+                    "Revision": self.revision,
+                    "FilePath": filename,
+                    "orinfer_range": f"{offset}-{count}",
+                }
+            )
+            url = f"https://modelscope.cn/api/v1/models/{self.repository}/repo?{query}"
+        else:
+            url = f"https://huggingface.co/{self.repo}/resolve/{self.revision}/{encoded}?download=true&orinfer_range={offset}-{count}"
         for attempt in range(5):
             try:
                 req = urllib.request.Request(

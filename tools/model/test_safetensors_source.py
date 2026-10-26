@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+import urllib.parse
 
 import numpy as np
 from safetensors.numpy import save_file
@@ -11,6 +12,45 @@ from tools.model.safetensors_source import Source, validate_header
 
 
 class OriginalSourceTests(unittest.TestCase):
+    def test_modelscope_reads_pinned_range_and_rejects_full_download(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "index.json"
+            path.write_text(json.dumps({"weight_map": {"x": "weights.safetensors"}}))
+            source = Source(path, repo="modelscope:Qwen/model", revision="a" * 40)
+
+            class Response:
+                status = 206
+                headers = {"Content-Range": "bytes 16-19/100"}
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    pass
+
+                def read(self, count):
+                    self.read_count = count
+                    return b"data"
+
+            response = Response()
+            with patch("urllib.request.urlopen", return_value=response) as request:
+                self.assertEqual(source.read("weights.safetensors", 16, 4), b"data")
+                req = request.call_args.args[0]
+                url = urllib.parse.urlparse(req.full_url)
+                self.assertEqual(url.netloc, "modelscope.cn")
+                self.assertEqual(url.path, "/api/v1/models/Qwen/model/repo")
+                self.assertEqual(urllib.parse.parse_qs(url.query)["Revision"], ["a" * 40])
+                self.assertEqual(req.get_header("Range"), "bytes=16-19")
+                self.assertEqual(response.read_count, 5)
+                response.status = 200
+                with (
+                    patch("time.sleep"),
+                    self.assertRaisesRegex(ValueError, "exact requested range"),
+                ):
+                    source.read("weights.safetensors", 16, 4)
+                # The body of a full-file HTTP 200 must never be consumed.
+                self.assertEqual(response.read_count, 5)
+
     def test_remote_header_uses_two_bounded_ranges_and_reuses_metadata_cache(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

@@ -9,7 +9,11 @@ case "$module" in
 esac
 cd "$repo_dir"
 mkdir -p artifacts/quantization/compiler-cache/sm120
+resource_limits=()
 if [[ "$module" == flash_next ]]; then
+    # Bound host allocations and charged file cache; keep desktop applications
+    # outside the converter's OOM domain and avoid consuming host swap.
+    resource_limits=(--memory 6g --memory-swap 6g)
     exec 9>artifacts/gpu-experiment.lock
     flock 9
 fi
@@ -21,6 +25,7 @@ if [[ -n "${ORINFER_CHECKPOINT_DIR:-}" ]]; then
     source_mounts+=(-v "$checkpoint:$checkpoint:ro")
 fi
 exec docker run --rm --name "orinfer-quantizer-$module-$$" --gpus all --network host \
+    "${resource_limits[@]}" \
     --user "$(id -u):$(id -g)" --entrypoint /opt/venv/bin/python \
     -v "$repo_dir:$repo_dir" -w "$repo_dir" \
     "${source_mounts[@]}" \
