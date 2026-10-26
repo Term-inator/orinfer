@@ -616,7 +616,8 @@ def sparse_attention(m: int, capacity: int, splits: int = 8):
     return main
 
 
-@orin_jit
+# NVRTC crashes on vectorized mixed FP32 accumulation and FP16 stores.
+@orin_jit(pass_configs={"tirx.disable_vectorize": True})
 def sparse_merge(
     m: int,
     splits: int = 8,

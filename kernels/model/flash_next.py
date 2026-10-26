@@ -170,7 +170,9 @@ def hc_initialize(M: int, H: int = 2560, streams: int = 4, dynamic_rows: bool = 
     return main
 
 
-@orin_jit
+# NVRTC on SM120 crashes on the unguarded float2 addition emitted for full
+# 256-element tiles. Scalar FP32 additions retain the same FP16 boundary.
+@orin_jit(pass_configs={"tirx.disable_vectorize": True})
 def residual_add(M: int, C: int, dynamic_rows: bool = False):
     """FP16 residual update, with one owner per element; Output may alias X."""
     if any(type(v) is not int or v <= 0 for v in (M, C)):
