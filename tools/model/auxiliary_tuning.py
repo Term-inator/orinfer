@@ -251,9 +251,14 @@ def publish(
         dict(source=source, toolchain=package["toolchain"], environment=machine),
     )
     hc_records = []
-    if "injection" in families:
+    hc_kinds = tuple(
+        kind
+        for family, kind in (("hc-down", "down"), ("injection", "injection"))
+        if family in families
+    )
+    if hc_kinds:
         if data["architecture"] != "flash_next":
-            raise ValueError("HC injection rebuilding requires Flash Next")
+            raise ValueError("HC rebuilding requires Flash Next")
         from tools.model.flash_next.hc import publish as publish_hc
 
         hc_records = publish_hc(
@@ -262,7 +267,7 @@ def publish(
             compiler,
             output / "hc",
             cache,
-            kinds=("injection",),
+            kinds=hc_kinds,
         )
     dynamics = {k["name"]: k for k in package["dynamic_batch_kernels"]}
     originals = {k["name"]: k for k in package["kernels"]}
@@ -298,7 +303,7 @@ def publish(
         configs = {
             family: fuse_config(family, output, source)
             for family in families
-            if family not in ("router", "histogram", "injection")
+            if family not in ("router", "histogram", "injection", "hc-down")
         }
     report = list(hc_records)
     histogram_checks = {}
@@ -531,7 +536,7 @@ def main():
     p.add_argument(
         "--families",
         nargs="+",
-        choices=("router", "histogram", "injection", "ple", "qsa"),
+        choices=("router", "histogram", "injection", "hc-down", "ple", "qsa"),
         default=["router", "histogram", "ple", "qsa"],
     )
     p.add_argument("--cache", type=Path, default=ROOT / "artifacts/build-cache/flash-next")

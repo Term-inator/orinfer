@@ -143,9 +143,31 @@ def inventory(package, compiler, kind="down"):
     return result, dynamic, rank, streams, hidden
 
 
+def published_variants(package, compiler, representative):
+    """Retain every distinct cubin/host contract in the input row portfolio."""
+    prefix = representative["name"]
+    pointers = compiler.pointers(representative)
+    result, seen = [], set()
+    for item in [
+        representative,
+        *(k for k in package["kernels"] if k["name"].startswith(prefix + "/rows/")),
+    ]:
+        if compiler.pointers(item) != pointers:
+            raise ValueError("HC row variant changes its operand views")
+        key = (
+            item["symbol"],
+            *(item[field]["sha256"] for field in ("module", "source", "host_abi")),
+        )
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
 def publish_kind(model, package, compiler, output, cache, kind):
     import torch
-    from kernels.model.hyperconnection import hc_projection, hc_injection
+    from kernels.model.hyperconnection import hc_injection
+    from kernels.model.hc_down import hc_down_cached
     from tools.model.compile import primitive
     from tools.model.flash_next.build import read_weights, source_identity, toolchain
 
@@ -155,15 +177,22 @@ def publish_kind(model, package, compiler, output, cache, kind):
     machine = toolchain()
     output.mkdir(parents=True, exist_ok=True)
     replaced, added, launches, removed, records = {}, [], {}, set(), []
-    # Every candidate keeps the sequential per-stream FP32 reductions and the
-    # same MMA K16 traversal. Only row/output tiling changes.
-    configs = [
-        dict(block_m=m, block_n=n)
-        for m, n in ((64, 128), (16, 16), (16, 32), (16, 64), (16, 128), (32, 32))
-    ]
+    # Each stream retains its K16 FP32 sum. New cached schedules compete
+    # against every existing matrix contract, including its row variants.
     if kind == "injection":
-        configs = [dict(algorithm="published")] + [
-            dict(algorithm="cached", block_m=m) for m in (1, 2, 3)
+        cached = [dict(algorithm="cached", block_m=m) for m in (1, 2, 3)]
+    else:
+        cached = [
+            dict(algorithm="cached", block_m=m, block_n=n, block_k=k, stages=stages)
+            for m, n, k, stages in (
+                (1, 16, 128, 2),
+                (1, 16, 128, 3),
+                (1, 16, 128, 4),
+                (2, 16, 128, 2),
+                (2, 16, 128, 3),
+                (1, 16, 256, 2),
+                (1, 32, 128, 2),
+            )
         ]
     for silu, items in sorted(groups.items()):
         representative = max(items, key=lambda k: dynamics[k["name"]]["capacity"])
@@ -175,24 +204,32 @@ def publish_kind(model, package, compiler, output, cache, kind):
             {"W": dict(kind="buffer", name=weight_name)},
             compiler.buffers,
         )["W"]
-        reference = Reference(compiler, representative)
+        variants = published_variants(package, compiler, representative)
+        references = [Reference(compiler, kernel) for kernel in variants]
+        reference = references[0]
+        configs = [dict(algorithm="published", variant=i) for i in range(len(variants))] + cached
         tuner = RowTuner(
             cache / "hc",
             dict(
                 source=source,
                 toolchain=machine,
                 weight=weight["data"],
-                reference=representative["module"],
+                references=[
+                    {field: kernel[field] for field in ("module", "source", "host_abi", "symbol")}
+                    for kernel in variants
+                ],
             ),
             capacity=capacity,
         )
 
         def build(config):
             options = dict(config)
-            algorithm = options.pop("algorithm", "matrix")
+            algorithm = options.pop("algorithm")
             if algorithm == "published":
-                return reference
-            if algorithm == "cached":
+                return references[options["variant"]]
+            if algorithm != "cached":
+                raise ValueError("Unknown HC implementation")
+            if kind == "injection":
                 return primitive(
                     hc_injection,
                     capacity,
@@ -203,15 +240,12 @@ def publish_kind(model, package, compiler, output, cache, kind):
                     **options,
                 )
             return primitive(
-                hc_projection,
+                hc_down_cached,
                 capacity,
                 outputs,
-                streams * hidden,
-                dtype="float16",
-                dynamic_rows=True,
+                hidden,
                 streams=streams,
-                reduction_groups=streams if kind == "down" else 1,
-                group_m=4,
+                dynamic_rows=True,
                 silu=silu,
                 **options,
             )
@@ -228,12 +262,18 @@ def publish_kind(model, package, compiler, output, cache, kind):
                     )
                     out = storage[:-31].view(rows, outputs)
 
+                    w = (
+                        real.view(torch.uint32)
+                        if kind == "down" and config["algorithm"] == "cached"
+                        else real
+                    )
+
                     def run():
-                        launch(kernel, x, real, out, rows)
+                        launch(kernel, x, w, out, rows)
 
                     def check():
                         torch.cuda.synchronize()
-                        if not torch.equal(out, expected):
+                        if not torch.equal(out.view(torch.int16), expected.view(torch.int16)):
                             raise AssertionError(
                                 f"HC {kind} arithmetic differs at {rows} rows: {config}"
                             )
@@ -284,7 +324,10 @@ def publish_kind(model, package, compiler, output, cache, kind):
                         )
                     ]
                     if kind == "injection"
-                    else None
+                    else [
+                        min(n, capacity)
+                        for n in (1, 2, 3, 4, 8, 17, 32, 64, 96, 128, 192, 256, 512, 1024, capacity)
+                    ]
                 ),
             )
             selected_kernels = {}
@@ -301,8 +344,11 @@ def publish_kind(model, package, compiler, output, cache, kind):
                         selected_kernels[key] = (
                             None if config.get("algorithm") == "published" else build(config)
                         )
+                    template = (
+                        variants[config["variant"]] if config["algorithm"] == "published" else old
+                    )
                     item, dynamic = compiler.emit(
-                        old,
+                        template,
                         old["name"] + suffix,
                         compiler.pointers(old),
                         rows,
@@ -322,7 +368,8 @@ def publish_kind(model, package, compiler, output, cache, kind):
             records.append(dict(kind=kind, silu=silu, bindings=len(items), selection=selected))
         finally:
             torch.cuda.synchronize()
-            reference.close()
+            for reference in references:
+                reference.close()
     package["kernels"] = [
         replaced.get(k["name"], k) for k in package["kernels"] if k["name"] not in removed
     ] + added

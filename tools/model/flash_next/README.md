@@ -87,6 +87,14 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-inje
   --auxiliary-only injection
 ```
 
+`--auxiliary-only hc-down` 单独调优 HC down。缓存候选在同一 block 内并行计算四个 stream 的原始 FP32 累加，按原顺序合并后执行 FP16 舍入及声明的 SiLU 边界，不增加全局临时工作区。缓存加载与原有 BF16 单行投影共享计算组件。输入包全部不同的矩阵 cubin／host ABI 也参与测量；行数选择按实际测量发布，并保留原来的权重和其他模型绑定。
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-down-build \
+  --model /path/to/native-model --model-output artifacts/models/flash-down-ready \
+  --auxiliary-only hc-down
+```
+
 在 CPU 上清点构造契约：
 
 ```bash

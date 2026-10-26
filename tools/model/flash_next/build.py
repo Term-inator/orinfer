@@ -419,7 +419,7 @@ def main():
     p.add_argument(
         "--auxiliary-only",
         nargs="+",
-        choices=("router", "histogram", "injection", "ple", "qsa"),
+        choices=("router", "histogram", "injection", "hc-down", "ple", "qsa"),
         help="Rebuild selected auxiliary families with unchanged model arithmetic",
     )
     p.add_argument(

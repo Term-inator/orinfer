@@ -4,7 +4,7 @@ import copy
 from types import SimpleNamespace
 import unittest
 
-from tools.model.flash_next.hc import inventory
+from tools.model.flash_next.hc import inventory, published_variants
 
 
 class HcContractsTests(unittest.TestCase):
@@ -127,6 +127,37 @@ class HcContractsTests(unittest.TestCase):
         compiler.buffers["Down"]["shape"] = [1024 * 3]
         with self.assertRaisesRegex(ValueError, "four stream gates"):
             inventory(package, compiler, "injection")
+
+    def test_published_variants_keep_distinct_host_and_symbol_contracts(self):
+        base = dict(
+            name="hc/down",
+            symbol="main",
+            **{key: dict(sha256=key) for key in ("module", "source", "host_abi")},
+        )
+        duplicate = copy.deepcopy(base)
+        duplicate["name"] += "/rows/1-8"
+        changed = copy.deepcopy(duplicate)
+        changed["name"] = "hc/down/rows/9-16"
+        changed["host_abi"]["sha256"] = "other-host"
+        symbol = copy.deepcopy(duplicate)
+        symbol["name"] = "hc/down/rows/17-32"
+        symbol["symbol"] = "other-symbol"
+        compiler = SimpleNamespace(pointers=lambda kernel: dict(A="x", W="w", C="y"))
+        self.assertEqual(
+            published_variants(dict(kernels=[base, duplicate, changed, symbol]), compiler, base),
+            [base, changed, symbol],
+        )
+
+    def test_published_variant_cannot_change_its_operand_views(self):
+        base = dict(
+            name="hc/down",
+            symbol="main",
+            **{key: dict(sha256=key) for key in ("module", "source", "host_abi")},
+        )
+        other = dict(base, name="hc/down/rows/1-8")
+        compiler = SimpleNamespace(pointers=lambda kernel: dict(A=kernel["name"], W="w", C="y"))
+        with self.assertRaisesRegex(ValueError, "operand views"):
+            published_variants(dict(kernels=[base, other]), compiler, base)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import unittest
 from tilelang import tvm
 
+from kernels.model.hc_down import hc_down_cached
 from kernels.model.rows import explicit_rows
 from tools.model.projection_tuning import factory as projection_factory, make_prim
 from kernels.model import moe, hyperconnection, flash_next, rotation_a8
@@ -478,6 +479,31 @@ class DynamicRowsTests(unittest.TestCase):
         for buffer in fn.buffer_map.values():
             if buffer.name in ("X", "Q", "S"):
                 self.assertTrue(buffer.shape[0].same_as(scalar))
+
+    def test_cached_hc_down_keeps_dynamic_rows_and_original_physical_bytes(self):
+        for tile in (1, 2):
+            fn = explicit_rows(
+                hc_down_cached.__wrapped__(1024, 320, 2560, block_m=tile, dynamic_rows=True)
+            )
+            (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
+            buffers = {b.name: b for b in fn.buffer_map.values()}
+            self.assertTrue(buffers["A"].shape[0].same_as(rows))
+            self.assertEqual([int(n) for n in buffers["A"].shape[1:]], [4, 2560])
+            self.assertEqual([int(n) for n in buffers["W"].shape], [320, 5120])
+            self.assertEqual(str(buffers["W"].dtype), "uint32")
+            self.assertTrue(buffers["C"].shape[0].same_as(rows))
+            self.assertEqual(int(buffers["C"].shape[1]), 320)
+        for options in (
+            dict(streams=2),
+            dict(block_m=3),
+            dict(block_n=7),
+            dict(block_k=64),
+            dict(silu=1),
+        ):
+            with self.assertRaisesRegex(ValueError, "geometry"):
+                hc_down_cached.__wrapped__(1024, 320, 2560, **options)
+        with self.assertRaisesRegex(ValueError, "shared memory"):
+            hc_down_cached.__wrapped__(1024, 320, 2560, block_m=2, stages=4)
 
     def test_single_output_gate_keeps_the_dynamic_row_argument(self):
         for capacity in (8, 128):
