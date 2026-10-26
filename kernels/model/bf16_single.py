@@ -6,14 +6,11 @@ expanded representation is created. FP32 accumulates in the original K16 order.
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.bf16_mma import SOURCE
-from kernels.model.floating_core import mma_loop
+from kernels.model.floating_core import mma_loop, cached_warp_loop, CACHED_WARP_PASSES
 from kernels.model.rows import row_count
 
 
-@orin_jit(
-    pass_configs={"tl.disable_thread_storage_sync": True, "tl.disable_shared_memory_reuse": True}
-)
+@orin_jit(pass_configs=CACHED_WARP_PASSES)
 def bf16_single(
     N,
     K,
@@ -44,6 +41,8 @@ def bf16_single(
         raise ValueError("Invalid request tile ordering")
     rows = row_count(rows, dynamic_rows)
 
+    product = cached_warp_loop(rows, K, 1, bn, bk, stages)
+
     @T.prim_func
     def main(
         A: T.Tensor((rows, groups, K), T.float16),
@@ -58,97 +57,10 @@ def bf16_single(
         ) as (block, group, lane):
             bx = block // rows if row_major_grid else block
             row = block % rows if row_major_grid else lane
-            T.import_source(SOURCE)
             tid = T.get_thread_binding()
-            lane = tid % 32
-            warp = tid // 32
-            live = T.alloc_shared((K,), T.bfloat16)
-            w = T.alloc_shared((stages, bn, bk // 2), T.uint32)
+            lane, warp = tid % 32, tid // 32
             acc = T.alloc_local((4,), T.float32)
-            v = T.alloc_local((4,), T.uint32)
-            T.clear(acc)
-            for initial in T.unroll(min(stages - 1, K // bk)):
-                for it in T.unroll(bn * bk // (threads * 8)):
-                    index = (tid + it * threads) * 4
-                    n = index // (bk // 2)
-                    col = index % (bk // 2)
-                    T.ptx_cp_async(
-                        T.access_ptr(w[initial, n, col ^ ((n % 8) * 4)], "w", 4),
-                        T.access_ptr(
-                            Weight[bx * bn + n, group * (K // 2) + initial * (bk // 2) + col],
-                            "r",
-                            4,
-                        ),
-                        4,
-                    )
-                T.ptx_commit_group()
-            for j in T.Parallel(K):
-                live[j] = A[row, group, j]
-            for step in T.serial(K // bk):
-                slot = step % stages
-                if stages == 4:
-                    if step + 2 < K // bk:
-                        T.ptx_wait_group(2)
-                    elif step + 1 < K // bk:
-                        T.ptx_wait_group(1)
-                    else:
-                        T.ptx_wait_group(0)
-                elif stages == 3:
-                    if step + 1 < K // bk:
-                        T.ptx_wait_group(1)
-                    else:
-                        T.ptx_wait_group(0)
-                else:
-                    T.ptx_wait_group(0)
-                T.sync_threads()
-                if step + stages - 1 < K // bk:
-                    nxt = (step + stages - 1) % stages
-                    for it in T.unroll(bn * bk // (threads * 8)):
-                        index = (tid + it * threads) * 4
-                        n = index // (bk // 2)
-                        col = index % (bk // 2)
-                        T.ptx_cp_async(
-                            T.access_ptr(w[nxt, n, col ^ ((n % 8) * 4)], "w", 4),
-                            T.access_ptr(
-                                Weight[
-                                    bx * bn + n,
-                                    group * (K // 2) + (step + stages - 1) * (bk // 2) + col,
-                                ],
-                                "r",
-                                4,
-                            ),
-                            4,
-                        )
-                    T.ptx_commit_group()
-                for kk in T.unroll(bk // 16):
-                    b0 = T.call_pure_extern(
-                        "uint32",
-                        "hc_raw_pair",
-                        T.access_ptr(live[step * bk + kk * 16 + (lane % 4) * 2], "r", 2),
-                    )
-                    b1 = T.call_pure_extern(
-                        "uint32",
-                        "hc_raw_pair",
-                        T.access_ptr(live[step * bk + kk * 16 + (lane % 4) * 2 + 8], "r", 2),
-                    )
-                    for rr in T.unroll(4):
-                        n = warp * 16 + lane // 4 + (rr % 2) * 8
-                        col = kk * 8 + lane % 4 + (rr // 2) * 4
-                        v[rr] = w[slot, n, col ^ ((n % 8) * 4)]
-                    T.evaluate(
-                        T.call_extern(
-                            "void",
-                            "hc_mma_bf16",
-                            T.access_ptr(acc[0], "rw", 4),
-                            v[0],
-                            v[1],
-                            v[2],
-                            v[3],
-                            b0,
-                            b1,
-                        )
-                    )
-                T.sync_threads()
+            product(A, Weight, acc, row, bx, group)
             if lane % 4 == 0:
                 for rr in T.unroll(2):
                     Output[group, row, bx * bn + warp * 16 + lane // 4 + rr * 8] = acc[rr * 2]

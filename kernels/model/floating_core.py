@@ -1,7 +1,7 @@
 """Shared floating MMA loop with explicit operand and reduction contracts.
 
-Grouping and operand conversion are compile-time choices. Sequential group
-sums preserve HC's numerical boundary; no split-K or parallel sum is introduced.
+Operand conversion and scheduling are compile-time choices. Independent group
+accumulators retain their original K16 order; consumers own the ordered sum.
 """
 
 import tilelang.language as T
@@ -80,5 +80,135 @@ def mma_loop(
                         total[i, j] += acc[i, j]
         if reduction_groups != 1:
             T.copy(total, acc)
+
+    return product
+
+
+CACHED_WARP_PASSES = {
+    "tl.disable_thread_storage_sync": True,
+    "tl.disable_shared_memory_reuse": True,
+}
+
+
+def cached_warp_loop(rows, K, tile, bn, bk, stages, *, groups_per_block=1):
+    """Cache live BF16 rows and pipeline packed weights into exact warp MMA.
+
+    A is token/group/K and W is row-major paired BF16. Every warp retains the
+    original K16 FP32 accumulator; callers own the output/reduction boundary.
+    Groups within a CTA share barriers but have disjoint operands and sums.
+    """
+    from kernels.model.bf16_mma import SOURCE
+
+    per = bn * 2
+
+    @T.macro
+    def product(A, W, acc, row, bx, first_group):
+        T.import_source(SOURCE)
+        tx = T.get_thread_binding()
+        group = tx // per
+        tid = tx % per
+        lane = tid % 32
+        warp = tid // 32
+        live = T.alloc_shared((groups_per_block, tile, K), T.bfloat16)
+        w = T.alloc_shared((groups_per_block, stages, bn, bk // 2), T.uint32)
+        v = T.alloc_local((4,), T.uint32)
+        T.clear(acc)
+        for initial in T.unroll(min(stages - 1, K // bk)):
+            for it in T.unroll(bn * bk // (per * 8)):
+                index = (tid + it * per) * 4
+                n = index // (bk // 2)
+                col = index % (bk // 2)
+                T.ptx_cp_async(
+                    T.access_ptr(w[group, initial, n, col ^ ((n % 8) * 4)], "w", 4),
+                    T.access_ptr(
+                        W[
+                            bx * bn + n,
+                            (first_group + group) * (K // 2) + initial * (bk // 2) + col,
+                        ],
+                        "r",
+                        4,
+                    ),
+                    4,
+                )
+            T.ptx_commit_group()
+        for g, r, j in T.Parallel(groups_per_block, tile, K):
+            live[g, r, j] = 0
+            if row + r < rows:
+                live[g, r, j] = A[row + r, first_group + g, j]
+        for step in T.serial(K // bk):
+            slot = step % stages
+            if stages == 4:
+                if step + 2 < K // bk:
+                    T.ptx_wait_group(2)
+                elif step + 1 < K // bk:
+                    T.ptx_wait_group(1)
+                else:
+                    T.ptx_wait_group(0)
+            elif stages == 3:
+                if step + 1 < K // bk:
+                    T.ptx_wait_group(1)
+                else:
+                    T.ptx_wait_group(0)
+            else:
+                T.ptx_wait_group(0)
+            T.sync_threads()
+            if step + stages - 1 < K // bk:
+                nxt = (step + stages - 1) % stages
+                for it in T.unroll(bn * bk // (per * 8)):
+                    index = (tid + it * per) * 4
+                    n = index // (bk // 2)
+                    col = index % (bk // 2)
+                    T.ptx_cp_async(
+                        T.access_ptr(w[group, nxt, n, col ^ ((n % 8) * 4)], "w", 4),
+                        T.access_ptr(
+                            W[
+                                bx * bn + n,
+                                (first_group + group) * (K // 2)
+                                + (step + stages - 1) * (bk // 2)
+                                + col,
+                            ],
+                            "r",
+                            4,
+                        ),
+                        4,
+                    )
+                T.ptx_commit_group()
+            for kk in T.unroll(bk // 16):
+                b0 = T.call_pure_extern(
+                    "uint32",
+                    "hc_raw_pair",
+                    T.access_ptr(
+                        live[group, (lane // 4) % tile, step * bk + kk * 16 + (lane % 4) * 2],
+                        "r",
+                        2,
+                    ),
+                )
+                b1 = T.call_pure_extern(
+                    "uint32",
+                    "hc_raw_pair",
+                    T.access_ptr(
+                        live[group, (lane // 4) % tile, step * bk + kk * 16 + (lane % 4) * 2 + 8],
+                        "r",
+                        2,
+                    ),
+                )
+                for rr in T.unroll(4):
+                    n = warp * 16 + lane // 4 + (rr % 2) * 8
+                    col = kk * 8 + lane % 4 + (rr // 2) * 4
+                    v[rr] = w[group, slot, n, col ^ ((n % 8) * 4)]
+                T.evaluate(
+                    T.call_extern(
+                        "void",
+                        "hc_mma_bf16",
+                        T.access_ptr(acc[0], "rw", 4),
+                        v[0],
+                        v[1],
+                        v[2],
+                        v[3],
+                        b0,
+                        b1,
+                    )
+                )
+            T.sync_threads()
 
     return product
