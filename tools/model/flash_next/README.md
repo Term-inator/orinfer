@@ -16,7 +16,7 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-init
 
 构建器逐块拼接已量化专家，不展开完整权重。选定 Q4 主干矩阵从 checkpoint 声明的同一 ModelScope/HF 提交读取原始 BF16 行，逐块释放；原始模型索引必须与该提交一致。首次构建允许下载这些字节范围，容器内存及内存加 swap 上限均为 6 GiB。编译使用形状张量，完整模型不载入 CUDA。输出目录保存可验证的权重转换和编译缓存。
 
-最终目录通过 Rust 原生计划校验后原子发布。生成成功、质量及完整请求 TPS 另行验收；构建完成仅表示原生包通过构造校验。有限专家模式使用 `--resident-experts N --cuda-graph off` 试跑。
+最终目录通过 Rust 原生计划校验后原子发布。生成成功、质量及完整请求 TPS 另行验收；构建完成仅表示原生包通过构造校验。有限专家模式使用 `--resident-experts N --cuda-graph off` 试跑。 Flash 专家通过逐矩阵地址表读取紧凑的预分配槽位，保持原始压缩 bank、scale 和整数运算；有限模式继续按真实路由选择完整专家。
 
 首次以单请求启动文本包，可显式限制常驻专家，并关闭 MTP 与前缀缓存：
 
@@ -121,3 +121,7 @@ PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.weights \
 数值验证固定 seed 20261002，对同一 teacher-forced 历史比较 top3 概率、KL/NLL 和任务结果；token 一致率用作诊断，质量结合概率与任务结果判断。`reference/` 提供完整 BF16 参考，整模型基线需执行全部层。`checks/` 提供 kernel、尾部和 replay 验证，Rust GPU 测试覆盖状态、prefix、MTP 和混合请求。完整请求性能通过 Rust CLI 测量，算子微测用于定位局部成本。
 
 源码职责：`construction.py`/`build.py` 管理正式重建，公共 `../projection_tuning.py` 管理整数候选；`weights.py`/`checkpoint.py` 读取离线权重，`native.py`/`mtp.py` 保留数学参考。公共算子在 `kernels/model/`，在线架构适配器在 `crates/orinfer-models/src/flash_next/`。
+
+### 专家存储重建
+
+`build.py --model INPUT --model-output OUTPUT --output BUILD --expert-storage-only` 将已发布的 BM8/BN64/SK1、K128 E8P INT8 专家计算重新绑定至逐矩阵地址表，保留原有路由 tile、动态行容量和全部其他 kernel。构建器验证输入 ABI 和矩阵几何，生成匹配的原生执行库并原子发布；该范围之外的专家实现使用 checkpoint 全量构建入口。输入和输出目录分别保存。输入计划由 `ORINFER_ENGINE` 指定的匹配 CLI 读取，发布验证使用本轮构建的当前引擎；GPU 包装器转发该只读工具路径。权重和 CPU 资产通过不可变文件链接复用，构建无需复制完整模型。

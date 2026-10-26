@@ -401,6 +401,11 @@ def main():
     p.add_argument("--cache", type=Path, default=ROOT / "artifacts/build-cache/flash-next")
     p.add_argument("--plan-only", action="store_true")
     p.add_argument(
+        "--expert-storage-only",
+        action="store_true",
+        help="Rebuild compressed expert address tables with unchanged row/arithmetic contracts",
+    )
+    p.add_argument(
         "--prefill-only",
         action="store_true",
         help="Rebuild only declared prefill projections; preserve other certified bindings",
@@ -421,6 +426,19 @@ def main():
         help="Restrict rebuilds to these output/input dimensions; repeat for multiple geometries",
     )
     args = p.parse_args()
+    if args.expert_storage_only:
+        if (
+            args.checkpoint
+            or args.plan_only
+            or args.prefill_only
+            or args.projection_kinds
+            or args.projection_shape
+        ):
+            p.error("expert-storage-only requires --model and a complete storage rebuild")
+        from tools.model.flash_next.expert_storage import rebuild as rebuild_expert_storage
+
+        rebuild_expert_storage(args)
+        return
     if args.checkpoint:
         if not args.source_index:
             p.error("--checkpoint requires --source-index")

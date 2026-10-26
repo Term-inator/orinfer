@@ -73,6 +73,7 @@ pub(super) fn banks(
             Ok(ExpertBank {
                 experts,
                 buffers: names,
+                addresses: vec![],
                 consumers,
             })
         })

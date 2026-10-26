@@ -1,5 +1,5 @@
-//! Whole compressed-expert SLRU ownership over shared CUDA VMM pages.
-use super::{Session, Value, check, host_weights, sys, weight_upload};
+//! Whole compressed-expert SLRU with model-declared slot or direct storage.
+use super::{Session, Value, check, expert_slots::Slots, host_weights, sys, weight_upload};
 use crate::{
     artifact::{Argument, Dtype, Kernel, Result},
     execution::ResidentExperts,
@@ -95,6 +95,7 @@ pub(super) struct Plan {
     pub banks: Vec<ExpertBank>,
     pub names: BTreeSet<String>,
     pub capacity: usize,
+    pub slot_layout: Option<super::expert_slots::Layout>,
 }
 impl Plan {
     pub fn new(
@@ -146,13 +147,34 @@ impl Plan {
                     || b.access != crate::artifact::Access::Read
                     || b.shape.first() != Some(&bank.experts)
                     || !names.insert(name.clone())
-                    || !kernels.values().any(|k| {
-                        k.args
-                            .iter()
-                            .any(|a| matches!(a, Argument::Buffer { name: used } if used == name))
-                    })
+                    || bank.addresses.is_empty()
+                        && !kernels.values().any(|k| {
+                            k.args.iter().any(
+                                |a| matches!(a, Argument::Buffer { name: used } if used == name),
+                            )
+                        })
                 {
                     return Err("Invalid or overlapping expert tensor bank".into());
+                }
+            }
+            if !bank.addresses.is_empty() {
+                if bank.addresses.len() != bank.buffers.len() {
+                    return Err("Incomplete expert address tables".into());
+                }
+                for name in &bank.addresses {
+                    let b = buffers
+                        .get(name.as_str())
+                        .ok_or("Missing expert address table")?;
+                    if b.dtype != Dtype::U64 || b.shape != [bank.experts] || b.data.is_some() {
+                        return Err("Invalid expert address table".into());
+                    }
+                }
+                if kernels.values().any(|k| {
+                    k.args.iter().any(
+                        |a| matches!(a, Argument::Buffer {name} if bank.buffers.contains(name)),
+                    )
+                }) {
+                    return Err("Compact expert consumer bypasses address tables".into());
                 }
             }
             for (name, index) in &bank.consumers {
@@ -175,7 +197,7 @@ impl Plan {
                 if !k
                     .args
                     .iter()
-                    .any(|a| matches!(a, Argument::Buffer { name } if bank.buffers.contains(name)))
+                    .any(|a| matches!(a, Argument::Buffer { name } if bank.buffers.contains(name) || bank.addresses.contains(name)))
                 {
                     return Err("Expert consumer does not use its bank".into());
                 }
@@ -184,7 +206,15 @@ impl Plan {
         let capacity = count
             .checked_mul(prepared.expert_banks.len())
             .ok_or("Expert capacity overflow")?;
+        let sizes = prepared
+            .plan
+            .buffers
+            .iter()
+            .map(|b| Ok((b.name.clone(), b.bytes()?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let slot_layout = super::expert_slots::Layout::new(&banks, capacity, &sizes)?;
         Ok(Some(Self {
+            slot_layout,
             banks,
             names,
             capacity,
@@ -204,6 +234,7 @@ pub(super) struct Pager {
     sources: BTreeMap<String, TensorSource>,
     consumers: BTreeMap<String, (usize, usize)>,
     refs: BTreeMap<(String, usize), Page>,
+    slots: Option<Slots>,
     prob: Queue,
     hot: Queue,
     transient: BTreeSet<Key>,
@@ -219,6 +250,7 @@ impl Pager {
         sources: BTreeMap<String, TensorSource>,
         workers: usize,
         host_cache_bytes: usize,
+        slots: Option<Slots>,
     ) -> Self {
         let consumers = plan
             .banks
@@ -226,11 +258,13 @@ impl Pager {
             .enumerate()
             .flat_map(|(i, b)| b.consumers.iter().map(move |(k, n)| (k.clone(), (i, *n))))
             .collect();
+        let mapped_bytes = slots.as_ref().map_or(0, |slots| slots.bytes);
         Self {
             banks: plan.banks,
             sources,
             consumers,
             refs: BTreeMap::new(),
+            slots,
             prob: Queue::default(),
             hot: Queue::default(),
             transient: BTreeSet::new(),
@@ -239,6 +273,8 @@ impl Pager {
             host_cache: Arc::new(Mutex::new(host_weights::Cache::new(host_cache_bytes))),
             statistics: Statistics {
                 capacity_experts: plan.capacity,
+                mapped_bytes,
+                peak_mapped_bytes: mapped_bytes,
                 ..Default::default()
             },
             poisoned: false,
@@ -259,6 +295,9 @@ impl Pager {
         Ok(pages)
     }
     fn release(&mut self, s: &Session, key: Key) -> Result<()> {
+        if let Some(slots) = &mut self.slots {
+            return slots.release(key);
+        }
         for page in self.pages(s, key)? {
             let n = self
                 .refs
@@ -344,55 +383,60 @@ impl Pager {
                 self.hot.remove(victim);
                 self.statistics.evictions += 1;
             }
-            let pages = self.pages(s, key)?;
-            for page in &pages {
-                if !self.refs.contains_key(page) {
-                    let mut reservations = s.expert_buffers.borrow_mut();
-                    let r = reservations.get_mut(&page.0).unwrap();
-                    r.map_page(s, page.1)?;
-                    let source = &self.sources[&page.0];
-                    // Small banks (such as row scales) fit one physical page.
-                    // Populate them once, rather than issue many tiny reads.
-                    if source.bytes <= r.granularity {
-                        uploads.push(weight_upload::Upload {
-                            source: source.clone(),
-                            destination: r.address,
-                        });
-                        self.statistics.loaded_bytes += source.bytes as u64;
+            if let Some(slots) = &mut self.slots {
+                self.statistics.loaded_bytes +=
+                    slots.load(key, &self.banks[bank], &self.sources, &mut uploads)? as u64;
+            } else {
+                let pages = self.pages(s, key)?;
+                for page in &pages {
+                    if !self.refs.contains_key(page) {
+                        let mut reservations = s.expert_buffers.borrow_mut();
+                        let r = reservations.get_mut(&page.0).unwrap();
+                        r.map_page(s, page.1)?;
+                        let source = &self.sources[&page.0];
+                        // Small banks (such as row scales) fit one physical page.
+                        // Populate them once, rather than issue many tiny reads.
+                        if source.bytes <= r.granularity {
+                            uploads.push(weight_upload::Upload {
+                                source: source.clone(),
+                                destination: r.address,
+                            });
+                            self.statistics.loaded_bytes += source.bytes as u64;
+                        }
                     }
+                    self.refs.entry(page.clone()).or_default().owners += 1;
                 }
-                self.refs.entry(page.clone()).or_default().owners += 1;
-            }
-            for name in &self.banks[bank].buffers {
-                let reservations = s.expert_buffers.borrow();
-                let r = &reservations[name];
-                let source = &self.sources[name];
-                if source.bytes <= r.granularity {
-                    continue;
-                }
-                let covered: Vec<_> = pages.iter().filter(|p| &p.0 == name).collect();
-                if covered
-                    .iter()
-                    .all(|p| self.refs[*p].initialized.contains(&key.1))
-                {
-                    continue;
-                }
-                let stride = source.bytes / self.banks[bank].experts;
-                let offset = key.1 * stride;
-                uploads.push(weight_upload::Upload {
-                    source: TensorSource {
-                        path: source.path.clone(),
-                        offset: source.offset + offset,
-                        bytes: stride,
-                    },
-                    destination: r.address + offset as u64,
-                });
-                self.statistics.loaded_bytes += stride as u64;
-                // A failed upload quarantines the pager. These markers are only
-                // consumed after the complete upload succeeds. Unmapping a page
-                // discards its markers, even if a neighboring page stays mapped.
-                for page in covered {
-                    self.refs.get_mut(page).unwrap().initialized.insert(key.1);
+                for name in &self.banks[bank].buffers {
+                    let reservations = s.expert_buffers.borrow();
+                    let r = &reservations[name];
+                    let source = &self.sources[name];
+                    if source.bytes <= r.granularity {
+                        continue;
+                    }
+                    let covered: Vec<_> = pages.iter().filter(|p| &p.0 == name).collect();
+                    if covered
+                        .iter()
+                        .all(|p| self.refs[*p].initialized.contains(&key.1))
+                    {
+                        continue;
+                    }
+                    let stride = source.bytes / self.banks[bank].experts;
+                    let offset = key.1 * stride;
+                    uploads.push(weight_upload::Upload {
+                        source: TensorSource {
+                            path: source.path.clone(),
+                            offset: source.offset + offset,
+                            bytes: stride,
+                        },
+                        destination: r.address + offset as u64,
+                    });
+                    self.statistics.loaded_bytes += stride as u64;
+                    // A failed upload quarantines the pager. These markers are only
+                    // consumed after the complete upload succeeds. Unmapping a page
+                    // discards its markers, even if a neighboring page stays mapped.
+                    for page in covered {
+                        self.refs.get_mut(page).unwrap().initialized.insert(key.1);
+                    }
                 }
             }
             if self.prob.keys.len() + self.hot.keys.len() < capacity {
@@ -406,6 +450,9 @@ impl Pager {
         self.statistics.transition_s += transition_at.elapsed().as_secs_f64();
         let upload_at = Instant::now();
         let uploaded = weight_upload::upload_experts(s, uploads, self.workers, &self.host_cache)?;
+        if let Some(slots) = &self.slots {
+            slots.publish(s, bank, self.banks[bank].experts)?;
+        }
         self.statistics.host_cache = self.host_cache.lock().unwrap().statistics;
         self.statistics.upload_s += upload_at.elapsed().as_secs_f64();
         self.statistics.upload_staging_s += uploaded.staging_s;
@@ -418,12 +465,17 @@ impl Pager {
             .statistics
             .peak_transient_experts
             .max(self.transient.len());
-        self.statistics.mapped_bytes = s
-            .expert_buffers
-            .borrow()
-            .values()
-            .map(|r| r.physical_bytes())
-            .sum();
+        self.statistics.mapped_bytes =
+            self.slots
+                .as_ref()
+                .map(|slots| slots.bytes)
+                .unwrap_or_else(|| {
+                    s.expert_buffers
+                        .borrow()
+                        .values()
+                        .map(|r| r.physical_bytes())
+                        .sum()
+                });
         self.statistics.peak_mapped_bytes = self
             .statistics
             .peak_mapped_bytes
@@ -565,14 +617,17 @@ mod gpu_tests {
                 banks: vec![ExpertBank {
                     experts: 5,
                     buffers: vec!["weights".into(), "scales".into()],
+                    addresses: vec![],
                     consumers: BTreeMap::from([("test".into(), 0)]),
                 }],
                 names: BTreeSet::from(["weights".into(), "scales".into()]),
                 capacity: 2,
+                slot_layout: None,
             },
             sources,
             4,
             32 << 20,
+            None,
         );
         for (round, wanted) in [
             vec![0],
@@ -647,6 +702,188 @@ mod gpu_tests {
         assert!(pager.statistics.peak_transient_experts > 0);
         assert!(pager.statistics.page_reuses > 0);
         assert!(s.expert_spares.borrow().is_empty());
+        s.cleanup().unwrap();
+        s.cleanup().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod compact_gpu_tests {
+    use super::super::Driver;
+    use super::*;
+    use std::ptr;
+
+    #[test]
+    #[ignore = "requires the serialized SM120 GPU"]
+    fn compact_slots_preserve_all_banks_tails_transients_and_reuse() {
+        let mut s = Session::new(Driver::load().unwrap());
+        // SAFETY: This test exclusively owns the retained context and stream.
+        unsafe {
+            check(sys::cuInit(0), "test init").unwrap();
+            check(sys::cuDeviceGet(&mut s.device, 0), "test device").unwrap();
+            check(sys::cuCtxGetCurrent(&mut s.previous), "test previous").unwrap();
+            let mut context = ptr::null_mut();
+            check(
+                sys::cuDevicePrimaryCtxRetain(&mut context, s.device),
+                "test retain",
+            )
+            .unwrap();
+            s.retained = true;
+            check(sys::cuCtxSetCurrent(context), "test current").unwrap();
+            check(sys::cuStreamCreate(&mut s.stream, 1), "test stream").unwrap();
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let payload: Vec<u8> = (0..8192).map(|i| ((i * 37 + i / 31) % 256) as u8).collect();
+        std::fs::write(file.path(), &payload).unwrap();
+        let mut banks = Vec::new();
+        let mut sources = BTreeMap::new();
+        let mut pointers = BTreeMap::new();
+        let mut cursor = 173;
+        for bank in 0..2 {
+            let mut buffers = Vec::new();
+            let mut addresses = Vec::new();
+            for (column, stride) in [397, 17].into_iter().enumerate() {
+                let name = format!("bank{bank}-{column}");
+                sources.insert(
+                    name.clone(),
+                    TensorSource {
+                        path: file.path().to_path_buf(),
+                        offset: cursor,
+                        bytes: stride * 5,
+                    },
+                );
+                cursor += stride * 5 + 23;
+                let table = name.clone() + "_addresses";
+                let mut address = 0;
+                // SAFETY: Five complete U64 entries, owned before a later failure.
+                unsafe {
+                    check(sys::cuMemAlloc_v2(&mut address, 40), "test table").unwrap();
+                }
+                s.buffers.push(address);
+                pointers.insert(table.clone(), address);
+                buffers.push(name);
+                addresses.push(table);
+            }
+            banks.push(ExpertBank {
+                experts: 5,
+                buffers,
+                addresses,
+                consumers: BTreeMap::from([(format!("test{bank}"), 0)]),
+            });
+        }
+        let sizes = sources
+            .iter()
+            .map(|(name, source)| (name.clone(), source.bytes))
+            .collect();
+        let slot_layout = super::super::expert_slots::Layout::new(&banks, 2, &sizes).unwrap();
+        let plan = Plan {
+            slot_layout,
+            names: sources.keys().cloned().collect(),
+            banks: banks.clone(),
+            capacity: 2,
+        };
+        let slots = Slots::new(&mut s, &plan, &pointers).unwrap().unwrap();
+        assert_eq!(slots.bytes, 5 * 768);
+        let expected_bytes = slots.bytes;
+        let mut pager = Pager::new(plan, sources.clone(), 2, 1 << 20, Some(slots));
+        let mut counts_address = 0;
+        // SAFETY: Five I32 counts, retained by the test session.
+        unsafe {
+            check(sys::cuMemAlloc_v2(&mut counts_address, 20), "test counts").unwrap();
+        }
+        s.buffers.push(counts_address);
+        let identity = serde_json::json!({"file":"unused","sha256":"0".repeat(64)});
+        for (round, (bank, wanted)) in [
+            (0, vec![0]),
+            (1, vec![4]),
+            (0, vec![0, 1, 2, 3, 4]),
+            (1, vec![0, 4]),
+            (0, vec![3]),
+            (1, vec![1, 2, 3]),
+            (0, vec![]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let counts: Vec<i32> = (0..5).map(|e| i32::from(wanted.contains(&e))).collect();
+            // SAFETY: Both complete histogram buffers are live until this copy returns.
+            unsafe {
+                check(
+                    sys::cuMemcpyHtoD_v2(counts_address, counts.as_ptr().cast(), 20),
+                    "test route",
+                )
+                .unwrap();
+            }
+            let kernel:Kernel=serde_json::from_value(serde_json::json!({"name":format!("test{bank}"),"symbol":"unused","module":identity,"source":identity,"host_abi":identity,"grid":[1,1,1],"block":[1,1,1],"shared_memory_bytes":0,"cooperative":false,"args":[]})).unwrap();
+            pager
+                .ensure(&s, &kernel, &[Value::Pointer(counts_address)])
+                .unwrap();
+            // SAFETY: Drain the table updates before synchronous readback.
+            unsafe {
+                check(sys::cuStreamSynchronize(s.stream), "test ready").unwrap();
+            }
+            for (name, table) in banks[bank].buffers.iter().zip(&banks[bank].addresses) {
+                let mut table_values = [0u64; 5];
+                // SAFETY: Exactly five initialized entries in this bank's published table.
+                unsafe {
+                    check(
+                        sys::cuMemcpyDtoH_v2(table_values.as_mut_ptr().cast(), pointers[table], 40),
+                        "test addresses",
+                    )
+                    .unwrap();
+                }
+                for &e in &wanted {
+                    assert_ne!(table_values[e], 0);
+                    let source = &sources[name];
+                    let stride = source.bytes / 5;
+                    let mut actual = vec![0u8; stride];
+                    // SAFETY: Each published expert owns a complete matrix in the pool.
+                    unsafe {
+                        check(
+                            sys::cuMemcpyDtoH_v2(
+                                actual.as_mut_ptr().cast(),
+                                table_values[e],
+                                stride,
+                            ),
+                            "test expert",
+                        )
+                        .unwrap();
+                    }
+                    assert_eq!(
+                        actual,
+                        payload[source.offset + e * stride..source.offset + (e + 1) * stride],
+                        "round {round} bank {bank} expert {e}"
+                    );
+                }
+            }
+            assert_eq!(pager.statistics.mapped_bytes, expected_bytes);
+            assert!(s.expert_buffers.borrow().is_empty());
+        }
+        assert!(pager.statistics.peak_transient_experts >= 3);
+        assert!(pager.statistics.evictions > 0);
+        assert_eq!(pager.statistics.page_reuses, 0);
+        std::fs::remove_file(file.path()).unwrap();
+        let counts = [0i32, 0, 0, 0, 1];
+        // SAFETY: The live source and destination cover the complete histogram.
+        unsafe {
+            check(
+                sys::cuMemcpyHtoD_v2(counts_address, counts.as_ptr().cast(), 20),
+                "failed route",
+            )
+            .unwrap();
+        }
+        let kernel: Kernel = serde_json::from_value(serde_json::json!({"name":"test0","symbol":"unused","module":identity,"source":identity,"host_abi":identity,"grid":[1,1,1],"block":[1,1,1],"shared_memory_bytes":0,"cooperative":false,"args":[]})).unwrap();
+        assert!(
+            pager
+                .ensure(&s, &kernel, &[Value::Pointer(counts_address)])
+                .is_err()
+        );
+        assert!(
+            pager
+                .ensure(&s, &kernel, &[Value::Pointer(counts_address)])
+                .unwrap_err()
+                .contains("quarantined")
+        );
         s.cleanup().unwrap();
         s.cleanup().unwrap();
     }

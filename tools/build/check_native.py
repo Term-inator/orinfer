@@ -11,6 +11,7 @@ TESTS = (
     "cuda::weight_upload::gpu_tests::streamed_bytes_and_reader_error_cleanup",
     "cuda::weight_upload::tests::staging_reuse_preserves_changed_inputs_and_recovers_read_errors",
     "cuda::experts::gpu_tests::sparse_ranges_preserve_neighbors_tails_and_eviction",
+    "cuda::experts::compact_gpu_tests::compact_slots_preserve_all_banks_tails_transients_and_reuse",
     "cuda::virtual_memory::tests::vmm_shared_prefix_cow_and_graph_replay",
     "cuda::virtual_memory::tests::vmm_graph_growth_reset_and_last_token",
 )

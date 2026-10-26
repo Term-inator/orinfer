@@ -63,6 +63,7 @@ def publish(bindings, layout, destination, output, engine):
             "FlashBatchPointers",
         }
     )
+    implicit.update(n for n in b.buffers if "_exps.weight_" in n)
     used = implicit | {a["name"] for k in b.kernels for a in k["args"] if "name" in a}
     b.weights.buffers = b.buffers = {n: v for n, v in b.buffers.items() if n in used}
     b.weights.scopes = b.scopes = {n: v for n, v in b.scopes.items() if n in used}

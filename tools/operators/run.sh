@@ -63,7 +63,7 @@ reference_env+=(-e "CARGO_HOME=$native_cargo_cache"
     -e "RUSTDOC=$native_toolchain/bin/rustdoc"
     -e "PATH=$native_toolchain/bin:/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 declare -A mounted_inputs=()
-for variable in ORINFER_CHECKPOINT_DIR ORINFER_REFERENCE_CHECKPOINT ORINFER_REFERENCE_SOURCE ORINFER_REFERENCE_ACTIVATIONS ORINFER_EXECUTION_CACHE; do
+for variable in ORINFER_CHECKPOINT_DIR ORINFER_REFERENCE_CHECKPOINT ORINFER_REFERENCE_SOURCE ORINFER_REFERENCE_ACTIVATIONS ORINFER_EXECUTION_CACHE ORINFER_ENGINE; do
     if [[ -n "${!variable:-}" ]]; then
         input_path="$(realpath -- "${!variable}")"
         if [[ -z "${mounted_inputs[$input_path]+present}" ]]; then

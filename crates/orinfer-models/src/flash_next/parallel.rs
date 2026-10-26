@@ -70,7 +70,7 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
             let ab = adjacent(beta, 1)?;
             branches.push([qkv, gate, ab, adjacent(ab, 1)?].map(str::to_owned));
         }
-        let expert = select(layer, &weight("ffn_gate_up_exps.weight_packed"))?;
+        let expert = select(layer, &weight("ffn_gate_up_exps.weight_packed_addresses"))?;
         let shared = select(layer, &weight("ffn_gate_shexp.weight_weight"))?;
         let gate = select(layer, &weight("ffn_gate_inp_shexp.weight_value"))?;
         branches.push([expert, adjacent(shared, -1)?, gate, adjacent(gate, 1)?].map(str::to_owned));
@@ -125,7 +125,7 @@ pub(super) fn build_rows(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<
         let inject = select(&format!("{part}_inject.weight_value"))?;
         regions.push([root, inject, inject, inject + 1]);
         if part == "hc_ffn" {
-            let expert = select("ffn_gate_up_exps.weight_packed")?;
+            let expert = select("ffn_gate_up_exps.weight_packed_addresses")?;
             let shared = select("ffn_gate_shexp.weight_weight")?;
             let gate = select("ffn_gate_inp_shexp.weight_value")?;
             regions.push([

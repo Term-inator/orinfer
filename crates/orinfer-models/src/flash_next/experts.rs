@@ -137,12 +137,21 @@ pub(super) fn banks(manifest: &Manifest, kernels: &[Kernel]) -> Result<Vec<Exper
                 .and_then(|b| b.shape.first())
                 .copied()
                 .ok_or("Missing expert bank")?;
+            let addresses: Vec<_> = names.iter().map(|n| format!("{n}_addresses")).collect();
+            for name in &addresses {
+                let b = buffers
+                    .get(name.as_str())
+                    .ok_or("Missing expert address table; rebuild the execution package")?;
+                if b.dtype != Dtype::U64 || b.shape != [experts] || b.data.is_some() {
+                    return Err("Invalid expert address table".into());
+                }
+            }
             let mut consumers = BTreeMap::new();
             for k in kernels {
                 if !k
                     .args
                     .iter()
-                    .any(|a| matches!(a, Argument::Buffer { name } if name == &names[0]))
+                    .any(|a| matches!(a, Argument::Buffer { name } if name == &addresses[0]))
                 {
                     continue;
                 }
@@ -181,6 +190,7 @@ pub(super) fn banks(manifest: &Manifest, kernels: &[Kernel]) -> Result<Vec<Exper
             Ok(ExpertBank {
                 experts,
                 buffers: names,
+                addresses,
                 consumers,
             })
         })

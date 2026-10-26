@@ -320,6 +320,9 @@ impl Executor {
                 _ => {}
             }
         }
+        for bank in &prepared.expert_banks {
+            used.extend(bank.buffers.iter().map(String::as_str));
+        }
         let unused_weights = manifest
             .buffers
             .iter()
@@ -479,6 +482,14 @@ impl Executor {
             - initial_workspace_reduction
             - weight_plan.as_ref().map_or(0, |p| p.cold_bytes)
             + weight_plan.as_ref().map_or(0, |p| p.capacity);
+        let buffer_bytes = buffer_bytes
+            .checked_add(
+                expert_plan
+                    .as_ref()
+                    .and_then(|p| p.slot_layout.as_ref())
+                    .map_or(0, |l| l.bytes),
+            )
+            .ok_or("Model slot allocation sum overflow")?;
         if buffer_bytes > free {
             return Err(format!(
                 "Model needs {buffer_bytes} device bytes, CUDA free {free}"
@@ -566,6 +577,14 @@ impl Executor {
                 address = weight_base
                     .checked_add(offset as u64)
                     .ok_or("Weight slice address overflow")?;
+            } else if paged
+                && expert_plan.as_ref().is_some_and(|p| {
+                    p.banks
+                        .iter()
+                        .any(|bank| !bank.addresses.is_empty() && bank.buffers.contains(&b.name))
+                })
+            {
+                // Compressed payload lives in the shared slot pool, never at this unused direct binding.
             } else if paged {
                 let reservation = super::virtual_memory::Reservation::reserve(&s, bytes, 1)?;
                 address = reservation.address;
@@ -646,6 +665,15 @@ impl Executor {
             }
         }
         drop(weights);
+        let slots = if let Some(plan) = &expert_plan {
+            super::expert_slots::Slots::new(&mut s, plan, &pointers)?
+        } else {
+            super::expert_slots::initialize_full(&s, &prepared.expert_banks, &pointers, &sizes)?;
+            None
+        };
+        if let Some(slots) = &slots {
+            allocations.weights.bytes += slots.bytes;
+        }
         let mut catalog = None;
         let mut functions = BTreeMap::new();
         let mut pending_modules = manifest
@@ -867,6 +895,7 @@ impl Executor {
                         expert_sources,
                         load_workers,
                         options.host_weight_cache_bytes,
+                        slots,
                     )
                 })),
                 growth: manifest

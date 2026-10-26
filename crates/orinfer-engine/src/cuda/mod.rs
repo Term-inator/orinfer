@@ -10,6 +10,7 @@ use std::{
     ptr,
     time::Instant,
 };
+mod expert_slots;
 pub(crate) mod experts;
 pub(crate) mod host_weights;
 mod kernels;

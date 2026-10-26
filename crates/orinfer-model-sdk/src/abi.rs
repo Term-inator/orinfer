@@ -126,6 +126,8 @@ pub struct CreatedPlan {
 pub struct ExpertBank {
     pub experts: usize,
     pub buffers: Vec<String>,
+    /// One U64[experts] table per compressed tensor; empty for direct banks.
+    pub addresses: Vec<String>,
     pub consumers: std::collections::BTreeMap<String, usize>,
 }
 

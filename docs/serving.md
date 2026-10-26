@@ -10,7 +10,7 @@
 
 服务加载一次模型，由单个 GPU worker 执行请求。CPU 使用模型目录中的 `tokenizer.json`、`chat_template.jinja` 和 `generation_config.json` 渲染模板及分词；在线推理直接使用 Rust 运行时和预编译 kernel。
 
-权重加载采用并行读取和有界的 pinned 缓冲区，并与异步 GPU 上传重叠。`--load-workers N` 可设置 1–32 个读取线程；默认按可用 CPU 核心选择，最多 4 个。暂存内存最多 256 MiB，加载结束后释放。开启 `--verify-weights` 时使用完整校验路径，启动较慢。
+权重加载采用并行读取和有界的 pinned 缓冲区，并与异步 GPU 上传重叠。`--load-workers N` 可设置 1–32 个读取线程；默认按可用 CPU 核心选择，最多 4 个。Session 复用读取线程和暂存缓冲，暂存内存最多 256 MiB，在模型销毁前等待读取及 DMA 完成后释放。开启 `--verify-weights` 时使用完整校验路径，启动较慢。
 
 执行包中的全部 kernel 资产仍校验 hash；普通文本、配置的 MTP、视觉及小 batch 计划预加载 CUDA 模块，其余计划在首次使用时加载，并在 CUDA Graph 捕获前完成绑定。延迟加载的形状会在首次执行时承担模块加载开销。
 
@@ -20,18 +20,22 @@
 
 ### 专家常驻容量
 
-`serve`、`run-model` 和 `score-model` 提供 `--resident-experts full|N`，默认 `full`，保持专家权重全量常驻。Flash Next 的有限模式要求执行包包含专家分页声明；旧执行库通过模型工具更新为匹配的原生执行库，保留原权重及 cubin。
+`serve`、`run-model` 和 `score-model` 提供 `--resident-experts full|N`，默认 `full`，保持专家权重全量常驻。Flash Next 的有限模式要求执行包声明压缩专家 bank 和逐矩阵地址表；模型工具一起重建寻址 kernel 与匹配的原生执行库，保留原权重数值。
 
-`N` 是每层等效容量：48 层主干共享最多 `48 × N` 个专家的全局 SLRU 缓存，容量由各层动态共享；可指定 1–512，512 等效全量常驻。MTP 专家使用独立的全量常驻权重。缺失专家的压缩权重和 scale 从模型文件按需读取，以压缩形式映射到稳定的 CUDA 虚拟地址，计算时临时解码为 INT8。
+`N` 是每层等效容量：48 层主干共享最多 `48 × N` 个专家的全局 SLRU 缓存，容量由各层动态共享；可指定 1–512，512 等效全量常驻。MTP 专家使用独立的全量常驻权重。缺失专家的压缩权重和 scale 从模型文件按需读取，上传至预分配的紧凑槽位，由逐矩阵地址表寻址，计算时临时解码为 INT8。
 
 ```bash
 ./target/release/orinfer serve /path/to/prepared-flash-model \
-  --model qwen-flash-next --resident-experts 256
+  --model qwen-flash-next --resident-experts 64
 ```
 
-有限模式在路由后执行 CPU 调度和 SSD 加载，自动使用 `cuda_graph=off`；`full` 保留所选 Graph 模式。容量限制按专家数量计算，实际物理内存还包含 CUDA 分配粒度和共享页开销。一轮 prefill 或 batch 路由的专家集合超过容量时，临时映射额外专家，随后释放，实际字节峰值需另计临时映射和页开销。较小容量会增加 I/O、降低吞吐；模型文件在整个服务期间必须保持可读且内容稳定。
+有限模式在路由后执行 CPU 调度和 SSD 加载，自动使用 `cuda_graph=off`；`full` 保留所选 Graph 模式。容量限制按专家数量计算。紧凑池将每个专家的压缩矩阵和 scale 按 256 字节对齐存放，物理槽位数为全局常驻容量与单层最大专家数的较大者，完整计入显存。单轮路由集合超过常驻容量时使用池内临时槽位，下一轮路由就绪并完成此前计算后释放；计算中的 gate/up 与 down 共用完整专家，不会因容量较小漏算。较小容量会增加 I/O、降低吞吐；模型文件在整个服务期间必须保持可读且内容稳定。
 
-专家分页将物理映射与数据初始化分开管理。大张量仅上传选中专家的连续压缩区间；一个专家跨越多个物理页时，所有涉及页均记录该专家区间已初始化。邻居仍持有物理页时可复用已初始化区间，物理页释放时同步清除记录。能放入一个物理页的小张量（如 scale bank）首次映射时完整读取，随后共享。`run-model` 的 `expert_cache` 报告包含 `route_wait_s`、`transition_s`、`upload_s`、`read_wait_s`、`dma_wait_s` 和 `upload_chunks`：读取/DMA等待是上传耗时的组成部分，路由等待包含此前 GPU 计算的完成时间；这些值用于定位成本，完整请求性能以实际生成结果与总耗时验收。
+`--host-weight-cache-mib` 为有限专家模式设置独立的 CPU 压缩权重缓存，CLI 默认 4096 MiB，0 关闭，可按主机预算设置为 16384 MiB。缓存按实际读取增长，保留原压缩字节，LRU 淘汰时释放页；预算包含页尾及元数据，并在 `expert_cache.host_cache` 中报告命中字节和实际计费。CPU 缓存与 GPU 专家容量、pinned 上传缓冲分别计费。首次填充增加 RAM 写入和缺页成本，性能需同时测冷请求与持续请求；swap 中的缓存页需要读回，不能视为高速 RAM 命中。HTTP health 返回配置的 `host_weight_cache_bytes`。
+
+本项目的 x86_64/SM120 独显部署按 CUDA 空闲显存校验请求状态、KV 和工作区，主机缓存与有界前处理采用各自预算。主机 RAM 与 GPU 显存分别计费，swap 不增加显存容量。
+
+紧凑专家池复用跨层全局 SLRU，淘汰后直接复用物理槽位；地址表按真实路由在计算 stream 上提交，上传完成前保留原始压缩字节和 scale 的完整性。`run-model` 的 `expert_cache` 报告包含 `route_wait_s`、`transition_s`、`upload_s`、`read_wait_s`、`dma_wait_s` 和 `upload_chunks`：读取/DMA等待是上传耗时的组成部分，路由等待包含此前 GPU 计算的完成时间；这些值用于定位成本，完整请求性能以实际生成结果与总耗时验收。
 
 ### 请求默认参数
 
@@ -248,6 +252,7 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 | `--scheduler-policy` | `latency` | 在线延迟优先；`throughput` 以整批吞吐为目标 |
 | `--cuda-graph` | `decode_only` | Graph 模式 |
 | `--resident-experts` | `full` | 主干专家每层等效常驻容量；有限模式全局缓存，MTP 全量常驻 |
+| `--host-weight-cache-mib` | `4096` | 有限专家模式的 CPU 压缩权重缓存预算；0 关闭 |
 | `--verify-weights` | 关闭 | 启动时完整校验已加载权重和 CPU 表内容 |
 | `--prefix-cache-mib` | `12288` | GPU 缓存字节预算，0 关闭 |
 | `--max-active-requests` | `32` | 活跃请求上限，1–128 |

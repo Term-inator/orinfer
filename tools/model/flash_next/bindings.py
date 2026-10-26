@@ -115,6 +115,10 @@ class Bindings:
         key = recipe.key + ("-dynamic" if dynamic else "-fixed")
         if key not in self.recipes:
             function, passes = construct(recipe.build, dynamic=dynamic)
+            if recipe.key.startswith(("expert-gu-", "expert-down-")):
+                from kernels.model.expert_addresses import indirect_experts
+
+                function = indirect_experts(function)
             # Preserve every free row scalar in the exported launch ABI.
             from kernels.model.rows import explicit_rows
 
@@ -168,6 +172,13 @@ class Bindings:
                 )
             for buffer, tensor in zip(values, args):
                 operand = self.buffer(tensor)
+                if buffer.name in ("PAddresses", "WSAddresses"):
+                    if operand["kind"] != "buffer":
+                        raise ValueError("Expert address operands must be complete banks")
+                    storage = self.buffers[operand["name"]]
+                    table = operand["name"] + "_addresses"
+                    self.fixed(table, "u64", [storage["shape"][0]])
+                    operand = dict(kind="buffer", name=table)
                 pointers[buffer.name] = operand
             slot = sum(
                 op["kind"] == "kernel" and op["name"].rsplit("/", 1)[-1].startswith("k")
