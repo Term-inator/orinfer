@@ -30,47 +30,6 @@ impl FromStr for Policy {
     }
 }
 
-/// Orin CUDA allocations consume system RAM. CUDA's free-memory counter alone
-/// does not protect the host or account for other processes' resident memory.
-/// Keep one sixteenth of physical RAM for the host, in addition to the caller's
-/// configurable admission reserve. Read MemAvailable, which includes RAM the
-/// kernel can reclaim, rather than MemFree or the amount of swap.
-pub(crate) fn usable_host_bytes() -> Result<usize> {
-    usable_host_bytes_from_meminfo(
-        &std::fs::read_to_string("/proc/meminfo")
-            .map_err(|e| format!("Read host memory budget: {e}"))?,
-    )
-}
-
-fn usable_host_bytes_from_meminfo(text: &str) -> Result<usize> {
-    let (mut total, mut available) = (None, None);
-    for line in text.lines() {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let target = match name {
-            "MemTotal" => &mut total,
-            "MemAvailable" => &mut available,
-            _ => continue,
-        };
-        let mut fields = value.split_whitespace();
-        let bytes = fields
-            .next()
-            .and_then(|v| v.parse::<usize>().ok())
-            .and_then(|n| n.checked_mul(1024))
-            .ok_or("Invalid host memory budget")?;
-        if fields.next() != Some("kB") || fields.next().is_some() || target.replace(bytes).is_some()
-        {
-            return Err("Invalid host memory budget".into());
-        }
-    }
-    let total = total.filter(|&n| n > 0).ok_or("Missing MemTotal")?;
-    let available = available
-        .filter(|&n| n <= total)
-        .ok_or("Invalid or missing MemAvailable")?;
-    Ok(available.saturating_sub(total / 16))
-}
-
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Options {
     pub policy: Policy,
@@ -478,31 +437,6 @@ mod tests {
         assert_eq!(decode_quantum_s(3.0, &options), 0.2);
         options.target_tpot_ms = 50.;
         assert_eq!(decode_quantum_s(3.0, &options), 0.05);
-    }
-    #[test]
-    fn unified_memory_admission_preserves_host_headroom() {
-        let total_kib = 64 * 1024 * 1024;
-        let usable = |available_kib| {
-            usable_host_bytes_from_meminfo(&format!(
-                "MemTotal: {total_kib} kB\nMemFree: 0 kB\nMemAvailable: {available_kib} kB\nSwapFree: 999999999 kB\n"
-            ))
-            .unwrap()
-        };
-        // A large CUDA free-memory reading must not admit work when Linux is
-        // near its low-memory threshold. Swap cannot fund device allocations.
-        assert_eq!((16usize << 30).min(usable(3 * 1024 * 1024)), 0);
-        let free = (16usize << 30).min(usable(6 * 1024 * 1024));
-        assert_eq!(free.saturating_sub(1 << 30), 1 << 30);
-        assert_eq!(usable(20 * 1024 * 1024), 16 << 30);
-        for bad in [
-            "MemTotal: 1 kB",
-            "MemTotal: 1 kB\nMemAvailable: 2 kB",
-            "MemTotal: 10 MB\nMemAvailable: 1 kB",
-            "MemTotal: 10 kB\nMemAvailable: 1 kB\nMemAvailable: 2 kB",
-            "MemTotal: 0 kB\nMemAvailable: 0 kB",
-        ] {
-            assert!(usable_host_bytes_from_meminfo(bad).is_err());
-        }
     }
     #[test]
     fn cached_cohorts_are_bounded_without_delaying_decoders_for_cold_work() {

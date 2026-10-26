@@ -441,10 +441,10 @@ impl ModelRuntime {
         // Reclaim idle arenas before evicting useful prefixes. Snapshot bytes
         // are only prospective capacity; they must not hide idle allocations
         // or graphs that need releasing under current memory pressure.
-        if self.admission_free_bytes()? < needed {
+        if self.execution.free_bytes()? < needed {
             self.execution.reclaim_idle_graphs()?;
         }
-        if self.admission_free_bytes()? < needed {
+        if self.execution.free_bytes()? < needed {
             self.execution.reclaim_idle_state()?;
             let additional = self.execution.additional_kv_bytes(context, &limits)?;
             let state = self.execution.additional_state_bytes(&limits)?;
@@ -458,7 +458,8 @@ impl ModelRuntime {
             prospective = additional;
         }
         if self
-            .admission_free_bytes()?
+            .execution
+            .free_bytes()?
             .saturating_add(self.prefix_cache.bytes)
             < needed
         {
@@ -466,7 +467,7 @@ impl ModelRuntime {
             // reservations. Keep useful prefixes until active work completes.
             return self.defer_memory_admission(needed, fixed, prospective, future, workspace);
         }
-        while self.admission_free_bytes()? < needed {
+        while self.execution.free_bytes()? < needed {
             let Some(snapshot) = self.prefix_cache.evict_one() else {
                 return self.defer_memory_admission(needed, fixed, prospective, future, workspace);
             };
@@ -485,17 +486,15 @@ impl ModelRuntime {
         workspace: usize,
     ) -> Result<bool> {
         self.scheduler_statistics.admission_deferrals += 1;
-        // Driver/host accounting can recover after releasing the last arena.
+        // Driver accounting can recover after releasing the last arena.
         // Let the worker queue and recheck instead of failing in that transient
         // window. A persistently oversized request still fails after two seconds.
         if self.reserved_requests.is_empty() {
             let since = self.idle_admission_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= std::time::Duration::from_secs(2) {
                 let message = format!(
-                    "Request context/output budget exceeds available inference memory (free {} MiB, CUDA free {}, host budget {}, required {} MiB: state {}, KV {}, future {}, workspace {})",
-                    self.admission_free_bytes()? >> 20,
+                    "Request context/output budget exceeds available inference memory (CUDA free {} MiB, required {} MiB: state {}, KV {}, future {}, workspace {})",
                     self.execution.free_bytes()? >> 20,
-                    scheduler::usable_host_bytes()? >> 20,
                     needed >> 20,
                     fixed >> 20,
                     kv >> 20,
@@ -509,12 +508,6 @@ impl ModelRuntime {
             self.idle_admission_since = None;
         }
         Ok(false)
-    }
-    fn admission_free_bytes(&self) -> Result<usize> {
-        Ok(self
-            .execution
-            .free_bytes()?
-            .min(scheduler::usable_host_bytes()?))
     }
     fn pending_workspace(
         &self,
@@ -594,7 +587,7 @@ impl ModelRuntime {
                 &["decode", "prefill", "head"],
             )?)
             .ok_or("Future workspace budget overflow")?;
-        let free = self.admission_free_bytes()?;
+        let free = self.execution.free_bytes()?;
         let available = free
             .saturating_sub(future)
             .saturating_sub(additional)
