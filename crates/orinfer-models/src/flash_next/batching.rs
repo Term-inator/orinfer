@@ -103,6 +103,9 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
 }
 
 fn private_role(column: &str, layer: usize) -> String {
+    if column == "State_ple" {
+        return column.to_owned();
+    }
     column.strip_prefix("State_").map_or_else(
         || column.to_owned(),
         |suffix| format!("State_{layer}_{suffix}"),
@@ -601,6 +604,21 @@ mod tests {
             }];
         m.mtp.as_mut().unwrap().mixed_verification_tokens = vec![2, 4];
         super::super::mixed::register(&mut m).unwrap();
+        // Enabling MTP registers its causal programs after the target fixture
+        // has already installed its launch contracts.
+        for name in m.programs.values().flatten().filter_map(|op| match op {
+            Operation::Kernel { name } if name.starts_with("causal_rows/") => Some(name),
+            _ => None,
+        }) {
+            let capacity = if name.contains("/verify/") || name.contains("/restore/") {
+                8
+            } else {
+                512
+            };
+            m.dynamic_batch_kernels
+                .insert(name.clone(), dynamic(name, capacity));
+        }
+        super::super::causal_rows::configure(&mut m).unwrap();
         m
     }
     #[test]
@@ -959,6 +977,50 @@ mod tests {
         }
         m.batch_layout.as_mut().unwrap().state_columns.swap(0, 1);
         assert!(register(&mut m).is_err());
+    }
+
+    #[test]
+    fn ple_history_uses_the_same_request_owner_at_every_layer() {
+        let mut m = manifest();
+        m.batch_layout.as_mut().unwrap().state_columns =
+            vec!["Position".into(), "State_ple".into()];
+        m.buffers.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"State_ple","dtype":"f16","shape":[9,10240],
+                "layout":"native_contiguous","alignment":256,"access":"read_write","data":null
+            }))
+            .unwrap(),
+        );
+        m.buffers
+            .iter_mut()
+            .find(|b| b.name == POINTERS)
+            .unwrap()
+            .shape = vec![128 * (48 * 2 + 10)];
+        register(&mut m).unwrap();
+        let bindings = state_bindings(
+            &m,
+            &[
+                BatchSegment {
+                    slot: 17,
+                    tokens: 1,
+                },
+                BatchSegment { slot: 3, tokens: 1 },
+            ],
+        )
+        .unwrap();
+        for (row, owner) in [17, 3].into_iter().enumerate() {
+            for layer in 0..48 {
+                assert_eq!(
+                    bindings[(row * 48 + layer) * 2 + 1],
+                    Some((owner, "State_ple".into()))
+                );
+            }
+        }
+        assert!(
+            bindings[2 * 48 * 2..128 * 48 * 2]
+                .iter()
+                .all(Option::is_none)
+        );
     }
 
     #[test]

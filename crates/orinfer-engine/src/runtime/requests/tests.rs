@@ -4,6 +4,7 @@ mod benchmark;
 mod decode_quality;
 mod decode_template;
 mod flash_batch;
+mod flash_expert;
 mod mtp_consistency;
 mod sampling;
 mod single_decode;
@@ -27,6 +28,8 @@ struct Fixture {
     batches: Vec<usize>,
     #[serde(default)]
     mtp_drafts: Option<usize>,
+    #[serde(default)]
+    resident_experts: Option<usize>,
     /// A fixed verification protocol isolates cache restoration from adaptive
     /// choices between ordinary decode and different verification widths.
     #[serde(default)]

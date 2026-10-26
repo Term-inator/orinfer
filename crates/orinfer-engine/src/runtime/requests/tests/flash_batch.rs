@@ -565,7 +565,7 @@ fn validate_flash_decode_batches() {
                 eprintln!(
                     "MTP admission deferred after {} requests: free {}, fixed {}, KV {}, workspace {} bytes",
                     requests.len(),
-                    model.admission_free_bytes().unwrap(),
+                    model.execution.free_bytes().unwrap(),
                     model
                         .execution
                         .additional_state_bytes(&model.request_limits(&item).unwrap())
@@ -1497,6 +1497,10 @@ fn validate_flash_prefix_cache() {
         LoadOptions {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 2 << 30,
+            resident_experts: fixture
+                .resident_experts
+                .map_or(Default::default(), crate::execution::ResidentExperts::Count),
+            host_weight_cache_bytes: 16usize << 30,
             mtp_drafts: Some(0),
 
             ..Default::default()

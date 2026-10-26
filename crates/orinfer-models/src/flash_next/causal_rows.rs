@@ -6,11 +6,17 @@ use crate::{
 
 pub(super) fn present(m: &Manifest) -> bool {
     m.dynamic_batch_kernels
-        .contains_key("causal_rows/verify/layer0/private/k0")
+        .contains_key("causal_rows/target/layer0/private/k0")
+        && (m.mtp.is_none()
+            || m.dynamic_batch_kernels
+                .contains_key("causal_rows/verify/layer0/private/k0"))
 }
 
 pub(super) fn register(m: &mut Manifest) {
     for family in ["target", "verify", "restore"] {
+        if family != "target" && m.mtp.is_none() {
+            continue;
+        }
         for layer in 0..48 {
             let section = if family == "restore" {
                 format!("layer{layer}")
@@ -50,6 +56,9 @@ pub(super) fn register(m: &mut Manifest) {
                 ),
             );
         }
+    }
+    if m.mtp.is_none() {
+        return;
     }
     m.programs.insert(
         "causal_rows/draft".into(),
@@ -92,4 +101,31 @@ pub(super) fn configure(m: &mut Manifest) -> Result<()> {
         rows.program_capacities.insert(name, cap);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_only_packages_register_only_their_causal_state() {
+        let mut m: Manifest = serde_json::from_value(serde_json::json!({
+            "schema_version":2,"target":"sm_120","model":"test","chunk_tokens":4096,
+            "max_context":4096,"vocab":16,"toolchain":{},"buffers":[],
+            "reset_buffers":[],"input":"Input","token":"Token","status":"Status",
+            "logits":"Logits","position":"Position","weight_bytes":0,
+            "weight_parameters":0,"weight_scope":"test"
+        }))
+        .unwrap();
+        register(&mut m);
+        assert_eq!(m.programs.len(), 49);
+        assert!(
+            m.programs
+                .keys()
+                .all(|name| name.starts_with("causal_rows/target/"))
+        );
+        assert_eq!(m.programs["causal_rows/target/layer0/private"].len(), 2);
+        assert_eq!(m.programs["causal_rows/target/layer3/private"].len(), 19);
+        assert_eq!(m.programs["causal_rows/target/layer1/ple"].len(), 2);
+    }
 }
