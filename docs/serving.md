@@ -41,6 +41,8 @@
 
 `reader_service_s` 和 `file_read_s` 分别累计各读取线程的服务时间与文件读取时间；`host_cache` 的 `lock_wait_s`、`metadata_s`、`copy_s` 和 `fill_s` 累计互斥锁等待、文件身份检查、命中复制和缓存填充耗时。这些线程累计值可以相互重叠，不能与上传墙钟时间相加。
 
+有限专家模式的动态 packet 复用执行包声明的独立 fork/join 区间：先向侧 stream 提交常驻 shared FFN，再在主 stream 准备路由专家，合并前等待侧分支完成。仅执行边界完整、侧分支不读取按需专家 bank 的区间，`scheduler.batch_execution.expert_parallel_branches` 记录实际提交数。专家读取或执行失败时，先等待侧 stream 结束，再返回错误并回收请求资源。
+
 ### 请求默认参数
 
 `--default-request-params` 接受一个 JSON 对象，为本次部署填充客户端省略的 Chat 请求字段。例如，默认开启 thinking，同时设置采样温度：

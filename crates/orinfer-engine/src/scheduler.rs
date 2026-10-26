@@ -315,6 +315,7 @@ pub struct BatchExecutionStatistics {
     pub workspace_mapping_s: f64,
     pub dynamic_graph_captures: usize,
     pub dynamic_direct_iterations: usize,
+    pub expert_parallel_branches: usize,
     pub graph_capture_deferrals: usize,
     pub graph_hits: usize,
     pub graph_misses: usize,

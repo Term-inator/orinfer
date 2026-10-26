@@ -250,6 +250,15 @@ pub(super) struct Pager {
     poisoned: bool,
 }
 impl Pager {
+    pub(super) fn consumes(&self, name: &str) -> bool {
+        self.consumers.contains_key(name)
+    }
+    pub(super) fn uses_bank(&self, kernel: &Kernel) -> bool {
+        kernel.args.iter().any(|argument| {
+            matches!(argument, Argument::Buffer { name } | Argument::BufferSlice { name, .. }
+                if self.sources.contains_key(name) || self.banks.iter().any(|b| b.addresses.contains(name)))
+        })
+    }
     pub fn new(
         plan: Plan,
         sources: BTreeMap<String, TensorSource>,
@@ -500,6 +509,13 @@ impl Pager {
 }
 
 impl super::executor::Executor {
+    #[cfg(test)]
+    pub(crate) fn fail_expert_reads_for_test(&self, directory: &std::path::Path) {
+        let mut cache = self.expert_cache.borrow_mut();
+        for source in cache.as_mut().unwrap().sources.values_mut() {
+            source.path = directory.join("missing-expert");
+        }
+    }
     pub(crate) fn expert_statistics(&self) -> Option<Statistics> {
         self.expert_cache.borrow().as_ref().map(|p| p.statistics)
     }

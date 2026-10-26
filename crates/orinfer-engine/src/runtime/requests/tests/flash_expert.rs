@@ -114,6 +114,7 @@ fn validate_flash_compact_expert_owners() {
         (scores, committed)
     };
     let mut reference = vec![];
+    let regions = std::mem::take(&mut *model.execution.parallel_regions.borrow_mut());
     for source in &sources {
         let mut request = model.start_request(input(source, 8), &|| false).unwrap();
         prefill_reference(&mut model, &mut request);
@@ -127,6 +128,15 @@ fn validate_flash_compact_expert_owners() {
         model.finish_request(&mut request, false).unwrap();
         reference.push(steps);
     }
+    assert_eq!(
+        model
+            .execution
+            .batch_statistics
+            .get()
+            .expert_parallel_branches,
+        0
+    );
+    *model.execution.parallel_regions.borrow_mut() = regions;
     for order in [[0, 1], [1, 0]] {
         // A cancelled owner must release its arena before the reversed admission.
         let mut cancelled = model
@@ -170,5 +180,67 @@ fn validate_flash_compact_expert_owners() {
         );
         model.finish_request(&mut requests[0], false).unwrap();
     }
-    std::fs::write(fixture.output,serde_json::to_vec_pretty(&json!({"owners":2,"reverse_admission":true,"cancelled_arena_reuse":true,"batch_shrink":true,"logits_and_committed_state_exact":true})).unwrap()).unwrap();
+    let branches = model
+        .execution
+        .batch_statistics
+        .get()
+        .expert_parallel_branches;
+    assert!(
+        branches > 0,
+        "Finite expert validation must execute independent branches"
+    );
+    std::fs::write(fixture.output,serde_json::to_vec_pretty(&json!({"owners":2,"reverse_admission":true,"cancelled_arena_reuse":true,"batch_shrink":true,"logits_and_committed_state_exact":true,"serial_reference":true,"expert_parallel_branches":branches})).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "Requires the native Flash package and exclusive GPU experiment lock"]
+fn validate_flash_expert_parallel_read_failure() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            resident_experts: crate::execution::ResidentExperts::Count(1),
+            host_weight_cache_bytes: 0,
+            cuda_graph: crate::execution::CudaGraphMode::Off,
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut request = model
+        .start_request(input(&fixture.cases[0], 8), &|| false)
+        .unwrap();
+    prefill_reference(&mut model, &mut request);
+    assert!(model.execution.session.parallel_handles.borrow().is_none());
+    let directory = tempfile::tempdir().unwrap();
+    model.execution.fail_expert_reads_for_test(directory.path());
+    let error = model
+        .advance_requests(&mut [&mut request], &scheduler::Options::default())
+        .unwrap_err();
+    assert!(error.contains("missing-expert"), "{error}");
+    let (side, _, _) = (*model.execution.session.parallel_handles.borrow())
+        .expect("Independent branch was not submitted");
+    // SAFETY: The live model owns this stream; failed execution must drain it
+    // before finish_request can release the owner's arena.
+    unsafe {
+        crate::cuda::check(
+            crate::cuda::sys::cuStreamQuery(side),
+            "failed branch drained",
+        )
+        .unwrap();
+    }
+    model.finish_request(&mut request, false).unwrap();
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(
+            &json!({"missing_read_failed":true,"side_stream_drained":true,"owner_released":true}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
 }

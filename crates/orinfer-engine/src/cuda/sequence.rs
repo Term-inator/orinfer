@@ -1360,7 +1360,7 @@ impl Executor {
                 "begin request capture",
             )?;
         }
-        let result = self.capture_parallel_operations(operations);
+        let result = self.parallel_operations(operations, false);
         let mut graph = ptr::null_mut();
         // SAFETY: Always end capture, including a failed recorded operation.
         let end = unsafe {
@@ -1550,67 +1550,101 @@ impl Executor {
         };
         Ok(handles)
     }
-    fn capture_parallel_operations(&self, operations: &[Invocation]) -> Result<()> {
-        let regions = parallel_regions(
+    fn parallel_operations(&self, operations: &[Invocation], expert_only: bool) -> Result<()> {
+        let mut regions = parallel_regions(
             operations,
             &self.parallel_regions.borrow(),
             &self.row_kernel_slots,
         )?;
+        if expert_only {
+            let pager = self.expert_cache.borrow();
+            let pager = pager.as_ref().ok_or("Missing finite expert cache")?;
+            let kernels = self
+                .direct
+                .as_ref()
+                .ok_or("Missing direct bindings")?
+                .kernels
+                .borrow();
+            regions.retain(|&[first, start, last, _]| {
+                matches!(&operations[first].operation, Operation::Kernel { name } if pager.consumes(name))
+                    && operations[start..=last].iter().all(|op| {
+                        matches!(&op.operation, Operation::Kernel { name }
+                            if kernels.get(name).is_some_and(|k| !pager.uses_bank(&k.spec)))
+                    })
+            });
+        }
         if regions.is_empty() {
             return operations.iter().try_for_each(|op| self.invoke(op));
         }
         let (side, fork_event, join_event) = self.ensure_parallel_handles()?;
-        for (i, op) in operations.iter().enumerate() {
-            if let Some(&[_, start, last, _]) = regions.iter().find(|r| r[0] == i) {
-                // SAFETY: Capture forks from the main stream's completed prefix;
-                // adapter-certified branches have disjoint writable buffers.
-                unsafe {
-                    check(
-                        sys::cuEventRecord(fork_event, self.session.stream),
-                        "capture fork",
-                    )?;
-                    check(
-                        sys::cuStreamWaitEvent(side, fork_event, 0),
-                        "capture side dependency",
-                    )?;
-                }
-                #[cfg(test)]
-                let gate_first = self.parallel_gate_first.get();
-                #[cfg(not(test))]
-                let gate_first = false;
-                if gate_first {
-                    self.invoke_on(&operations[last], side)?;
-                    for operation in &operations[start..last] {
-                        self.invoke_on(operation, side)?;
+        let result = (|| {
+            for (i, op) in operations.iter().enumerate() {
+                if let Some(&[_, start, last, _]) = regions.iter().find(|r| r[0] == i) {
+                    // SAFETY: Work forks from the main stream's completed prefix;
+                    // adapter-certified branches have disjoint writable buffers.
+                    unsafe {
+                        check(
+                            sys::cuEventRecord(fork_event, self.session.stream),
+                            "parallel branch fork",
+                        )?;
+                        check(
+                            sys::cuStreamWaitEvent(side, fork_event, 0),
+                            "parallel side dependency",
+                        )?;
                     }
-                } else {
-                    for operation in &operations[start..=last] {
-                        self.invoke_on(operation, side)?;
+                    #[cfg(test)]
+                    let gate_first = self.parallel_gate_first.get();
+                    #[cfg(not(test))]
+                    let gate_first = false;
+                    if gate_first {
+                        self.invoke_on(&operations[last], side)?;
+                        for operation in &operations[start..last] {
+                            self.invoke_on(operation, side)?;
+                        }
+                    } else {
+                        for operation in &operations[start..=last] {
+                            self.invoke_on(operation, side)?;
+                        }
+                    }
+                    // SAFETY: The side event follows every producer in the branch.
+                    unsafe {
+                        check(
+                            sys::cuEventRecord(join_event, side),
+                            "parallel branch completion",
+                        )?;
                     }
                 }
-                // SAFETY: The side event follows every producer in the branch.
-                unsafe {
-                    check(
-                        sys::cuEventRecord(join_event, side),
-                        "capture branch completion",
-                    )?;
+                if regions.iter().any(|r| r[1] <= i && i <= r[2]) {
+                    continue;
                 }
-            }
-            if regions.iter().any(|r| r[1] <= i && i <= r[2]) {
-                continue;
-            }
-            if regions.iter().any(|r| r[3] == i) {
-                // SAFETY: Join before consumers and before the next layer reuses scratch.
-                unsafe {
-                    check(
-                        sys::cuStreamWaitEvent(self.session.stream, join_event, 0),
-                        "capture join",
-                    )?;
+                if regions.iter().any(|r| r[3] == i) {
+                    // SAFETY: Join before consumers and before the next layer reuses scratch.
+                    unsafe {
+                        check(
+                            sys::cuStreamWaitEvent(self.session.stream, join_event, 0),
+                            "parallel branch join",
+                        )?;
+                    }
                 }
+                self.invoke(op)?;
             }
-            self.invoke(op)?;
+            Ok(())
+        })();
+        if expert_only {
+            if result.is_err() {
+                // An expert read/launch can fail after the independent branch
+                // was submitted. Drain it before an owner arena can be reused.
+                // SAFETY: The session owns this side stream and its context.
+                unsafe {
+                    check(sys::cuStreamSynchronize(side), "drain failed expert branch")?;
+                }
+            } else {
+                let mut statistics = self.batch_statistics.get();
+                statistics.expert_parallel_branches += regions.len();
+                self.batch_statistics.set(statistics);
+            }
         }
-        Ok(())
+        result
     }
     pub(super) fn program_graph(&self, name: &str) -> Result<Handle> {
         if let Some(&graph) = self.graphs.borrow().get(name) {
@@ -2187,6 +2221,11 @@ impl Executor {
             let at = Instant::now();
             if configured {
                 self.invoke_shared_pieces(operations, allow_capture)?;
+            } else if self.expert_cache.borrow().is_some() && self.weight_cache.borrow().is_none() {
+                // Reuse adapter-certified fork/join regions without capture.
+                // The resident shared FFN is submitted before the expert route
+                // barrier, allowing it to run during host reads and uploads.
+                self.parallel_operations(operations, true)?;
             } else {
                 for op in operations {
                     self.invoke(op)?;
