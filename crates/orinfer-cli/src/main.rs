@@ -136,6 +136,9 @@ struct LoadArgs {
     /// Routed experts per layer equivalent, shared globally; full keeps all. MTP stays resident.
     #[arg(long, value_name = "full|N", default_value_t = ResidentExperts::default())]
     resident_experts: ResidentExperts,
+    /// CPU compressed expert cache budget in MiB; 0 disables it.
+    #[arg(long = "host-weight-cache-mib", value_name = "MIB", default_value_t = 4096, value_parser = parse_cache_mib)]
+    host_weight_cache_bytes: usize,
     /// CUDA graph capture: decode_only, full or off.
     #[arg(long, value_name = "MODE", default_value_t = CudaGraphMode::default())]
     cuda_graph: CudaGraphMode,
@@ -250,6 +253,7 @@ impl From<InferenceArgs> for ServerConfig {
             verify_weights: args.load.verify_weights,
             load_workers: args.load.load_workers,
             resident_experts: args.load.resident_experts,
+            host_weight_cache_bytes: args.load.host_weight_cache_bytes,
             mtp_drafts: args.mtp_drafts.0,
             prompt_lookup: args.load.prompt_lookup,
             prefix_cache_bytes: args.prefix_cache_bytes,
@@ -304,6 +308,7 @@ impl From<BatchArgs> for BatchConfig {
                 verify_weights: config.verify_weights,
                 load_workers: config.load_workers,
                 resident_experts: config.resident_experts,
+                host_weight_cache_bytes: config.host_weight_cache_bytes,
                 mtp_drafts: config.mtp_drafts,
                 prompt_lookup: config.prompt_lookup,
                 prefix_cache_bytes: config.prefix_cache_bytes,
@@ -613,6 +618,7 @@ fn execute(command: Command, data_dir: &std::path::Path) -> Result<(), String> {
                 verify_weights: args.load.verify_weights,
                 load_workers: args.load.load_workers,
                 resident_experts: args.load.resident_experts,
+                host_weight_cache_bytes: args.load.host_weight_cache_bytes,
                 ..Default::default()
             },
         )?),
@@ -625,6 +631,7 @@ fn execute(command: Command, data_dir: &std::path::Path) -> Result<(), String> {
                 verify_weights: args.load.verify_weights,
                 load_workers: args.load.load_workers,
                 resident_experts: args.load.resident_experts,
+                host_weight_cache_bytes: args.load.host_weight_cache_bytes,
                 ..Default::default()
             },
         )?),
@@ -644,6 +651,7 @@ fn batch_overrides(
     .clone();
     let fields = [
         ("prefix_cache_bytes", "prefix_cache_mib"),
+        ("host_weight_cache_bytes", "host_weight_cache_mib"),
         ("memory_reserve_bytes", "memory_reserve_mib"),
     ];
     values.retain(|key, _| {
@@ -726,6 +734,7 @@ mod tests {
         assert_eq!(config.listen, "[::]:8088");
         assert_eq!(config.cuda_graph, CudaGraphMode::DecodeOnly);
         assert_eq!(config.prefix_cache_bytes, 12usize << 30);
+        assert_eq!(config.host_weight_cache_bytes, 4usize << 30);
         assert_eq!(config.scheduler.max_active, 32);
         assert_eq!(
             config.scheduler.policy,
@@ -742,6 +751,7 @@ mod tests {
             "--prompt-lookup",
             "--mtp-drafts=7",
             "--resident-experts=256",
+            "--host-weight-cache-mib=16384",
             "--cuda-graph",
             "off",
             "--max-active-requests",
@@ -762,6 +772,7 @@ mod tests {
         assert_eq!(config.cuda_graph, CudaGraphMode::Off);
         assert_eq!(config.mtp_drafts, Some(7));
         assert_eq!(config.resident_experts, ResidentExperts::Count(256));
+        assert_eq!(config.host_weight_cache_bytes, 16usize << 30);
         assert!(config.prompt_lookup);
         assert!(config.verify_weights);
         assert_eq!(config.prefix_cache_bytes, 0);

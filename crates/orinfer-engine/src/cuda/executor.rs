@@ -819,88 +819,92 @@ impl Executor {
             driver_version: version,
             total_bytes: total,
         };
-        let executor = Self {
-            snapshot_allocations: vec![],
-            row_kernel_slots: manifest
-                .row_execution
-                .as_ref()
-                .map(|rows| rows.kernel_slots())
-                .unwrap_or_default(),
-            parallel_regions: RefCell::new(
-                manifest
-                    .graph_branches
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .collect(),
-            ),
-            #[cfg(test)]
-            parallel_gate_first: Default::default(),
-            #[cfg(test)]
-            parallel_priority: RefCell::new("small_side".into()),
-            #[cfg(test)]
-            live_graph_events: Default::default(),
-            #[cfg(test)]
-            live_graph_ms: Default::default(),
-            session: s,
-            pointers: BufferAddresses::new(
-                pointers,
-                manifest
+        let executor =
+            Self {
+                snapshot_allocations: vec![],
+                row_kernel_slots: manifest
+                    .row_execution
+                    .as_ref()
+                    .map(|rows| rows.kernel_slots())
+                    .unwrap_or_default(),
+                parallel_regions: RefCell::new(
+                    manifest
+                        .graph_branches
+                        .values()
+                        .flatten()
+                        .cloned()
+                        .collect(),
+                ),
+                #[cfg(test)]
+                parallel_gate_first: Default::default(),
+                #[cfg(test)]
+                parallel_priority: RefCell::new("small_side".into()),
+                #[cfg(test)]
+                live_graph_events: Default::default(),
+                #[cfg(test)]
+                live_graph_ms: Default::default(),
+                session: s,
+                pointers: BufferAddresses::new(
+                    pointers,
+                    manifest
+                        .buffers
+                        .iter()
+                        .filter(|b| scopes[&b.name] == crate::loader::BufferScope::Sequence)
+                        .map(|b| b.name.clone())
+                        .collect(),
+                ),
+                sizes,
+                graphs: RefCell::new(graphs),
+                direct,
+                kernels: RefCell::new(catalog),
+                cuda_graph,
+                weight_cache: RefCell::new(weight_plan.map(|p| {
+                    super::weight_cache::Pager::new(p.capacity, cold_sources, load_workers)
+                })),
+                expert_cache: RefCell::new(expert_plan.map(|p| {
+                    super::experts::Pager::new(
+                        p,
+                        expert_sources,
+                        load_workers,
+                        options.host_weight_cache_bytes,
+                    )
+                })),
+                growth: manifest
+                    .kv_cache
+                    .as_ref()
+                    .map(|kv| kv.growth.clone())
+                    .unwrap_or_default(),
+                allocations,
+                workspace_dependencies,
+                text_workspaces: text_workspaces.into_iter().collect(),
+                peak_kv_bytes: std::cell::Cell::new(0),
+                peak_prefill_workspace_bytes: std::cell::Cell::new(0),
+                prefill_workspace: manifest
+                    .kv_cache
+                    .as_ref()
+                    .map(|kv| kv.prefill_workspace.keys().cloned().collect())
+                    .unwrap_or_default(),
+                sequences: vec![super::sequence::Sequence::default()],
+                state_table: Default::default(),
+                idle_selection: Default::default(),
+                live_workspace: None,
+                workspace_save_s: 0.,
+                workspace_restore_s: 0.,
+                active_sequence: 0,
+                sequence_specs: manifest
                     .buffers
                     .iter()
                     .filter(|b| scopes[&b.name] == crate::loader::BufferScope::Sequence)
-                    .map(|b| b.name.clone())
+                    .cloned()
                     .collect(),
-            ),
-            sizes,
-            graphs: RefCell::new(graphs),
-            direct,
-            kernels: RefCell::new(catalog),
-            cuda_graph,
-            weight_cache: RefCell::new(
-                weight_plan.map(|p| {
-                    super::weight_cache::Pager::new(p.capacity, cold_sources, load_workers)
-                }),
-            ),
-            expert_cache: RefCell::new(
-                expert_plan.map(|p| super::experts::Pager::new(p, expert_sources, load_workers)),
-            ),
-            growth: manifest
-                .kv_cache
-                .as_ref()
-                .map(|kv| kv.growth.clone())
-                .unwrap_or_default(),
-            allocations,
-            workspace_dependencies,
-            text_workspaces: text_workspaces.into_iter().collect(),
-            peak_kv_bytes: std::cell::Cell::new(0),
-            peak_prefill_workspace_bytes: std::cell::Cell::new(0),
-            prefill_workspace: manifest
-                .kv_cache
-                .as_ref()
-                .map(|kv| kv.prefill_workspace.keys().cloned().collect())
-                .unwrap_or_default(),
-            sequences: vec![super::sequence::Sequence::default()],
-            state_table: Default::default(),
-            idle_selection: Default::default(),
-            live_workspace: None,
-            workspace_save_s: 0.,
-            workspace_restore_s: 0.,
-            active_sequence: 0,
-            sequence_specs: manifest
-                .buffers
-                .iter()
-                .filter(|b| scopes[&b.name] == crate::loader::BufferScope::Sequence)
-                .cloned()
-                .collect(),
-            sequence_strides: lazy.map(|kv| kv.buffers.clone()).unwrap_or_default(),
-            batch_graphs: Default::default(),
-            batch_graph_trials: Default::default(),
-            shared_graphs: Default::default(),
-            shared_graph_trials: Default::default(),
-            batch_statistics: Default::default(),
-            batch_graph_clock: std::cell::Cell::new(0),
-        };
+                sequence_strides: lazy.map(|kv| kv.buffers.clone()).unwrap_or_default(),
+                batch_graphs: Default::default(),
+                batch_graph_trials: Default::default(),
+                shared_graphs: Default::default(),
+                shared_graph_trials: Default::default(),
+                batch_statistics: Default::default(),
+                batch_graph_clock: std::cell::Cell::new(0),
+            };
         let stats = LoadStats {
             resident_experts: options.resident_experts,
             manifest_sha256: fingerprint,

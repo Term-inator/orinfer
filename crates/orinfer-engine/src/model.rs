@@ -26,6 +26,8 @@ pub struct RequestReport {
     pub head_s: f64,
     pub ttft_s: f64,
     pub decode_s: f64,
+    pub expert_cache_prefill: Option<crate::execution::ExpertCacheStatistics>,
+    pub expert_cache_decode: Option<crate::execution::ExpertCacheStatistics>,
     pub prefill_tps: f64,
     pub decode_tps: Option<f64>,
     pub final_position: usize,

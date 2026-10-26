@@ -97,6 +97,7 @@ impl ModelRuntime {
                     .upload_ids(&controls.last_index, &[(chunk_tokens - 1) as u32])?;
             }
             let reset_s = reset_start.elapsed().as_secs_f64();
+            let expert_before = self.execution.expert_statistics();
             let request_start = Instant::now();
             let mut tokens = vec![];
             let mut logits_files = vec![];
@@ -182,6 +183,7 @@ impl ModelRuntime {
             let head_s = head_start.elapsed().as_secs_f64();
             let ttft_s = request_start.elapsed().as_secs_f64();
             dump_logits(s, q, 0, &mut logits_files)?;
+            let expert_prefill = self.execution.expert_statistics();
             let decode_start = Instant::now();
             let mut history = q.input_tokens.clone();
             for step in 1..q.max_new_tokens {
@@ -249,6 +251,14 @@ impl ModelRuntime {
                 head_s,
                 ttft_s,
                 decode_s,
+                expert_cache_prefill: expert_prefill
+                    .zip(expert_before)
+                    .map(|(end, start)| end.since(start)),
+                expert_cache_decode: self
+                    .execution
+                    .expert_statistics()
+                    .zip(expert_prefill)
+                    .map(|(end, start)| end.since(start)),
                 prefill_tps: q.input_tokens.len() as f64 / prefill_s,
                 decode_tps: (q.max_new_tokens > 1)
                     .then_some((q.max_new_tokens - 1) as f64 / decode_s),

@@ -812,6 +812,12 @@ pub(super) fn worker(
     }
     activity.active.store(0, Ordering::Relaxed);
     activity.queued.store(0, Ordering::Relaxed);
+    if let Some(stats) = model
+        .expert_cache_statistics()
+        .and_then(|stats| serde_json::to_string(&stats).ok())
+    {
+        eprintln!("EXPERT_CACHE {stats}");
+    }
     if let Ok(stats) = serde_json::to_string(&model.scheduler_statistics()) {
         eprintln!("SCHEDULER {stats}");
     }

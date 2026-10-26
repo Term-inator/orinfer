@@ -10,6 +10,7 @@ pub struct WorkerOptions {
     pub cuda_graph: String,
     pub mtp_drafts: String,
     pub resident_experts: String,
+    pub host_weight_cache_mib: usize,
     pub prefix_cache_mib: usize,
     pub max_active_requests: usize,
     pub max_batch_tokens: usize,
@@ -30,6 +31,7 @@ impl Default for WorkerOptions {
             cuda_graph: "decode_only".into(),
             mtp_drafts: "auto".into(),
             resident_experts: "full".into(),
+            host_weight_cache_mib: 4096,
             prefix_cache_mib: 12288,
             max_active_requests: 32,
             max_batch_tokens: 128,
@@ -54,6 +56,7 @@ impl WorkerOptions {
                 .mtp_drafts
                 .map_or_else(|| "auto".into(), |n| n.to_string()),
             resident_experts: settings.resident_experts.to_string(),
+            host_weight_cache_mib: settings.host_weight_cache_bytes >> 20,
             prefix_cache_mib: settings.prefix_cache_bytes >> 20,
             max_active_requests: settings.scheduler.max_active,
             max_batch_tokens: settings.scheduler.max_batch_tokens,
@@ -76,6 +79,10 @@ impl WorkerOptions {
             cuda_graph: self.cuda_graph.parse()?,
             mtp_drafts: orinfer_engine::execution::parse_mtp_drafts(&self.mtp_drafts)?,
             resident_experts: self.resident_experts.parse()?,
+            host_weight_cache_bytes: self
+                .host_weight_cache_mib
+                .checked_mul(1 << 20)
+                .ok_or("Host weight cache budget overflow")?,
             prefix_cache_bytes: self
                 .prefix_cache_mib
                 .checked_mul(1 << 20)
@@ -112,6 +119,8 @@ impl WorkerOptions {
             self.mtp_drafts.clone(),
             "--resident-experts".into(),
             self.resident_experts.clone(),
+            "--host-weight-cache-mib".into(),
+            self.host_weight_cache_mib.to_string(),
             "--prefix-cache-mib".into(),
             self.prefix_cache_mib.to_string(),
             "--max-active-requests".into(),

@@ -11,6 +11,7 @@ use std::{
     time::Instant,
 };
 pub(crate) mod experts;
+pub(crate) mod host_weights;
 mod kernels;
 mod sequence;
 pub(crate) mod snapshot;
@@ -150,6 +151,9 @@ pub(crate) struct Session {
     pub(crate) parallel_handles:
         std::cell::RefCell<Option<(sys::CUstream, sys::CUevent, sys::CUevent)>>,
     transfers: std::cell::RefCell<transfers::Transfers>,
+    weight_staging: std::cell::RefCell<Option<weight_upload::Staging>>,
+    expert_spares: std::cell::RefCell<BTreeMap<usize, Vec<sys::CUmemGenericAllocationHandle>>>,
+    expert_page_reuses: std::cell::Cell<u64>,
 }
 impl Session {
     pub(crate) fn new(driver: Driver) -> Self {
@@ -173,10 +177,29 @@ impl Session {
             capturing: false,
             parallel_handles: Default::default(),
             transfers: Default::default(),
+            weight_staging: Default::default(),
+            expert_spares: Default::default(),
+            expert_page_reuses: Default::default(),
         }
     }
+    /// Unused expert pages live only within one cache transition. Release them
+    /// before uploading weights, and retain ownership on a failed release.
+    fn release_expert_spares(&self) -> Result<()> {
+        let mut spares = self.expert_spares.borrow_mut();
+        for handles in spares.values_mut() {
+            while let Some(&handle) = handles.last() {
+                // SAFETY: These exclusively owned handles have been unmapped.
+                unsafe {
+                    check(sys::cuMemRelease(handle), "release spare expert page")?;
+                }
+                handles.pop();
+            }
+        }
+        spares.clear();
+        Ok(())
+    }
     pub(crate) fn cleanup(&mut self) -> Result<()> {
-        let mut errors = vec![];
+        let mut errors: Vec<_> = self.release_expert_spares().err().into_iter().collect();
         let mut record = |code, op| {
             if let Err(e) = check(code, op) {
                 errors.push(e)
@@ -203,6 +226,9 @@ impl Session {
                     }
                 }
             }
+            // The reusable weight pool owns host registrations and CUDA events.
+            // Drop it while its stream and context are still alive.
+            drop(self.weight_staging.get_mut().take());
             if !self.exec.is_null() {
                 record(sys::cuGraphExecDestroy(self.exec), "destroy graph exec");
                 self.exec = ptr::null_mut();

@@ -198,8 +198,8 @@ impl Pager {
             });
         }
         drop(buffers);
-        // Upload owns bounded staging buffers and confirms DMA completion before
-        // returning, so either the main or branch stream may consume the tensor.
+        // Upload reuses session-owned bounded staging and confirms DMA completion
+        // before returning, so either stream may consume the tensor.
         weight_upload::upload(session, uploads, self.workers)?;
         Ok(())
     }

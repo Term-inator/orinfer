@@ -1,5 +1,5 @@
 //! Whole compressed-expert SLRU ownership over shared CUDA VMM pages.
-use super::{Session, Value, check, sys, weight_upload};
+use super::{Session, Value, check, host_weights, sys, weight_upload};
 use crate::{
     artifact::{Argument, Dtype, Kernel, Result},
     execution::ResidentExperts,
@@ -9,6 +9,7 @@ use orinfer_model_sdk::abi::ExpertBank;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -56,12 +57,38 @@ pub struct Statistics {
     /// Cache bookkeeping and physical page mapping/unmapping, excluding upload.
     pub transition_s: f64,
     pub upload_s: f64,
+    pub upload_staging_s: f64,
     pub read_wait_s: f64,
     pub dma_wait_s: f64,
     pub upload_chunks: usize,
+    pub page_reuses: u64,
+    pub host_cache: crate::execution::HostWeightCacheStatistics,
     /// Physical VMM pages include allocation-granule overhead and shared neighbors.
     pub mapped_bytes: usize,
     pub peak_mapped_bytes: usize,
+}
+
+impl Statistics {
+    /// Interval counters with gauges retained at the end of the interval.
+    pub(crate) fn since(self, before: Self) -> Self {
+        Self {
+            lookups: self.lookups - before.lookups,
+            hits: self.hits - before.hits,
+            evictions: self.evictions - before.evictions,
+            loaded_bytes: self.loaded_bytes - before.loaded_bytes,
+            ensure_calls: self.ensure_calls - before.ensure_calls,
+            route_wait_s: self.route_wait_s - before.route_wait_s,
+            transition_s: self.transition_s - before.transition_s,
+            upload_s: self.upload_s - before.upload_s,
+            upload_staging_s: self.upload_staging_s - before.upload_staging_s,
+            read_wait_s: self.read_wait_s - before.read_wait_s,
+            dma_wait_s: self.dma_wait_s - before.dma_wait_s,
+            upload_chunks: self.upload_chunks - before.upload_chunks,
+            page_reuses: self.page_reuses - before.page_reuses,
+            host_cache: self.host_cache.since(before.host_cache),
+            ..self
+        }
+    }
 }
 
 pub(super) struct Plan {
@@ -182,11 +209,17 @@ pub(super) struct Pager {
     transient: BTreeSet<Key>,
     clock: u64,
     workers: usize,
+    host_cache: Arc<Mutex<host_weights::Cache>>,
     pub statistics: Statistics,
     poisoned: bool,
 }
 impl Pager {
-    pub fn new(plan: Plan, sources: BTreeMap<String, TensorSource>, workers: usize) -> Self {
+    pub fn new(
+        plan: Plan,
+        sources: BTreeMap<String, TensorSource>,
+        workers: usize,
+        host_cache_bytes: usize,
+    ) -> Self {
         let consumers = plan
             .banks
             .iter()
@@ -203,6 +236,7 @@ impl Pager {
             transient: BTreeSet::new(),
             clock: 0,
             workers,
+            host_cache: Arc::new(Mutex::new(host_weights::Cache::new(host_cache_bytes))),
             statistics: Statistics {
                 capacity_experts: plan.capacity,
                 ..Default::default()
@@ -367,10 +401,14 @@ impl Pager {
                 self.transient.insert(key);
             }
         }
+        s.release_expert_spares()?;
+        self.statistics.page_reuses = s.expert_page_reuses.get();
         self.statistics.transition_s += transition_at.elapsed().as_secs_f64();
         let upload_at = Instant::now();
-        let uploaded = weight_upload::upload(s, uploads, self.workers)?;
+        let uploaded = weight_upload::upload_experts(s, uploads, self.workers, &self.host_cache)?;
+        self.statistics.host_cache = self.host_cache.lock().unwrap().statistics;
         self.statistics.upload_s += upload_at.elapsed().as_secs_f64();
+        self.statistics.upload_staging_s += uploaded.staging_s;
         self.statistics.read_wait_s += uploaded.read_wait_s;
         self.statistics.dma_wait_s += uploaded.dma_wait_s;
         self.statistics.upload_chunks += uploaded.chunks;
@@ -410,6 +448,33 @@ impl super::executor::Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interval_statistics_separate_counters_and_current_gauges() {
+        let before = Statistics {
+            lookups: 11,
+            hits: 3,
+            loaded_bytes: 1024,
+            upload_s: 2.,
+            ..Default::default()
+        };
+        let end = Statistics {
+            lookups: 20,
+            hits: 8,
+            loaded_bytes: 4096,
+            upload_s: 5.,
+            resident_experts: 7,
+            mapped_bytes: 8192,
+            ..Default::default()
+        };
+        let interval = end.since(before);
+        assert_eq!(interval.lookups, 9);
+        assert_eq!(interval.hits, 5);
+        assert_eq!(interval.loaded_bytes, 3072);
+        assert_eq!(interval.upload_s, 3.);
+        assert_eq!(interval.resident_experts, 7);
+        assert_eq!(interval.mapped_bytes, 8192);
+    }
+
     #[test]
     fn victim_selection_preserves_the_entire_current_union() {
         let mut q = Queue::default();
@@ -507,6 +572,7 @@ mod gpu_tests {
             },
             sources,
             4,
+            32 << 20,
         );
         for (round, wanted) in [
             vec![0],
@@ -579,6 +645,8 @@ mod gpu_tests {
         }
         assert!(pager.statistics.evictions > 0);
         assert!(pager.statistics.peak_transient_experts > 0);
+        assert!(pager.statistics.page_reuses > 0);
+        assert!(s.expert_spares.borrow().is_empty());
         s.cleanup().unwrap();
         s.cleanup().unwrap();
     }

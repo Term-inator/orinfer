@@ -30,14 +30,25 @@ impl Reservation {
             location: prop.location,
             flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
         };
-        let mut handle = 0;
-        // SAFETY: Aligned reserved extent; record ownership before mapping/access can fail.
-        unsafe {
-            check(
-                sys::cuMemCreate(&mut handle, self.granularity, &prop, 0),
-                "create expert page",
-            )?;
-        }
+        let handle = s
+            .expert_spares
+            .borrow_mut()
+            .get_mut(&self.granularity)
+            .and_then(Vec::pop);
+        let handle = if let Some(handle) = handle {
+            s.expert_page_reuses.set(s.expert_page_reuses.get() + 1);
+            handle
+        } else {
+            let mut handle = 0;
+            // SAFETY: Aligned reserved extent; record ownership before mapping can fail.
+            unsafe {
+                check(
+                    sys::cuMemCreate(&mut handle, self.granularity, &prop, 0),
+                    "create expert page",
+                )?;
+            }
+            handle
+        };
         self.slabs.push(Slab {
             offset,
             bytes: self.granularity,
@@ -77,7 +88,14 @@ impl Reservation {
             unsafe_unmap(&s.driver, self.address, slab)?;
             slab.mapped = false;
         }
-        unsafe_release(&s.driver, slab.handle)?;
+        // The route barrier completed all consumers before this page was
+        // unmapped. Reuse its physical handle for another expert in this same
+        // transition; the new owner still uploads its own complete payload.
+        s.expert_spares
+            .borrow_mut()
+            .entry(slab.bytes)
+            .or_default()
+            .push(slab.handle);
         self.slabs.swap_remove(index);
         Ok(())
     }

@@ -40,6 +40,8 @@ impl FromStr for CudaGraphMode {
 pub struct LoadOptions {
     /// Routed experts per layer equivalent; finite budgets are shared across banks.
     pub resident_experts: ResidentExperts,
+    /// CPU compressed-expert cache budget; zero reads directly from storage.
+    pub host_weight_cache_bytes: usize,
     pub cuda_graph: CudaGraphMode,
     /// Hash loaded weight payloads and CPU row tables in addition to structural checks.
     pub verify_weights: bool,
@@ -69,6 +71,7 @@ impl From<ResidentExperts> for serde_json::Value {
     }
 }
 pub use crate::cuda::experts::Statistics as ExpertCacheStatistics;
+pub use crate::cuda::host_weights::Statistics as HostWeightCacheStatistics;
 impl fmt::Display for ResidentExperts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

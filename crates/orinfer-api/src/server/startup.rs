@@ -33,6 +33,7 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
     let scheduler = settings.scheduler;
     let verify_weights = settings.verify_weights;
     let resident_experts = settings.resident_experts;
+    let host_weight_cache_bytes = settings.host_weight_cache_bytes;
     let prompt_lookup = settings.prompt_lookup;
     let activity = Arc::new(continuous::Activity::default());
     let lifecycle = Arc::clone(&activity.lifecycle);
@@ -126,6 +127,7 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
         prompt_lookup,
         verify_weights,
         resident_experts,
+        host_weight_cache_bytes,
         vision,
         api_key: std::env::var("ORINFER_API_KEY")
             .ok()
@@ -181,6 +183,7 @@ fn load_model(settings: &Settings) -> Result<LoadedModel> {
             verify_weights: settings.verify_weights,
             load_workers: settings.load_workers,
             resident_experts: settings.resident_experts,
+            host_weight_cache_bytes: settings.host_weight_cache_bytes,
             prefix_cache_bytes: settings.prefix_cache_bytes,
             mtp_drafts: settings.mtp_drafts,
             prompt_lookup: settings.prompt_lookup,
