@@ -187,8 +187,7 @@ def expert_histogram(M: int, E: int = 512, top_k: int = 10, dynamic_rows: bool =
     """
     if any(type(x) is not int or x <= 0 for x in (M, E, top_k)) or top_k > E:
         raise ValueError("Invalid MoE dispatch dimensions")
-    width = 1 << (M * top_k - 1).bit_length()
-
+    warps = 4
     M = row_count(M, dynamic_rows)
 
     @T.prim_func
@@ -197,20 +196,34 @@ def expert_histogram(M: int, E: int = 512, top_k: int = 10, dynamic_rows: bool =
         Counts: T.Tensor((E,), T.int32),
         RelativeSlot: T.Tensor((M, top_k), T.int32),
     ):
-        with T.Kernel(E, threads=128) as expert:
-            matches = T.alloc_fragment((width,), T.int32)
-            prefix = T.alloc_fragment((width,), T.int32)
-            for j in T.Parallel(width):
-                matches[j] = T.if_then_else(
-                    j < M * top_k, T.cast(IDs[j // top_k, j % top_k] == expert, T.int32), 0
-                )
-                prefix[j] = matches[j]
-            T.cumsum(prefix, dim=0)
-            for j in T.Parallel(width):
-                if j == width - 1:
-                    Counts[expert] = prefix[j]
-                if j < M * top_k and matches[j] != 0:
-                    RelativeSlot[j // top_k, j % top_k] = prefix[j] - 1
+        with T.Kernel(T.ceildiv(E, warps), threads=warps * 32) as block:
+            tx = T.get_thread_binding()
+            expert, lane = block * warps + tx // 32, tx % 32
+            total = T.alloc_var(T.int32, 0)
+            found = T.alloc_var(T.int32, 0)
+            mask = T.alloc_var(T.uint32)
+            if expert < E:
+                # One warp walks each expert's assignments in token/rank order.
+                # Ballot gives the exact integer prefix within a 32-slot chunk;
+                # total carries the count across only the live runtime chunks.
+                for part in T.serial(T.ceildiv(M * top_k, 32)):
+                    assignment = part * 32 + lane
+                    found = 0
+                    if assignment < M * top_k:
+                        found = T.cast(
+                            IDs[assignment // top_k, assignment % top_k] == expert, T.int32
+                        )
+                    mask = T.call_pure_extern(
+                        "uint32", "__ballot_sync", T.uint32(0xFFFFFFFF), found != 0
+                    )
+                    if found != 0:
+                        preceding = mask & ((T.uint32(1) << lane) - T.uint32(1))
+                        RelativeSlot[assignment // top_k, assignment % top_k] = (
+                            total + T.call_pure_extern("int32", "__popc", preceding)
+                        )
+                    total += T.call_pure_extern("int32", "__popc", mask)
+                if lane == 0:
+                    Counts[expert] = total
 
     return main
 

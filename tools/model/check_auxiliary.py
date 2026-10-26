@@ -65,6 +65,63 @@ def verify(run, ref, actual, expected, change):
     )
 
 
+def histogram(args, records, *, experts=512, top_k=10, capacity=4096):
+    """Validate stable integer prefixes against an independent CPU assignment walk."""
+    candidate = compile_kernel(
+        moe.expert_histogram.__wrapped__(capacity, experts, top_k, dynamic_rows=True)
+    )
+    export_kernel(candidate, args.output / f"histogram-e{experts}-k{top_k}")
+    lengths = (
+        [0, 1, 3, capacity]
+        if args.quick
+        else [0, 1, 2, 3, 4, 8, 17, 31, 32, 33, 127, 128, 511, 512, 1023, 1024, capacity]
+    )
+    for rows in sorted({n for n in lengths if n <= capacity}):
+        ids = torch.empty(capacity, top_k, dtype=torch.int32, device="cuda")
+        counts = torch.full((experts + 17,), -777, device="cuda", dtype=torch.int32)
+        slots = torch.full((capacity * top_k + 31,), -777, device="cuda", dtype=torch.int32)
+        output = slots[: capacity * top_k].view(capacity, top_k)
+
+        def run():
+            launch(candidate, ids, counts[:experts], output, rows)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for pattern in ("independent", "hot", "changed"):
+            raw = (
+                torch.rand(rows, experts).argsort(dim=1)[:, :top_k]
+                if pattern == "independent"
+                else (
+                    torch.arange(top_k)[None].expand(rows, -1)
+                    + (experts - top_k if pattern == "changed" else 0)
+                )
+            ).to(torch.int32)
+            expected_counts, expected_slots = [0] * experts, []
+            for expert in raw.flatten().tolist():
+                expected_slots.append(expected_counts[expert])
+                expected_counts[expert] += 1
+            ids[:rows].copy_(raw)
+            counts.fill_(-777)
+            slots.fill_(-777)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert counts[:experts].cpu().tolist() == expected_counts, (rows, pattern)
+            assert slots[: rows * top_k].cpu().tolist() == expected_slots, (rows, pattern)
+            assert bool((counts[experts:] == -777).all())
+            assert bool((slots[rows * top_k :] == -777).all())
+        records.append(
+            dict(
+                kind="histogram",
+                experts=experts,
+                top_k=top_k,
+                rows=rows,
+                exact=True,
+                changed_input_replay=True,
+            )
+        )
+
+
 def routing(args, records):
     old = reference(args, "moe", moe)
     for experts, top in ((256, 8), (512, 10)):
@@ -229,13 +286,18 @@ def main():
     p.add_argument("--quick", action="store_true")
     p.add_argument("--qsa-parts", type=int, nargs="+", choices=(2, 4, 8), default=[2, 4])
     p.add_argument(
-        "--families", nargs="+", choices=("router", "ple", "qsa"), default=["router", "ple", "qsa"]
+        "--families",
+        nargs="+",
+        choices=("router", "histogram", "ple", "qsa"),
+        default=["router", "histogram", "ple", "qsa"],
     )
     args = p.parse_args()
     configure()
     records = []
     for family in args.families:
-        {"router": routing, "ple": gating, "qsa": selection}[family](args, records)
+        {"router": routing, "histogram": histogram, "ple": gating, "qsa": selection}[family](
+            args, records
+        )
     write_json(args.output / "results.json", dict(complete=True, cases=records))
 
 

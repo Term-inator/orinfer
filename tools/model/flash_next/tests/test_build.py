@@ -38,6 +38,31 @@ class BuildTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requested scope"):
             select_projections(groups, shapes=[[640, 2560]])
 
+    def test_histogram_validates_counts_and_sliced_assignment_extents(self):
+        from tools.model.auxiliary_tuning import histogram_geometry
+
+        package = dict(config_signature=dict(text=dict(num_experts=512, num_experts_per_tok=10)))
+        operands = {role: dict(name=role) for role in ("Counts", "IDs", "RelativeSlot")}
+        buffers = {
+            role: dict(dtype="i32", shape=[size])
+            for role, size in (("Counts", 512), ("IDs", 4096 * 10), ("RelativeSlot", 4096 * 10))
+        }
+        self.assertEqual(histogram_geometry(package, operands, buffers, 1024), (512, 10))
+        for role in ("IDs", "RelativeSlot"):
+            operands[role]["offset"] = 4095 * 10 * 4
+            self.assertEqual(histogram_geometry(package, operands, buffers, 1), (512, 10))
+            with self.assertRaisesRegex(ValueError, "physical view"):
+                histogram_geometry(package, operands, buffers, 2)
+        for role in operands:
+            bad = {key: dict(value) for key, value in operands.items()}
+            for offset in (-4, 1):
+                bad[role]["offset"] = offset
+                with self.assertRaisesRegex(ValueError, "physical view"):
+                    histogram_geometry(package, bad, buffers, 1)
+        buffers["Counts"]["shape"] = [511]
+        with self.assertRaisesRegex(ValueError, "physical view"):
+            histogram_geometry(package, operands, buffers, 1)
+
     def test_router_uses_checkpoint_geometry_for_flattened_sliced_workspaces(self):
         from tools.model.auxiliary_tuning import router_geometry
 

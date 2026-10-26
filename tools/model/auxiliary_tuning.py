@@ -57,6 +57,26 @@ def router_geometry(package, operands, buffers, rows):
     return experts, top
 
 
+def histogram_geometry(package, operands, buffers, rows):
+    """Stable assignment counts use the checkpoint's expert and top-k extents."""
+    text = package["config_signature"]["text"]
+    experts, top = text["num_experts"], text["num_experts_per_tok"]
+    if any(type(n) is not int or n <= 0 for n in (experts, top, rows)) or top > experts:
+        raise ValueError("Invalid expert histogram geometry")
+    for role, size in (("IDs", rows * top), ("RelativeSlot", rows * top), ("Counts", experts)):
+        operand = buffers[operands[role]["name"]]
+        offset = operands[role].get("offset", 0)
+        if (
+            operand["dtype"] != "i32"
+            or operand.get("data") is not None
+            or offset < 0
+            or offset % 4
+            or math.prod(operand["shape"]) * 4 - offset < size * 4
+        ):
+            raise ValueError("Expert histogram exceeds its published physical view")
+    return experts, top
+
+
 def fuse_config(family, output, source):
     """Use one aggregate winner; reject candidates with measured regressions."""
     from tools.model.check_auxiliary import gating, selection
@@ -206,7 +226,9 @@ def qsa_pair(old, first, compiler, capacity, context, config, layout=None):
     return result
 
 
-def publish(data, package, manifest, compiler, output, families=("router", "ple", "qsa")):
+def publish(
+    data, package, manifest, compiler, output, families=("router", "histogram", "ple", "qsa")
+):
     from kernels.model import moe, ple
     from tools.model.expert_tuning import MoeTuner
     from tools.model.row_selection import choices
@@ -252,9 +274,12 @@ def publish(data, package, manifest, compiler, output, families=("router", "ple"
     configs = {}
     if data["architecture"] == "flash_next":
         configs = {
-            family: fuse_config(family, output, source) for family in families if family != "router"
+            family: fuse_config(family, output, source)
+            for family in families
+            if family not in ("router", "histogram")
         }
     report = []
+    histogram_checks = {}
     for old in originals.values():
         name = old["name"]
         if "/rows/" in name:
@@ -290,7 +315,38 @@ def publish(data, package, manifest, compiler, output, families=("router", "ple"
                 contracts.add(item["name"])
             report.append(dict(kind="qsa-private", name=name))
             continue
-        if roles == {"IDs", "Logits", "Prob"} and "router" in families:
+        if roles == {"IDs", "Counts", "RelativeSlot"} and "histogram" in families:
+            e, k = histogram_geometry(package, p, compiler.buffers, capacity)
+            check_key = (e, k, capacity)
+            if check_key not in histogram_checks:
+                from tools.model.check_auxiliary import histogram
+
+                cases = []
+                histogram(
+                    SimpleNamespace(output=output / "histogram-checks", quick=False),
+                    cases,
+                    experts=e,
+                    top_k=k,
+                    capacity=capacity,
+                )
+                histogram_checks[check_key] = cases
+            item, launch = compiler.emit(
+                old,
+                name,
+                p,
+                capacity,
+                build=lambda capacity=capacity, e=e, k=k, dynamic=dynamic: (
+                    moe.expert_histogram.__wrapped__(capacity, e, k, dynamic_rows=dynamic)
+                ),
+                key=f"aux-histogram-e{e}-k{k}-{'dynamic' if dynamic else 'single'}",
+                symbolic=dynamic,
+            )
+            replaced[name] = item
+            if dynamic:
+                launches[name] = launch
+            contracts.add(name)
+            report.append(dict(kind="histogram", name=name, experts=e, top_k=k))
+        elif roles == {"IDs", "Logits", "Prob"} and "router" in families:
             e, k = router_geometry(package, p, compiler.buffers, capacity)
             selected = tuner.topk(e, k)
             spans = (
@@ -406,19 +462,18 @@ def publish(data, package, manifest, compiler, output, families=("router", "ple"
     ] + list(launches.values())
     package["plan_kernel_contracts"] = sorted((contracts - removed) | {k["name"] for k in added})
     write_json(
-        output / "published.json", dict(source=source, bindings=report, fusion_configs=configs)
+        output / "published.json",
+        dict(
+            source=source,
+            bindings=report,
+            fusion_configs=configs,
+            histogram_checks=list(histogram_checks.values()),
+        ),
     )
     return report
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    for key in ("model", "model-output", "output"):
-        p.add_argument("--" + key, type=Path, required=True)
-    p.add_argument(
-        "--families", nargs="+", choices=("router", "ple", "qsa"), default=["router", "ple", "qsa"]
-    )
-    args = p.parse_args()
+def rebuild(args):
     from tools.operators.common import configure
     from tools.model.compact import compact_package
 
@@ -436,6 +491,19 @@ def main():
         data["execution_package"] = digest
         write_json(staging / "cache/model.json", data)
     print("COMPLETE", digest, flush=True)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    for key in ("model", "model-output", "output"):
+        p.add_argument("--" + key, type=Path, required=True)
+    p.add_argument(
+        "--families",
+        nargs="+",
+        choices=("router", "histogram", "ple", "qsa"),
+        default=["router", "histogram", "ple", "qsa"],
+    )
+    rebuild(p.parse_args())
 
 
 if __name__ == "__main__":

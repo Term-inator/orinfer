@@ -409,6 +409,12 @@ def main():
         help="Rebuild compressed expert address tables with unchanged row/arithmetic contracts",
     )
     p.add_argument(
+        "--auxiliary-only",
+        nargs="+",
+        choices=("router", "histogram", "ple", "qsa"),
+        help="Rebuild selected auxiliary families with unchanged model arithmetic",
+    )
+    p.add_argument(
         "--hc-only",
         action="store_true",
         help="Measure and rebuild HC down row selections with unchanged arithmetic",
@@ -434,6 +440,23 @@ def main():
         help="Restrict rebuilds to these output/input dimensions; repeat for multiple geometries",
     )
     args = p.parse_args()
+    if args.auxiliary_only:
+        if (
+            args.model is None
+            or args.checkpoint
+            or args.expert_storage_only
+            or args.hc_only
+            or args.plan_only
+            or args.prefill_only
+            or args.projection_kinds
+            or args.projection_shape
+        ):
+            p.error("auxiliary-only requires --model and a complete auxiliary family rebuild")
+        from tools.model.auxiliary_tuning import rebuild as rebuild_auxiliary
+
+        args.families = args.auxiliary_only
+        rebuild_auxiliary(args)
+        return
     if args.hc_only:
         if (
             args.checkpoint

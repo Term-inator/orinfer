@@ -71,6 +71,14 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-hc-b
   --hc-only
 ```
 
+`--auxiliary-only histogram` 只重建专家计数与稳定槽位生成，沿用其余投影、路由分数、专家 tile 和请求状态绑定。直方图按实际 token 行数遍历，每个专家由一个 warp 生成 token／rank 顺序一致的整数前缀；完整重建也使用此实现。构建时校验 checkpoint 的专家数、top-k 和物理视图，并以独立 CPU 计数验证尾部、热点分布与修改输入后的 Graph replay。其他可选辅助族为 `router`、`ple` 和 `qsa`。
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-histogram-build \
+  --model /path/to/native-model --model-output artifacts/models/flash-histogram-ready \
+  --auxiliary-only histogram
+```
+
 在 CPU 上清点构造契约：
 
 ```bash
