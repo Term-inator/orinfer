@@ -488,9 +488,9 @@ class DynamicRowsTests(unittest.TestCase):
                 (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
                 buffers = {b.name: b for b in fn.buffer_map.values()}
                 self.assertTrue(buffers["A"].shape[0].same_as(rows))
-                self.assertTrue(buffers["Output"].shape[0].same_as(rows))
-                self.assertEqual(int(buffers["Weight"].shape[0]), 1)
-                self.assertEqual(str(buffers["Weight"].dtype), "bfloat16")
+                self.assertTrue(buffers["C"].shape[0].same_as(rows))
+                self.assertEqual(int(buffers["W"].shape[0]), 1)
+                self.assertEqual(str(buffers["W"].dtype), "bfloat16")
 
     def test_hc_down_cache_and_streaming_keep_symbolic_partial_rows(self):
         for capacity in (8, 128):

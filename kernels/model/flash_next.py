@@ -90,8 +90,8 @@ def scalar_bf16_projection(
     @T.prim_func
     def main(
         A: T.Tensor((M, K), dtype),
-        Weight: T.Tensor((outputs, K), T.bfloat16),
-        Output: T.Tensor((M, outputs), dtype),
+        W: T.Tensor((outputs, K), T.bfloat16),
+        C: T.Tensor((M, outputs), dtype),
     ):
         with T.Kernel(T.ceildiv(M, tile), outputs, threads=128) as (block, col):
             T.import_source(_BF16_LOAD)
@@ -101,7 +101,7 @@ def scalar_bf16_projection(
                 a[r, k] = 0
                 if block * tile + r < M:
                     a[r, k] = T.cast(A[block * tile + r, k], T.bfloat16)
-            T.copy(Weight[col, 0], w)
+            T.copy(W[col, 0], w)
             T.sync_threads()
             tx = T.get_thread_binding()
             if tx < 32:
@@ -142,7 +142,7 @@ def scalar_bf16_projection(
                             False,
                         )
                 if row < tile and block * tile + row < M and tid == 0:
-                    Output[block * tile + row, col] = acc[0]
+                    C[block * tile + row, col] = acc[0]
 
     return main
 

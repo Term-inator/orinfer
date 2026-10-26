@@ -352,7 +352,15 @@ def rebuild(args):
             from tools.model.flash_next.hc import publish as publish_hc
 
             publish_hc(args.model, package, compiler, args.output / "hc", args.cache)
-            publish_auxiliary(data, package, manifest, compiler, args.output / "auxiliary")
+            publish_auxiliary(
+                data,
+                package,
+                manifest,
+                compiler,
+                args.output / "auxiliary",
+                cache=args.cache,
+                model=args.model,
+            )
             if (
                 data["metadata"].get("vision")
                 and data["metadata"]["vision"]["max_features"] < data["metadata"]["max_context"]
@@ -411,7 +419,7 @@ def main():
     p.add_argument(
         "--auxiliary-only",
         nargs="+",
-        choices=("router", "histogram", "ple", "qsa"),
+        choices=("router", "histogram", "injection", "ple", "qsa"),
         help="Rebuild selected auxiliary families with unchanged model arithmetic",
     )
     p.add_argument(

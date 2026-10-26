@@ -227,7 +227,15 @@ def qsa_pair(old, first, compiler, capacity, context, config, layout=None):
 
 
 def publish(
-    data, package, manifest, compiler, output, families=("router", "histogram", "ple", "qsa")
+    data,
+    package,
+    manifest,
+    compiler,
+    output,
+    families=("router", "histogram", "ple", "qsa"),
+    *,
+    model,
+    cache=ROOT / "artifacts/build-cache/flash-next",
 ):
     from kernels.model import moe, ple
     from tools.model.expert_tuning import MoeTuner
@@ -242,6 +250,20 @@ def publish(
         output / "router-tuning",
         dict(source=source, toolchain=package["toolchain"], environment=machine),
     )
+    hc_records = []
+    if "injection" in families:
+        if data["architecture"] != "flash_next":
+            raise ValueError("HC injection rebuilding requires Flash Next")
+        from tools.model.flash_next.hc import publish as publish_hc
+
+        hc_records = publish_hc(
+            model,
+            package,
+            compiler,
+            output / "hc",
+            cache,
+            kinds=("injection",),
+        )
     dynamics = {k["name"]: k for k in package["dynamic_batch_kernels"]}
     originals = {k["name"]: k for k in package["kernels"]}
     replaced, added, launches, contracts = {}, [], {}, set(package["plan_kernel_contracts"])
@@ -276,9 +298,9 @@ def publish(
         configs = {
             family: fuse_config(family, output, source)
             for family in families
-            if family not in ("router", "histogram")
+            if family not in ("router", "histogram", "injection")
         }
-    report = []
+    report = list(hc_records)
     histogram_checks = {}
     for old in originals.values():
         name = old["name"]
@@ -485,7 +507,16 @@ def rebuild(args):
         compiler = Compiler(
             origin, root, args.output, {b["name"]: b for b in data["metadata"]["buffers"]}
         )
-        publish(data, package, manifest, compiler, args.output, args.families)
+        publish(
+            data,
+            package,
+            manifest,
+            compiler,
+            args.output,
+            args.families,
+            cache=args.cache,
+            model=args.model,
+        )
         digest = compact_package(root, package, staging / "cache/packages")
         shutil.rmtree(root)
         data["execution_package"] = digest
@@ -500,9 +531,10 @@ def main():
     p.add_argument(
         "--families",
         nargs="+",
-        choices=("router", "histogram", "ple", "qsa"),
+        choices=("router", "histogram", "injection", "ple", "qsa"),
         default=["router", "histogram", "ple", "qsa"],
     )
+    p.add_argument("--cache", type=Path, default=ROOT / "artifacts/build-cache/flash-next")
     rebuild(p.parse_args())
 
 

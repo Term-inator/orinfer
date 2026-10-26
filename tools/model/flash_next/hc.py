@@ -1,9 +1,10 @@
-"""Measure HC down tiles against the published cubin, preserving all row contracts."""
+"""Measure exact HC projection portfolios against the published cubins."""
 
 import ctypes
 import math
 import re
 import shutil
+from types import SimpleNamespace
 
 from tools.build.files import file_hash, write_json
 from tools.model.build_cache import identity
@@ -21,6 +22,7 @@ class Reference:
         from cuda.bindings import driver as cu
 
         self.cu, self.host = cu, compiler.host(kernel)
+        self.adapter = SimpleNamespace(func=self.__call__)
         self.module = None
         self.module = self.checked(cu.cuModuleLoadData(compiler.read(kernel["module"])))[0]
         try:
@@ -49,7 +51,7 @@ class Reference:
             self.checked(self.cu.cuModuleUnload(self.module))
             self.module = None
 
-    def __call__(self, x, w, out, rows):
+    def __call__(self, x, w, out, rows, *, stream=None):
         import torch
 
         values = dict(A=x, W=w, C=out)
@@ -72,17 +74,23 @@ class Reference:
                 *(evaluate(config["gridDim" + axis], dimensions) for axis in "XYZ"),
                 *(evaluate(config["blockDim" + axis], dimensions) for axis in "XYZ"),
                 evaluate(config["sharedMemBytes"], dimensions),
-                self.cu.CUstream(torch.cuda.current_stream().cuda_stream),
+                self.cu.CUstream(
+                    torch.cuda.current_stream().cuda_stream if stream is None else stream
+                ),
                 ctypes.addressof(pointers),
                 0,
             )
         )
 
 
-def inventory(package, compiler):
-    """Infer fused SiLU from typed consumers, never generated CUDA text."""
+def inventory(package, compiler, kind="down"):
+    """Validate typed HC operands and down consumers against checkpoint geometry."""
+    if kind not in ("down", "injection"):
+        raise ValueError("Unknown HC projection kind")
     text = package["config_signature"]["text"]
     rank, streams, hidden = (text[key] for key in ("hc_lowrank", "hc_count", "hidden_size"))
+    outputs = rank if kind == "down" else streams
+    weight_role = "down" if kind == "down" else "inject"
     dynamic = {k["name"]: k for k in package["dynamic_batch_kernels"]}
     kernels = [k for k in package["kernels"] if "/rows/" not in k["name"]]
     pointers = {k["name"]: compiler.pointers(k) for k in kernels}
@@ -94,23 +102,28 @@ def inventory(package, compiler):
         p = pointers[old["name"]]
         weight = p.get("W", {}).get("name", "")
         if not re.fullmatch(
-            r"W_(?:blk\.\d+\.hc_(?:attn|ffn)_|output_hc_)down\.weight_value", weight
+            rf"W_(?:blk\.\d+\.hc_(?:attn|ffn)_|output_hc_){weight_role}\.weight_value", weight
         ):
             continue
         if set(p) != {"A", "W", "C"} or old["name"] not in dynamic:
             continue  # Fixed-row partial/finish has its own arithmetic contract.
         descriptor = compiler.buffers[weight]
-        if descriptor["dtype"] != "bf16" or descriptor["shape"] != [rank, streams * hidden]:
-            raise ValueError("HC down weight differs from the checkpoint geometry")
+        if descriptor["dtype"] != "bf16" or descriptor["shape"] != [outputs, streams * hidden]:
+            raise ValueError(f"HC {kind} weight differs from the checkpoint geometry")
         if any(v.get("offset", 0) for v in p.values()):
-            raise ValueError("HC down requires whole native operands")
-        for role, width in (("A", streams * hidden), ("C", rank)):
+            raise ValueError(f"HC {kind} requires whole native operands")
+        for role, width in (("A", streams * hidden), ("C", outputs)):
             operand = compiler.buffers[p[role]["name"]]
             if (
                 operand["dtype"] != "f16"
                 or math.prod(operand["shape"]) < dynamic[old["name"]]["capacity"] * width
             ):
-                raise ValueError("HC down activation differs from its physical FP16 row view")
+                raise ValueError(f"HC {kind} activation differs from its physical FP16 row view")
+        if kind == "injection":
+            if streams != 4:
+                raise ValueError("HC injection requires four stream gates")
+            result.setdefault(False, []).append(old)
+            continue
         consumers = sections[old["name"].rsplit("/", 1)[0]]
         separate = any(
             set(pointers[k["name"]]) == {"Down", "Activated"}
@@ -126,17 +139,18 @@ def inventory(package, compiler):
             raise ValueError("HC down has an ambiguous SiLU consumer contract")
         result.setdefault(fused, []).append(old)
     if not result:
-        raise ValueError("No dynamic HC down construction contracts found")
+        raise ValueError(f"No dynamic HC {kind} construction contracts found")
     return result, dynamic, rank, streams, hidden
 
 
-def publish(model, package, compiler, output, cache):
+def publish_kind(model, package, compiler, output, cache, kind):
     import torch
-    from kernels.model.hyperconnection import hc_projection
+    from kernels.model.hyperconnection import hc_projection, hc_injection
     from tools.model.compile import primitive
     from tools.model.flash_next.build import read_weights, source_identity, toolchain
 
-    groups, dynamics, rank, streams, hidden = inventory(package, compiler)
+    groups, dynamics, rank, streams, hidden = inventory(package, compiler, kind)
+    outputs = rank if kind == "down" else streams
     source = source_identity()
     machine = toolchain()
     output.mkdir(parents=True, exist_ok=True)
@@ -147,6 +161,10 @@ def publish(model, package, compiler, output, cache):
         dict(block_m=m, block_n=n)
         for m, n in ((64, 128), (16, 16), (16, 32), (16, 64), (16, 128), (32, 32))
     ]
+    if kind == "injection":
+        configs = [dict(algorithm="published")] + [
+            dict(algorithm="cached", block_m=m) for m in (1, 2, 3)
+        ]
     for silu, items in sorted(groups.items()):
         representative = max(items, key=lambda k: dynamics[k["name"]]["capacity"])
         capacity = dynamics[representative["name"]]["capacity"]
@@ -170,28 +188,45 @@ def publish(model, package, compiler, output, cache):
         )
 
         def build(config):
+            options = dict(config)
+            algorithm = options.pop("algorithm", "matrix")
+            if algorithm == "published":
+                return reference
+            if algorithm == "cached":
+                return primitive(
+                    hc_injection,
+                    capacity,
+                    outputs,
+                    streams * hidden,
+                    dynamic_rows=True,
+                    dtype="float16",
+                    **options,
+                )
             return primitive(
                 hc_projection,
                 capacity,
-                rank,
+                outputs,
                 streams * hidden,
                 dtype="float16",
                 dynamic_rows=True,
                 streams=streams,
-                reduction_groups=streams,
+                reduction_groups=streams if kind == "down" else 1,
                 group_m=4,
                 silu=silu,
-                **config,
+                **options,
             )
 
         def inputs(rows):
             for scale in (1.0, 0.03125):
                 x = (torch.randn(rows, streams * hidden, device="cuda") * scale).half()
-                expected = torch.empty(rows, rank, device="cuda", dtype=torch.float16)
+                expected = torch.empty(rows, outputs, device="cuda", dtype=torch.float16)
                 reference(x, real, expected, rows)
 
                 def fixture(kernel, config):
-                    out = torch.empty_like(expected)
+                    storage = torch.full(
+                        (rows * outputs + 31,), 91.0, device="cuda", dtype=torch.float16
+                    )
+                    out = storage[:-31].view(rows, outputs)
 
                     def run():
                         launch(kernel, x, real, out, rows)
@@ -199,7 +234,12 @@ def publish(model, package, compiler, output, cache):
                     def check():
                         torch.cuda.synchronize()
                         if not torch.equal(out, expected):
-                            raise AssertionError(f"HC arithmetic differs at {rows} rows: {config}")
+                            raise AssertionError(
+                                f"HC {kind} arithmetic differs at {rows} rows: {config}"
+                            )
+
+                        if not bool((storage[-31:] == 91.0).all()):
+                            raise AssertionError("HC projection wrote beyond its output")
 
                     def change():
                         x.neg_()
@@ -212,21 +252,55 @@ def publish(model, package, compiler, output, cache):
 
         try:
             selected = tuner.select(
-                dict(kind="hc-down", silu=silu, rank=rank, streams=streams, hidden=hidden),
+                dict(kind="hc-" + kind, silu=silu, rank=rank, streams=streams, hidden=hidden),
                 configs,
                 build,
                 inputs,
+                measure_rows=(
+                    [
+                        min(n, capacity)
+                        for n in (
+                            1,
+                            2,
+                            3,
+                            4,
+                            8,
+                            17,
+                            32,
+                            64,
+                            96,
+                            128,
+                            129,
+                            144,
+                            160,
+                            176,
+                            192,
+                            224,
+                            256,
+                            257,
+                            384,
+                            512,
+                            capacity,
+                        )
+                    ]
+                    if kind == "injection"
+                    else None
+                ),
             )
             selected_kernels = {}
             for old in items:
                 rows = dynamics[old["name"]]["capacity"]
                 for suffix, config in choices(selected, rows):
                     key = (
-                        "hc-down-"
+                        "hc-"
+                        + kind
+                        + "-"
                         + identity(dict(silu=silu, capacity=capacity, config=config))[:20]
                     )
                     if key not in selected_kernels:
-                        selected_kernels[key] = build(config)
+                        selected_kernels[key] = (
+                            None if config.get("algorithm") == "published" else build(config)
+                        )
                     item, dynamic = compiler.emit(
                         old,
                         old["name"] + suffix,
@@ -245,7 +319,7 @@ def publish(model, package, compiler, output, cache):
                     for k in package["kernels"]
                     if k["name"].startswith(old["name"] + "/rows/")
                 )
-            records.append(dict(silu=silu, bindings=len(items), selection=selected))
+            records.append(dict(kind=kind, silu=silu, bindings=len(items), selection=selected))
         finally:
             torch.cuda.synchronize()
             reference.close()
@@ -263,6 +337,14 @@ def publish(model, package, compiler, output, cache):
         | {k["name"] for k in added}
     )
     write_json(output / "hc-selection.json", dict(source=source, records=records))
+    return records
+
+
+def publish(model, package, compiler, output, cache, *, kinds=("down", "injection")):
+    records = []
+    for kind in kinds:
+        records.extend(publish_kind(model, package, compiler, output / kind, cache, kind))
+    write_json(output / "hc-selection.json", dict(records=records))
     return records
 
 

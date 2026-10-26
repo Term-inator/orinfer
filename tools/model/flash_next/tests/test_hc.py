@@ -45,6 +45,18 @@ class HcContractsTests(unittest.TestCase):
             self.assertEqual([rank, streams, hidden], [320, 4, 2560])
             self.assertEqual(dynamic[groups[fused][0]["name"]]["capacity"], 1024)
 
+    def test_multiple_down_layers_keep_the_weight_role(self):
+        package, compiler, pointers = self.fixture()
+        for source, target in (
+            ("target/layer0/k1", "target/layer1/k1"),
+            ("target/layer0/k2", "target/layer1/k2"),
+        ):
+            pointers[target] = copy.deepcopy(pointers[source])
+            package["kernels"].append(dict(name=target))
+        package["dynamic_batch_kernels"].append(dict(name="target/layer1/k1", capacity=1024))
+        groups, *_ = inventory(package, compiler)
+        self.assertEqual(len(groups[False]), 2)
+
     def test_old_row_variants_do_not_duplicate_canonical_bindings(self):
         package, compiler, _ = self.fixture()
         package["kernels"].append(dict(name="target/layer0/k1/rows/1-1024"))
@@ -81,6 +93,40 @@ class HcContractsTests(unittest.TestCase):
             compiler.buffers["Down"][field] = value
             with self.assertRaisesRegex(ValueError, "physical FP16"):
                 inventory(package, compiler)
+
+    def test_injection_uses_four_output_checkpoint_contract(self):
+        package, compiler, pointers = self.fixture()
+        old = "W_blk.0.hc_attn_down.weight_value"
+        new = old.replace("down.", "inject.")
+        pointers["target/layer0/k1"]["W"]["name"] = new
+        compiler.buffers[new] = dict(dtype="bf16", shape=[4, 10240])
+        compiler.buffers["Down"]["shape"] = [1024 * 4]
+        groups, *_ = inventory(package, compiler, "injection")
+        self.assertEqual(len(groups[False]), 1)
+        second = "target/layer1/k1"
+        pointers[second] = copy.deepcopy(pointers["target/layer0/k1"])
+        package["kernels"].append(dict(name=second))
+        package["dynamic_batch_kernels"].append(dict(name=second, capacity=1024))
+        groups, *_ = inventory(package, compiler, "injection")
+        self.assertEqual(len(groups[False]), 2)
+        self.assertEqual(pointers[groups[False][0]["name"]]["W"]["name"], new)
+        compiler.buffers[new]["shape"] = [320, 10240]
+        with self.assertRaisesRegex(ValueError, "geometry"):
+            inventory(package, compiler, "injection")
+
+    def test_injection_checks_output_capacity_and_stream_count(self):
+        package, compiler, pointers = self.fixture()
+        new = "W_blk.0.hc_attn_inject.weight_value"
+        pointers["target/layer0/k1"]["W"]["name"] = new
+        compiler.buffers[new] = dict(dtype="bf16", shape=[4, 10240])
+        compiler.buffers["Down"]["shape"] = [1024 * 4 - 1]
+        with self.assertRaisesRegex(ValueError, "physical FP16"):
+            inventory(package, compiler, "injection")
+        package["config_signature"]["text"]["hc_count"] = 3
+        compiler.buffers[new]["shape"] = [3, 7680]
+        compiler.buffers["Down"]["shape"] = [1024 * 3]
+        with self.assertRaisesRegex(ValueError, "four stream gates"):
+            inventory(package, compiler, "injection")
 
 
 if __name__ == "__main__":
