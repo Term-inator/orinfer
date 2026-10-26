@@ -61,6 +61,9 @@ pub struct Statistics {
     pub read_wait_s: f64,
     pub dma_wait_s: f64,
     pub upload_chunks: usize,
+    /// Sum of reader work/wait intervals across concurrent workers.
+    pub reader_service_s: f64,
+    pub file_read_s: f64,
     pub page_reuses: u64,
     pub host_cache: crate::execution::HostWeightCacheStatistics,
     /// Physical VMM pages include allocation-granule overhead and shared neighbors.
@@ -84,6 +87,8 @@ impl Statistics {
             read_wait_s: self.read_wait_s - before.read_wait_s,
             dma_wait_s: self.dma_wait_s - before.dma_wait_s,
             upload_chunks: self.upload_chunks - before.upload_chunks,
+            reader_service_s: self.reader_service_s - before.reader_service_s,
+            file_read_s: self.file_read_s - before.file_read_s,
             page_reuses: self.page_reuses - before.page_reuses,
             host_cache: self.host_cache.since(before.host_cache),
             ..self
@@ -259,6 +264,13 @@ impl Pager {
             .flat_map(|(i, b)| b.consumers.iter().map(move |(k, n)| (k.clone(), (i, *n))))
             .collect();
         let mapped_bytes = slots.as_ref().map_or(0, |slots| slots.bytes);
+        let mut host_cache = host_weights::Cache::new(host_cache_bytes);
+        for source in sources
+            .values()
+            .filter(|source| source.bytes <= weight_upload::PAYLOAD_BYTES)
+        {
+            host_cache.register_bank(source);
+        }
         Self {
             banks: plan.banks,
             sources,
@@ -270,7 +282,7 @@ impl Pager {
             transient: BTreeSet::new(),
             clock: 0,
             workers,
-            host_cache: Arc::new(Mutex::new(host_weights::Cache::new(host_cache_bytes))),
+            host_cache: Arc::new(Mutex::new(host_cache)),
             statistics: Statistics {
                 capacity_experts: plan.capacity,
                 mapped_bytes,
@@ -459,6 +471,8 @@ impl Pager {
         self.statistics.read_wait_s += uploaded.read_wait_s;
         self.statistics.dma_wait_s += uploaded.dma_wait_s;
         self.statistics.upload_chunks += uploaded.chunks;
+        self.statistics.reader_service_s += uploaded.reader_service_s;
+        self.statistics.file_read_s += uploaded.file_read_s;
         self.statistics.resident_experts = self.prob.keys.len() + self.hot.keys.len();
         self.statistics.transient_experts = self.transient.len();
         self.statistics.peak_transient_experts = self

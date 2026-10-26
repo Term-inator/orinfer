@@ -33,9 +33,13 @@
 
 `--host-weight-cache-mib` 为有限专家模式设置独立的 CPU 压缩权重缓存，CLI 默认 4096 MiB，0 关闭，可按主机预算设置为 16384 MiB。缓存按实际读取增长，保留原压缩字节，LRU 淘汰时释放页；预算包含页尾及元数据，并在 `expert_cache.host_cache` 中报告命中字节和实际计费。CPU 缓存与 GPU 专家容量、pinned 上传缓冲分别计费。首次填充增加 RAM 写入和缺页成本，性能需同时测冷请求与持续请求；swap 中的缓存页需要读回，不能视为高速 RAM 命中。HTTP health 返回配置的 `host_weight_cache_bytes`。
 
+缓存命中时只在互斥锁内更新索引，读取线程持有只读租约并行复制到 pinned 缓冲；租约存活期间保留完整计费且禁止淘汰。能放入单个上传缓冲并满足缓存预算的小型完整专家 bank 共用缓存条目，GPU 仍只接收本轮选中专家的字节；bank 索引元数据也计入预算。
+
 本项目的 x86_64/SM120 独显部署按 CUDA 空闲显存校验请求状态、KV 和工作区，主机缓存与有界前处理采用各自预算。主机 RAM 与 GPU 显存分别计费，swap 不增加显存容量。
 
 紧凑专家池复用跨层全局 SLRU，淘汰后直接复用物理槽位；地址表按真实路由在计算 stream 上提交，上传完成前保留原始压缩字节和 scale 的完整性。`run-model` 的 `expert_cache` 报告包含 `route_wait_s`、`transition_s`、`upload_s`、`read_wait_s`、`dma_wait_s` 和 `upload_chunks`：读取/DMA等待是上传耗时的组成部分，路由等待包含此前 GPU 计算的完成时间；这些值用于定位成本，完整请求性能以实际生成结果与总耗时验收。
+
+`reader_service_s` 和 `file_read_s` 分别累计各读取线程的服务时间与文件读取时间；`host_cache` 的 `lock_wait_s`、`metadata_s`、`copy_s` 和 `fill_s` 累计互斥锁等待、文件身份检查、命中复制和缓存填充耗时。这些线程累计值可以相互重叠，不能与上传墙钟时间相加。
 
 ### 请求默认参数
 

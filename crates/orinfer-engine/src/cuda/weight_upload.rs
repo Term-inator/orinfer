@@ -14,7 +14,7 @@ use std::{
 
 const ALIGNMENT: usize = 4096;
 const SLOT_BYTES: usize = 8 << 20;
-const PAYLOAD_BYTES: usize = SLOT_BYTES - ALIGNMENT;
+pub(super) const PAYLOAD_BYTES: usize = SLOT_BYTES - ALIGNMENT;
 
 pub(super) struct Upload {
     pub source: TensorSource,
@@ -28,6 +28,9 @@ pub(super) struct Statistics {
     pub staging_s: f64,
     pub idle_work_s: f64,
     pub chunks: usize,
+    pub reader_service_s: f64,
+    pub file_read_s: f64,
+    cache_copy_s: f64,
 }
 
 /// Ready reads have priority. While disk readers are busy, the CUDA owner may
@@ -63,6 +66,15 @@ struct ReadFile {
 #[derive(Default)]
 struct Reader {
     files: BTreeMap<std::path::PathBuf, ReadFile>,
+    file_read_s: f64,
+    cache_copy_s: f64,
+}
+
+struct ReadReport {
+    result: Result<usize>,
+    service_s: f64,
+    file_read_s: f64,
+    cache_copy_s: f64,
 }
 
 struct Slot {
@@ -180,7 +192,7 @@ struct Job {
 /// bounded by the staging slot count. Threads keep immutable shard files open.
 struct Readers {
     jobs: Option<mpsc::SyncSender<Job>>,
-    completed: mpsc::Receiver<(Job, Result<usize>)>,
+    completed: mpsc::Receiver<(Job, ReadReport)>,
     handles: Vec<std::thread::JoinHandle<()>>,
 }
 impl Readers {
@@ -210,6 +222,9 @@ impl Readers {
                             let target = unsafe {
                                 std::slice::from_raw_parts_mut(job.pointer as *mut u8, SLOT_BYTES)
                             };
+                            let at = Instant::now();
+                            let file_before = reader.file_read_s;
+                            let copy_before = reader.cache_copy_s;
                             let result = reader.read(
                                 &job.source,
                                 job.offset,
@@ -217,7 +232,13 @@ impl Readers {
                                 target,
                                 job.cache.as_deref(),
                             );
-                            if done.send((job, result)).is_err() {
+                            let report = ReadReport {
+                                result,
+                                service_s: at.elapsed().as_secs_f64(),
+                                file_read_s: reader.file_read_s - file_before,
+                                cache_copy_s: reader.cache_copy_s - copy_before,
+                            };
+                            if done.send((job, report)).is_err() {
                                 break;
                             }
                         }
@@ -248,6 +269,15 @@ fn unsupported_direct(error: &std::io::Error) -> bool {
     )
 }
 
+fn cache_lock(
+    cache: &Mutex<host_weights::Cache>,
+) -> std::sync::MutexGuard<'_, host_weights::Cache> {
+    let at = Instant::now();
+    let mut guard = cache.lock().unwrap();
+    guard.statistics.lock_wait_s += at.elapsed().as_secs_f64();
+    guard
+}
+
 impl Reader {
     /// Reuse shard descriptors and accept EOF tails on sector-aligned direct reads.
     fn read(
@@ -270,16 +300,12 @@ impl Reader {
         {
             return Err("Weight chunk exceeds tensor".into());
         }
-        let aligned = absolute / ALIGNMENT * ALIGNMENT;
-        let skip = absolute - aligned;
-        let extent = (skip + bytes).next_multiple_of(ALIGNMENT);
-        if extent > target.len() {
-            return Err("Weight chunk exceeds staging slot".into());
-        }
         // A retained descriptor must still refer to the named shard. Check the
         // current length too, so truncation/removal retain their error semantics.
+        let metadata_at = Instant::now();
         let metadata = std::fs::metadata(&source.path)
             .map_err(|e| format!("{}: {e}", source.path.display()))?;
+        let metadata_s = metadata_at.elapsed().as_secs_f64();
         let identity = (metadata.dev(), metadata.ino());
         let size = usize::try_from(metadata.len()).map_err(|_| "Weight shard length overflow")?;
         if self
@@ -295,29 +321,62 @@ impl Reader {
                 source.path.display()
             ));
         }
-        let key = cache.map(|_| host_weights::Key::new(&source.path, &metadata, absolute, bytes));
-        if let Some((cache, key)) = cache.zip(key.as_ref())
-            && cache.lock().unwrap().copy(key, target)
+        let mut key =
+            cache.map(|_| host_weights::Key::new(&source.path, &metadata, absolute, bytes));
+        let mut read_absolute = absolute;
+        let mut read_bytes = bytes;
+        if let Some(cache) = cache {
+            let (resolved, payload) = {
+                let mut guard = cache_lock(cache);
+                guard.statistics.metadata_s += metadata_s;
+                let resolved = guard.resolve(key.take().unwrap());
+                let payload = guard.acquire(&resolved, bytes);
+                (resolved, payload)
+            };
+            (read_absolute, read_bytes) = resolved.extent();
+            key = Some(resolved);
+            if let Some(payload) = payload {
+                if target.len() < bytes {
+                    return Err("Weight chunk exceeds staging slot".into());
+                }
+                let at = Instant::now();
+                let first = absolute - read_absolute;
+                target[..bytes].copy_from_slice(&payload[first..first + bytes]);
+                self.cache_copy_s += at.elapsed().as_secs_f64();
+                return Ok(0);
+            }
+        }
+        let aligned = read_absolute / ALIGNMENT * ALIGNMENT;
+        let skip = read_absolute - aligned;
+        let extent = (skip + read_bytes).next_multiple_of(ALIGNMENT);
+        if extent > target.len()
+            || read_absolute
+                .checked_add(read_bytes)
+                .is_none_or(|end| end > size)
         {
-            return Ok(0);
+            return Err("Weight bank exceeds its file or staging extent".into());
         }
         let store = |skip: usize, target: &[u8]| -> Result<usize> {
             if let Some((cache, key)) = cache.zip(key.as_ref())
-                && cache.lock().unwrap().reserve(key)?
+                && cache_lock(cache).reserve(key)?
             {
                 // Reserve first, then fault/copy pages without holding the
                 // shared cache lock. All workers' pending bytes are billed.
-                let mut data = match memmap2::MmapMut::map_anon(bytes) {
+                let fill_at = Instant::now();
+                let mut data = match memmap2::MmapMut::map_anon(read_bytes) {
                     Ok(data) => data,
                     Err(error) => {
-                        cache.lock().unwrap().cancel(key);
+                        cache_lock(cache).cancel(key);
                         return Err(format!("Host weight cache allocation: {error}"));
                     }
                 };
-                data.copy_from_slice(&target[skip..skip + bytes]);
-                cache.lock().unwrap().commit(key.clone(), data)?;
+                data.copy_from_slice(&target[skip..skip + read_bytes]);
+                let fill_s = fill_at.elapsed().as_secs_f64();
+                let mut guard = cache_lock(cache);
+                guard.statistics.fill_s += fill_s;
+                guard.commit(key.clone(), data)?;
             }
-            Ok(skip)
+            Ok(skip + absolute - read_absolute)
         };
         let file = match self.files.entry(source.path.clone()) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -354,12 +413,14 @@ impl Reader {
         if (target.as_ptr() as usize).is_multiple_of(ALIGNMENT)
             && let Some(direct) = &file.direct
         {
+            let at = Instant::now();
             let read = loop {
                 match direct.read_at(&mut target[..extent], aligned as u64) {
                     Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                     result => break result,
                 }
             };
+            self.file_read_s += at.elapsed().as_secs_f64();
             match read {
                 Ok(n) if n == extent.min(file.size - aligned) => return store(skip, target),
                 Ok(_) => {
@@ -374,9 +435,13 @@ impl Reader {
                 Err(error) => return Err(format!("{}: {error}", source.path.display())),
             }
         }
-        file.buffered
-            .read_exact_at(&mut target[..bytes], absolute as u64)
-            .map_err(|e| format!("{}: {e}", source.path.display()))?;
+        let at = Instant::now();
+        let result = file
+            .buffered
+            .read_exact_at(&mut target[..read_bytes], read_absolute as u64)
+            .map_err(|e| format!("{}: {e}", source.path.display()));
+        self.file_read_s += at.elapsed().as_secs_f64();
+        result?;
         store(0, target)
     }
 }
@@ -546,11 +611,14 @@ fn upload_with_cache(
                     break;
                 }
                 debug_assert_ne!(reading, 0);
-                let ((job, result), wait_s, idle_s) = receive(done_rx, idle)?;
+                let ((job, report), wait_s, idle_s) = receive(done_rx, idle)?;
+                statistics.reader_service_s += report.service_s;
+                statistics.file_read_s += report.file_read_s;
+                statistics.cache_copy_s += report.cache_copy_s;
                 statistics.read_wait_s += wait_s;
                 statistics.idle_work_s += idle_s;
                 reading -= 1;
-                let skip = result?;
+                let skip = report.result?;
                 let slot = &pool.slots[job.slot];
                 // SAFETY: CPU read completed; GPU allocation covers this chunk.
                 // The event completes before the slot is returned to a reader.
@@ -583,6 +651,9 @@ fn upload_with_cache(
     if result.is_ok() {
         // Every slot's DMA event completed before active reached zero.
         pool.pending = false;
+    }
+    if let (Some(cache), Ok(statistics)) = (cache, &result) {
+        cache.lock().unwrap().statistics.copy_s += statistics.cache_copy_s;
     }
     result
 }
@@ -619,6 +690,71 @@ mod tests {
         assert!(reader.read(&source, 0, 1024, &mut target, None).is_err());
         fs::remove_file(path).unwrap();
         assert!(reader.read(&source, 0, 1024, &mut target, None).is_err());
+    }
+
+    #[test]
+    fn cached_banks_select_exact_rows_and_revalidate_file_identity() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path();
+        let data: Vec<_> = (0..12345).map(|i| (i * 37) as u8).collect();
+        fs::write(path, &data).unwrap();
+        let bank = TensorSource {
+            path: path.into(),
+            offset: 173,
+            bytes: 8192 + 537,
+        };
+        let mut cache = host_weights::Cache::new(1 << 20);
+        cache.register_bank(&bank);
+        let cache = Mutex::new(cache);
+        let mut reader = Reader::default();
+        let mut target = memmap2::MmapMut::map_anon(SLOT_BYTES).unwrap();
+        for (row, bytes) in [(37, 131), (1024, 4097), (8192, 537)] {
+            let source = TensorSource {
+                path: path.into(),
+                offset: bank.offset + row,
+                bytes,
+            };
+            let skip = reader
+                .read(&source, 0, bytes, &mut target, Some(&cache))
+                .unwrap();
+            assert_eq!(
+                &target[skip..skip + bytes],
+                &data[source.offset..source.offset + bytes]
+            );
+        }
+        assert_eq!(cache.lock().unwrap().statistics.hits, 2);
+        assert_eq!(
+            cache.lock().unwrap().statistics.requested_bytes,
+            131 + 4097 + 537
+        );
+        let replacement = path.with_extension("replacement");
+        let changed: Vec<_> = data.iter().map(|b| b.wrapping_add(19)).collect();
+        fs::write(&replacement, &changed).unwrap();
+        fs::rename(replacement, path).unwrap();
+        let source = TensorSource {
+            path: path.into(),
+            offset: bank.offset + 37,
+            bytes: 131,
+        };
+        let skip = reader
+            .read(&source, 0, source.bytes, &mut target, Some(&cache))
+            .unwrap();
+        assert_eq!(
+            &target[skip..skip + source.bytes],
+            &changed[source.offset..source.offset + source.bytes]
+        );
+        fs::write(path, &changed[..512]).unwrap();
+        assert!(
+            reader
+                .read(&source, 0, source.bytes, &mut target, Some(&cache))
+                .is_err()
+        );
+        fs::remove_file(path).unwrap();
+        assert!(
+            reader
+                .read(&source, 0, source.bytes, &mut target, Some(&cache))
+                .is_err()
+        );
     }
 
     #[test]
