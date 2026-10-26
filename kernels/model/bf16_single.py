@@ -114,3 +114,40 @@ def bf16_rows(
                     )
 
     return bf16_rows_kernel
+
+
+@orin_jit(pass_configs=CACHED_WARP_PASSES)
+def bf16_short(M, N, K, *, block_m=1, block_n=32, block_k=64, stages=3, dynamic_rows=False):
+    """Short FP16 output projection with exact BF16 MMA K16 accumulation."""
+    if (
+        any(type(x) is not int or x <= 0 for x in (M, N, K))
+        or block_m not in (1, 2, 3, 4, 8)
+        or block_n not in (16, 32)
+        or block_k not in (64, 128, 256)
+        or stages not in (2, 3, 4)
+        or N % block_n
+        or K % block_k
+    ):
+        raise ValueError("Unsupported short BF16 projection geometry")
+    rows = row_count(M, dynamic_rows)
+    bm, bn = block_m, block_n
+    product = cached_warp_loop(rows, K, bm, bn, block_k, stages)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((rows, 1, K), T.float16),
+        W: T.Tensor((N, K // 2), T.uint32),
+        C: T.Tensor((rows, N), T.float16),
+    ):
+        with T.Kernel(T.ceildiv(rows, bm), N // bn, threads=bn * 2) as (by, bx):
+            tid = T.get_thread_binding()
+            lane, warp = tid % 32, tid // 32
+            acc = T.alloc_local((4,), T.float32)
+            product(A, W, acc, by * bm, bx, 0)
+            for rr in T.unroll(4):
+                row = (lane % 4) * 2 + rr % 2
+                column = warp * 16 + lane // 4 + (rr // 2) * 8
+                if row < bm and by * bm + row < rows:
+                    C[by * bm + row, bx * bn + column] = T.cast(acc[rr], T.float16)
+
+    return main

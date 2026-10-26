@@ -85,12 +85,12 @@ class Reference:
 
 def inventory(package, compiler, kind="down"):
     """Validate typed HC operands and down consumers against checkpoint geometry."""
-    if kind not in ("down", "injection"):
+    if kind not in ("down", "injection", "up"):
         raise ValueError("Unknown HC projection kind")
     text = package["config_signature"]["text"]
     rank, streams, hidden = (text[key] for key in ("hc_lowrank", "hc_count", "hidden_size"))
-    outputs = rank if kind == "down" else streams
-    weight_role = "down" if kind == "down" else "inject"
+    outputs = rank if kind == "down" else streams * hidden if kind == "up" else streams
+    weight_role = "down" if kind == "down" else "up" if kind == "up" else "inject"
     dynamic = {k["name"]: k for k in package["dynamic_batch_kernels"]}
     kernels = [k for k in package["kernels"] if "/rows/" not in k["name"]]
     pointers = {k["name"]: compiler.pointers(k) for k in kernels}
@@ -108,17 +108,23 @@ def inventory(package, compiler, kind="down"):
         if set(p) != {"A", "W", "C"} or old["name"] not in dynamic:
             continue  # Fixed-row partial/finish has its own arithmetic contract.
         descriptor = compiler.buffers[weight]
-        if descriptor["dtype"] != "bf16" or descriptor["shape"] != [outputs, streams * hidden]:
+        if descriptor["dtype"] != "bf16" or descriptor["shape"] != [
+            outputs,
+            rank if kind == "up" else streams * hidden,
+        ]:
             raise ValueError(f"HC {kind} weight differs from the checkpoint geometry")
         if any(v.get("offset", 0) for v in p.values()):
             raise ValueError(f"HC {kind} requires whole native operands")
-        for role, width in (("A", streams * hidden), ("C", outputs)):
+        for role, width in (("A", rank if kind == "up" else streams * hidden), ("C", outputs)):
             operand = compiler.buffers[p[role]["name"]]
             if (
                 operand["dtype"] != "f16"
                 or math.prod(operand["shape"]) < dynamic[old["name"]]["capacity"] * width
             ):
                 raise ValueError(f"HC {kind} activation differs from its physical FP16 row view")
+        if kind == "up":
+            result.setdefault(False, []).append(old)
+            continue
         if kind == "injection":
             if streams != 4:
                 raise ValueError("HC injection requires four stream gates")
@@ -168,18 +174,32 @@ def publish_kind(model, package, compiler, output, cache, kind):
     import torch
     from kernels.model.hyperconnection import hc_injection
     from kernels.model.hc_down import hc_down_cached
+    from kernels.model.bf16_single import bf16_short
     from tools.model.compile import primitive
     from tools.model.flash_next.build import read_weights, source_identity, toolchain
 
     groups, dynamics, rank, streams, hidden = inventory(package, compiler, kind)
-    outputs = rank if kind == "down" else streams
+    outputs = rank if kind == "down" else streams * hidden if kind == "up" else streams
     source = source_identity()
     machine = toolchain()
     output.mkdir(parents=True, exist_ok=True)
     replaced, added, launches, removed, records = {}, [], {}, set(), []
     # Each stream retains its K16 FP32 sum. New cached schedules compete
     # against every existing matrix contract, including its row variants.
-    if kind == "injection":
+    if kind == "up":
+        cached = [
+            dict(algorithm="cached", block_m=m, block_n=n, block_k=64, stages=stages)
+            for m, n, stages in (
+                (1, 16, 3),
+                (1, 32, 2),
+                (1, 32, 3),
+                (2, 32, 3),
+                (3, 32, 3),
+                (4, 32, 3),
+                (8, 32, 3),
+            )
+        ]
+    elif kind == "injection":
         cached = [dict(algorithm="cached", block_m=m) for m in (1, 2, 3)]
     else:
         cached = [
@@ -229,6 +249,8 @@ def publish_kind(model, package, compiler, output, cache, kind):
                 return references[options["variant"]]
             if algorithm != "cached":
                 raise ValueError("Unknown HC implementation")
+            if kind == "up":
+                return primitive(bf16_short, capacity, outputs, rank, dynamic_rows=True, **options)
             if kind == "injection":
                 return primitive(
                     hc_injection,
@@ -252,7 +274,10 @@ def publish_kind(model, package, compiler, output, cache, kind):
 
         def inputs(rows):
             for scale in (1.0, 0.03125):
-                x = (torch.randn(rows, streams * hidden, device="cuda") * scale).half()
+                x = (
+                    torch.randn(rows, rank if kind == "up" else streams * hidden, device="cuda")
+                    * scale
+                ).half()
                 expected = torch.empty(rows, outputs, device="cuda", dtype=torch.float16)
                 reference(x, real, expected, rows)
 
@@ -264,12 +289,17 @@ def publish_kind(model, package, compiler, output, cache, kind):
 
                     w = (
                         real.view(torch.uint32)
-                        if kind == "down" and config["algorithm"] == "cached"
+                        if kind in ("down", "up") and config["algorithm"] == "cached"
                         else real
                     )
 
                     def run():
-                        launch(kernel, x, w, out, rows)
+                        activation = (
+                            x.view(rows, 1, rank)
+                            if kind == "up" and config["algorithm"] == "cached"
+                            else x
+                        )
+                        launch(kernel, activation, w, out, rows)
 
                     def check():
                         torch.cuda.synchronize()
@@ -387,7 +417,7 @@ def publish_kind(model, package, compiler, output, cache, kind):
     return records
 
 
-def publish(model, package, compiler, output, cache, *, kinds=("down", "injection")):
+def publish(model, package, compiler, output, cache, *, kinds=("down", "injection", "up")):
     records = []
     for kind in kinds:
         records.extend(publish_kind(model, package, compiler, output / kind, cache, kind))

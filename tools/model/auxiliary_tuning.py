@@ -253,7 +253,7 @@ def publish(
     hc_records = []
     hc_kinds = tuple(
         kind
-        for family, kind in (("hc-down", "down"), ("injection", "injection"))
+        for family, kind in (("hc-down", "down"), ("injection", "injection"), ("hc-up", "up"))
         if family in families
     )
     if hc_kinds:
@@ -303,7 +303,7 @@ def publish(
         configs = {
             family: fuse_config(family, output, source)
             for family in families
-            if family not in ("router", "histogram", "injection", "hc-down")
+            if family not in ("router", "histogram", "injection", "hc-down", "hc-up")
         }
     report = list(hc_records)
     histogram_checks = {}
@@ -536,7 +536,7 @@ def main():
     p.add_argument(
         "--families",
         nargs="+",
-        choices=("router", "histogram", "injection", "hc-down", "ple", "qsa"),
+        choices=("router", "histogram", "injection", "hc-down", "hc-up", "ple", "qsa"),
         default=["router", "histogram", "ple", "qsa"],
     )
     p.add_argument("--cache", type=Path, default=ROOT / "artifacts/build-cache/flash-next")

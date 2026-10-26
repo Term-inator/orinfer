@@ -63,7 +63,7 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-w8-b
 
 W8 调优包含寄存器 scale 复用和按行 tile 遍历的候选；它们读取相同的原生 W8 权重，保持完整 INT32 点积、先权重 scale 后 token scale 的 FP32 乘法顺序，以及最终输出舍入。候选由真实权重和多个行数的测量选择，发布包只保留选中的实现，Rust 在线路径没有新增依赖。
 
-`--hc-only` 单独测量并重建 HC down 与 injection 的动态行选择，完整重建也执行此步骤。构建器从 checkpoint 几何和类型化的 SiLU/up 消费者识别融合边界，在真实 BF16 权重上直接对照输入包的已发布 cubin，验证多个行数、输出尾部和改变输入后的 Graph replay。候选保持逐 stream 的 FP32 归约顺序、BF16 MMA K16 累加及 FP16 舍入，只改变行与输出 tile；最终包只包含被选中的实现及离线生成的行数区间。
+`--hc-only` 单独测量并重建 HC down、up 与 injection 的动态行选择，完整重建也执行此步骤。构建器从 checkpoint 几何和类型化的 SiLU/up 消费者识别融合边界，在真实 BF16 权重上直接对照输入包的已发布 cubin，验证多个行数、输出尾部和改变输入后的 Graph replay。候选保持逐 stream 的 FP32 归约顺序、BF16 MMA K16 累加及 FP16 舍入，只改变行与输出 tile；最终包只包含被选中的实现及离线生成的行数区间。
 
 ```bash
 bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-hc-build \
@@ -153,6 +153,14 @@ PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.weights \
 数值验证固定 seed 20261002，对同一 teacher-forced 历史比较 top3 概率、KL/NLL 和任务结果；token 一致率用作诊断，质量结合概率与任务结果判断。`reference/` 提供完整 BF16 参考，整模型基线需执行全部层。`checks/` 提供 kernel、尾部和 replay 验证，Rust GPU 测试覆盖状态、prefix、MTP 和混合请求。完整请求性能通过 Rust CLI 测量，算子微测用于定位局部成本。
 
 源码职责：`construction.py`/`build.py` 管理正式重建，公共 `../projection_tuning.py` 管理整数候选；`weights.py`/`checkpoint.py` 读取离线权重，`native.py`/`mtp.py` 保留数学参考。公共算子在 `kernels/model/`，在线架构适配器在 `crates/orinfer-models/src/flash_next/`。
+
+`--auxiliary-only hc-up` 单独调优 HC up。短行候选复用公共 BF16 warp MMA 计算组件，缓存真实输入行，按 K16 顺序累加后直接舍入到 FP16；较大行数与原矩阵实现共同测量选择。权重仍保持单份 BF16，发布时读取同一物理字节。
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-up-build \
+  --model /path/to/native-model --model-output /path/to/up-model \
+  --auxiliary-only hc-up
+```
 
 ### 专家存储重建
 
