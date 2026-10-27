@@ -162,6 +162,16 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-up-b
   --auxiliary-only hc-up
 ```
 
+### 专家动态 launch
+
+`--auxiliary-only expert-grid` 为已经使用逐矩阵地址表的 BM8/BN64/SK1 K128 专家投影重建动态 launch。每个非空 tile 至少拥有一行，按真实 packet 行数乘 top-k 得到分配行数 R，launch 上界取原容量、R 和 ceil(R/8)+专家数的最小值。路由 tile、所有有效专家、压缩权重、整数 MMA 和 FP16 输出边界保持原语义。构建器显式传递 token 行数，专家输入、scale 和输出使用 R 行。
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-expert-grid \
+  --model /path/to/indirect-model --model-output /path/to/live-expert-model \
+  --auxiliary-only expert-grid
+```
+
 ### 专家存储重建
 
 `build.py --model INPUT --model-output OUTPUT --output BUILD --expert-storage-only` 将已发布的 BM8/BN64/SK1、K128 E8P INT8 专家计算重新绑定至逐矩阵地址表，保留原有路由 tile、动态行容量和全部其他 kernel。构建器验证输入 ABI 和矩阵几何，生成匹配的原生执行库并原子发布；该范围之外的专家实现使用 checkpoint 全量构建入口。输入和输出目录分别保存。输入计划由 `ORINFER_ENGINE` 指定的匹配 CLI 读取，发布验证使用本轮构建的当前引擎；GPU 包装器转发该只读工具路径。权重和 CPU 资产通过不可变文件链接复用，构建无需复制完整模型。

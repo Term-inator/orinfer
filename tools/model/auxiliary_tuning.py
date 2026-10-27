@@ -250,7 +250,7 @@ def publish(
         output / "router-tuning",
         dict(source=source, toolchain=package["toolchain"], environment=machine),
     )
-    hc_records = []
+    projection_records = []
     hc_kinds = tuple(
         kind
         for family, kind in (("hc-down", "down"), ("injection", "injection"), ("hc-up", "up"))
@@ -261,7 +261,7 @@ def publish(
             raise ValueError("HC rebuilding requires Flash Next")
         from tools.model.flash_next.hc import publish as publish_hc
 
-        hc_records = publish_hc(
+        projection_records = publish_hc(
             model,
             package,
             compiler,
@@ -269,6 +269,12 @@ def publish(
             cache,
             kinds=hc_kinds,
         )
+    if "expert-grid" in families:
+        if data["architecture"] != "flash_next":
+            raise ValueError("Expert launch rebuilding requires Flash Next")
+        from tools.model.flash_next.expert_launch import publish as publish_expert_launch
+
+        projection_records.extend(publish_expert_launch(model, package, compiler, output))
     dynamics = {k["name"]: k for k in package["dynamic_batch_kernels"]}
     originals = {k["name"]: k for k in package["kernels"]}
     replaced, added, launches, contracts = {}, [], {}, set(package["plan_kernel_contracts"])
@@ -303,9 +309,9 @@ def publish(
         configs = {
             family: fuse_config(family, output, source)
             for family in families
-            if family not in ("router", "histogram", "injection", "hc-down", "hc-up")
+            if family not in ("router", "histogram", "injection", "hc-down", "hc-up", "expert-grid")
         }
-    report = list(hc_records)
+    report = list(projection_records)
     histogram_checks = {}
     for old in originals.values():
         name = old["name"]
@@ -536,7 +542,16 @@ def main():
     p.add_argument(
         "--families",
         nargs="+",
-        choices=("router", "histogram", "injection", "hc-down", "hc-up", "ple", "qsa"),
+        choices=(
+            "router",
+            "histogram",
+            "injection",
+            "hc-down",
+            "hc-up",
+            "expert-grid",
+            "ple",
+            "qsa",
+        ),
         default=["router", "histogram", "ple", "qsa"],
     )
     p.add_argument("--cache", type=Path, default=ROOT / "artifacts/build-cache/flash-next")

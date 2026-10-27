@@ -7,6 +7,7 @@ only expose PRMT and one SM120 INT8 MMA instruction, with no kernel or loops.
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 SOURCE = r"""
@@ -34,13 +35,27 @@ __device__ __forceinline__ void e8p_mma(int* d, unsigned a0, unsigned a1, unsign
     }
 )
 def e8p_decode_grouped(
-    rows, E, tiles, N, K, *, block_n=64, split_k=1, parity_xor=False, packed_k=128
+    rows,
+    E,
+    tiles,
+    N,
+    K,
+    *,
+    block_n=64,
+    split_k=1,
+    parity_xor=False,
+    packed_k=128,
+    dynamic_rows=False,
+    top_k=1,
 ):
     if (
         any(type(v) is not int or v <= 0 for v in (rows, E, tiles, N, K))
         or type(parity_xor) is not bool
         or type(packed_k) is not int
         or packed_k not in (64, 128)
+        or type(top_k) is not int
+        or not 1 <= top_k <= E
+        or rows % top_k
         or K % 128
         or K * 128 * 128 > 2**31 - 1
         or type(block_n) is not int
@@ -55,6 +70,10 @@ def e8p_decode_grouped(
     padding = 16 if parity_xor else 24
     threads = BN * 2 * SK
     iterations = (K // G + SK - 1) // SK
+    rows = row_count(rows // top_k, dynamic_rows) * top_k
+    # Every nonempty tile owns at least one assignment. Rounding each
+    # expert's row count up to BM8 also gives the bound ceil(R/8) + E.
+    launch_tiles = T.min(tiles, T.min(rows, T.ceildiv(rows, 8) + E)) if dynamic_rows else tiles
 
     @T.prim_func
     def main(
@@ -71,7 +90,7 @@ def e8p_decode_grouped(
         TileCount: T.Tensor((1,), T.int32),
         C: T.Tensor((rows, N), T.float16),
     ):
-        with T.Kernel(tiles, T.ceildiv(N, BN), threads=threads) as (tile, bx):
+        with T.Kernel(launch_tiles, T.ceildiv(N, BN), threads=threads) as (tile, bx):
             T.import_source(SOURCE)
             tid = T.get_thread_binding()
             lane, warp, sk = tid % 32, (tid // 32) % (BN // 16), tid // (BN * 2)
