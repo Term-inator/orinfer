@@ -65,6 +65,7 @@ class NativeStorageTests(unittest.TestCase):
                 for i, (first, count) in enumerate(((0, 2), (2, 1)))
             ]
             source = SimpleNamespace(
+                config={"quantization_config": {}},
                 parts=dict(expert=parts, dense=dense_parts),
                 shape=lambda name: (3, 2, 128) if name == "expert" else (3, 5),
             )
@@ -92,6 +93,28 @@ class NativeStorageTests(unittest.TestCase):
                     weights.buffers[name]["data"]["sha256"],
                     payload_hash(path, begin + left, right - left),
                 )
+            before = {
+                name: path.read_bytes()
+                for name, filename in weights.mapping.items()
+                if (path := weights.directory / filename).is_file()
+            }
+            source.config = {"quantization_config": {"component": "mtp"}}
+            draft = Weights(source, weights.root)
+            # MTP has its own output HC mixer. Even identical logical names
+            # must not overwrite target files or collide in the native arena.
+            draft.dense("dense", "output.weight")
+            draft.expert("expert", "blk.48.ffn_down_exps.weight")
+            self.assertFalse(set(weights.buffers) & set(draft.buffers))
+            self.assertFalse(set(weights.mapping.values()) & set(draft.mapping.values()))
+            for name, payload in before.items():
+                self.assertEqual((weights.directory / weights.mapping[name]).read_bytes(), payload)
+            with safe_open(
+                draft.directory / draft.mapping[draft.logical["output.weight"]["weight"]],
+                framework="np",
+            ) as stream:
+                np.testing.assert_array_equal(
+                    stream.get_tensor(draft.logical["output.weight"]["weight"]), dense
+                )
 
     def test_basis_disagreement_and_bad_k_major_layout_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -111,7 +134,11 @@ class NativeStorageTests(unittest.TestCase):
                 )
                 for i in range(2)
             ]
-            source = SimpleNamespace(parts=dict(expert=parts), shape=lambda _: (2, 2, 128))
+            source = SimpleNamespace(
+                config={"quantization_config": {}},
+                parts=dict(expert=parts),
+                shape=lambda _: (2, 2, 128),
+            )
             weights = Weights(source, root / "native")
             with self.assertRaisesRegex(ValueError, "disagree"):
                 weights.expert("expert", "blk.0.ffn_down_exps.weight")
@@ -124,7 +151,10 @@ class NativeStorageTests(unittest.TestCase):
             root = Path(tmp)
             values = np.array([-0.5, 0, 0.5, 1], np.float32)
             source = SimpleNamespace(
-                parts=dict(norm=[]), shape=lambda _: (4,), tensor=lambda _: values.copy()
+                config={"quantization_config": {}},
+                parts=dict(norm=[]),
+                shape=lambda _: (4,),
+                tensor=lambda _: values.copy(),
             )
             weights = Weights(source, root / "native")
             weights.original("norm", "blk.3.attn_q_norm.weight")

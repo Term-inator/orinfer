@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from tools.model.flash_next.config import CONTRACT, validate
+from tools.model.flash_next.config import CONTRACT, validate, validate_pair
 
 
 def fixture(component="text"):
@@ -30,11 +30,31 @@ def fixture(component="text"):
             "embedding_rotation": "paley20-walsh8",
             "compute_dtype": "int8_quality",
             "component": component,
+            "source": "test/Flash",
+            "source_revision": "a" * 40,
+            "seed": 20261002,
         },
     }
 
 
 class ConfigTests(unittest.TestCase):
+    def test_draft_sharing_requires_the_same_checkpoint_identity(self):
+        draft, target = fixture("mtp"), fixture()
+        validate_pair(draft, target, 4096)
+        for key in ("source", "source_revision", "seed", "basis", "expert_rotation"):
+            for missing in (True, False):
+                changed = copy.deepcopy(draft)
+                if missing:
+                    del changed["quantization_config"][key]
+                else:
+                    changed["quantization_config"][key] = "different"
+                with self.subTest(key=key, missing=missing), self.assertRaises(ValueError):
+                    validate_pair(changed, target, 4096)
+        with self.assertRaisesRegex(ValueError, "identities"):
+            validate_pair(target, target, 4096)
+        with self.assertRaisesRegex(ValueError, "identities"):
+            validate_pair(draft, draft, 4096)
+
     def test_text_and_shared_mtp_context(self):
         for component in ("text", "mtp"):
             for capacity in (1, 512, 2048, 8192, 262144):

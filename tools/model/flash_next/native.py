@@ -81,7 +81,7 @@ class Model:
     def __init__(
         self, source, capacity, output, *, use_graph=True, target=None, decode_w8_optimized=True
     ):
-        from tools.model.flash_next.config import validate
+        from tools.model.flash_next.config import validate, validate_pair
 
         validate(source.config, capacity)
         self.source, self.capacity, self.output = source, capacity, output
@@ -95,18 +95,7 @@ class Model:
         if self.is_mtp:
             if target is None or target.is_mtp or target.capacity != capacity:
                 raise ValueError("MTP requires a matching target model")
-            left, right = (
-                source.config["quantization_config"],
-                target.source.config["quantization_config"],
-            )
-            if (
-                any(
-                    left.get(k) != right.get(k)
-                    for k in ("source", "source_revision", "seed", "basis", "expert_rotation")
-                )
-                or source.config["text_config"] != target.source.config["text_config"]
-            ):
-                raise ValueError("MTP and target checkpoint identities differ")
+            validate_pair(source.config, target.source.config, capacity)
         elif target is not None:
             raise ValueError("Target sharing is only for MTP")
         self.layer_ids = (48,) if self.is_mtp else tuple(range(48))

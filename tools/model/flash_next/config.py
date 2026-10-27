@@ -9,6 +9,23 @@ CONTRACT = json.loads(
 )["families"]["flash_next"]
 
 
+def validate_pair(draft, target, capacity):
+    """A shared-head draft must use the target's architecture and weight identity."""
+    validate(draft, capacity)
+    validate(target, capacity)
+    left, right = draft["quantization_config"], target["quantization_config"]
+    if (
+        left.get("component") != "mtp"
+        or right.get("component", "text") != "text"
+        or draft["text_config"] != target["text_config"]
+        or any(
+            key not in left or key not in right or left[key] != right[key]
+            for key in ("source", "source_revision", "seed", "basis", "expert_rotation")
+        )
+    ):
+        raise ValueError("MTP and target checkpoint identities differ")
+
+
 def validate(config, capacity):
     """Reject unsupported semantics before allocating weights or CUDA state."""
     if not isinstance(config, dict) or config.get("model_type") != "qwen4_exp":

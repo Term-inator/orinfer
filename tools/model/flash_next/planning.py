@@ -2,6 +2,8 @@
 
 The reference supplies arithmetic and operand views. Fake tensors preserve
 storage aliases and byte offsets without loading model weights onto CUDA.
+An MTP planner takes its matching target planner, shares its output operands,
+and gives layer 48 its own QSA state and position controls.
 """
 
 from dataclasses import dataclass
@@ -10,6 +12,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from tools.model.flash_next.native import Model
+from tools.model.flash_next.config import validate, validate_pair
 
 
 @dataclass(frozen=True)
@@ -19,18 +22,27 @@ class Recipe:
 
 
 class Planner(Model):
-    def __init__(self, assembly, context, output):
+    def __init__(self, assembly, context, output, *, target=None):
         if type(context) is not int or not 4096 <= context <= 262144:
             raise ValueError("Native Flash construction needs context in 4096..262144")
+        self.config = assembly["config"]
+        validate(self.config, context)
+        self.is_mtp = self.config["quantization_config"].get("component") == "mtp"
+        if self.is_mtp:
+            if target is None or target.is_mtp or target.capacity != context:
+                raise ValueError("MTP planning requires a matching target planner")
+            validate_pair(self.config, target.config, context)
+        elif target is not None:
+            raise ValueError("Only MTP planning shares a target")
         self.capacity, self.output = context, output
-        self.is_mtp, self.draft_vocab, self.decode_w8_optimized = False, None, True
-        self.layer_ids = tuple(range(48))
+        self.draft_vocab, self.decode_w8_optimized = None, True
+        self.layer_ids = (48,) if self.is_mtp else tuple(range(48))
         self.weights, self.states, self.plans, self.kernels = {}, {}, {}, {}
         self.workspaces, self.prefix_divisors = {}, {}
         self.prefill_workspace_rows, self.position = 0, 0
         self.batch_body = False
         self.storage_names, self.tensors = {}, {}
-        self.mode = FakeTensorMode()
+        self.mode = target.mode if self.is_mtp else FakeTensorMode()
         types = {
             name: getattr(torch, dtype)
             for name, dtype in dict(
@@ -65,8 +77,17 @@ class Planner(Model):
                         key: value if key == "parity_xor" else self.tensors[value]
                         for key, value in operands.items()
                     }
+            if self.is_mtp:
+                if "output.weight" in self.weights:
+                    raise ValueError("MTP must share the target output head")
+                self.weights["output.weight"] = target.weights["output.weight"]
+                for value in self.weights["output.weight"]:
+                    identity = value.untyped_storage()._cdata
+                    name = target.storage_names[identity]
+                    self.tensors[name] = value
+                    self.storage_names[identity] = name
             for layer in self.layer_ids:
-                if layer % 4 != 3:
+                if not self.is_mtp and layer % 4 != 3:
                     shapes = dict(conv=((1, 3, 10240), "f16"), gdn=((48, 128, 128), "f32"))
                 else:
                     shapes = {suffix: ((context, 2, 256), "i8") for suffix in ("key", "value")}
@@ -79,12 +100,14 @@ class Planner(Model):
                 for suffix, (shape, dtype) in shapes.items():
                     name = f"{layer}:{suffix}"
                     self.states[name] = tensor(f"State_{layer}_{suffix}", shape, dtype)
-                    if layer % 4 == 3 and suffix != "pending":
+                    if (self.is_mtp or layer % 4 == 3) and suffix != "pending":
                         self.prefix_divisors[name] = 4 if suffix == "index" else 1
-            self.states["ple"] = tensor("State_ple", (9, self.C * self.H), "f16")
-            self.position_gpu = tensor("Position", (1,), "i32")
-            self.lengths = tensor("Length", (1,), "i32")
-            self.position_out = tensor("PositionOut", (1,), "i32")
+            if not self.is_mtp:
+                self.states["ple"] = tensor("State_ple", (9, self.C * self.H), "f16")
+            prefix = "Mtp" if self.is_mtp else ""
+            self.position_gpu = tensor(prefix + "Position", (1,), "i32")
+            self.lengths = tensor(prefix + "Length", (1,), "i32")
+            self.position_out = tensor(prefix + "PositionOut", (1,), "i32")
 
     def kernel(self, key, build):
         if key not in self.kernels:

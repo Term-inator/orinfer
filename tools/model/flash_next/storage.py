@@ -2,6 +2,8 @@
 
 Expert banks retain their K128 layout. Joining slices copies bytes directly
 between files; it never allocates a full bank on the host or the GPU.
+MTP operands and shard names have a separate namespace for their own HC mixer
+and codebooks; the shared target head is bound by the arithmetic planner.
 """
 
 import hashlib
@@ -60,12 +62,16 @@ def segments(parts, key):
 class Weights:
     def __init__(self, checkpoint, root):
         self.source, self.root = checkpoint, Path(root)
+        self.prefix = (
+            "Mtp_" if checkpoint.config["quantization_config"].get("component") == "mtp" else ""
+        )
         self.directory = self.root / "cache/weights"
         self.directory.mkdir(parents=True, exist_ok=True)
         self.buffers, self.scopes, self.mapping, self.logical = {}, {}, {}, {}
         self.books = {}
 
     def shard(self, filename, tensors):
+        filename = self.prefix + filename
         if any(t["name"] in self.buffers for t in tensors):
             raise ValueError("Duplicate native operand")
         path = self.directory / filename
@@ -135,7 +141,7 @@ class Weights:
                 table, signs = current, rotation
             elif not np.array_equal(table, current) or not np.array_equal(signs, rotation):
                 raise ValueError(f"Expert slices disagree on their basis: {original}")
-        prefix = f"W_{name}"
+        prefix = f"{self.prefix}W_{name}"
         operands = {"packed": prefix + "_packed", "scale": prefix + "_scale"}
         self.shard(
             name + ".safetensors",
@@ -156,14 +162,14 @@ class Weights:
         )
         key = hashlib.sha256(table.tobytes() + signs.tobytes()).hexdigest()
         if key not in self.books:
-            book = f"W_e8p_{len(self.books)}"
+            book = f"{self.prefix}W_e8p_{len(self.books)}"
             operands_book = {
                 suffix: book + "_" + suffix
                 for suffix in ("table", "short_table", "selector_table", "signs")
             }
             selector = e8p_selector_table(table)
             self.constants(
-                book + ".safetensors",
+                f"W_e8p_{len(self.books)}.safetensors",
                 {
                     operands_book["table"]: table.view("<u4").reshape(1, 256, 2),
                     operands_book["short_table"]: e8p_sign_table(table)[None],
@@ -179,7 +185,7 @@ class Weights:
     def dense(self, original, name):
         parts = self.source.parts[original]
         outputs, inputs = self.source.shape(original)
-        operands = {suffix: f"W_{name}_{suffix}" for suffix in ("weight", "scale")}
+        operands = {suffix: f"{self.prefix}W_{name}_{suffix}" for suffix in ("weight", "scale")}
         for part in parts:
             for key, dtype, shape in (
                 ("weight", "I8", [part["count"], inputs]),
@@ -203,7 +209,7 @@ class Weights:
     def original(self, original, name):
         parts = self.source.parts[original]
         shape = list(self.source.shape(original))
-        operand = f"W_{name}_value"
+        operand = f"{self.prefix}W_{name}_value"
         floating = (
             "norm.weight" in name
             or "ple_norm_" in name
@@ -253,6 +259,7 @@ class Weights:
             print("ASSEMBLED", name, flush=True)
         total = self.finish()
         return dict(
+            config=self.source.config,
             buffers=self.buffers,
             scopes=self.scopes,
             logical=self.logical,
