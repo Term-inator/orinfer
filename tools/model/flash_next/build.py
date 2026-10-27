@@ -414,7 +414,7 @@ def main():
     p.add_argument(
         "--workspace-only",
         action="store_true",
-        help="Share certified serial QSA staging without changing kernel arithmetic",
+        help="Share certified serial QSA/expert staging without changing kernel arithmetic",
     )
     p.add_argument(
         "--expert-storage-only",

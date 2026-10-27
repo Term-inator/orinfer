@@ -72,6 +72,73 @@ def fixture():
     return data, package, manifest, Compiler(roles)
 
 
+def expert_fixture():
+    data, package, manifest, compiler = fixture()
+    data["metadata"]["buffers"].clear()
+    data["buffer_scopes"].clear()
+    package["kernels"].clear()
+    package["buffer_contracts"].clear()
+    compiler.roles.clear()
+    dispatch = {"A", "D", "DS", "IDs", "RelativeSlot", "RowOffsets", "Scale", "SlotMap"}
+    projection = {
+        "A",
+        "AS",
+        "Book",
+        "C",
+        "Counts",
+        "Offsets",
+        "PAddresses",
+        "TileCount",
+        "TileExpert",
+        "TileRow",
+        "WSAddresses",
+    }
+    quant = {"Q", "S", "Signs", "X"}
+    combine = {"Expert", "Output", "Prob", "Shared", "SharedGate", "SlotMap"}
+    for prefix in ("raw", "rows"):
+        for name, dtype in (("Dispatch", "i8"), ("Up", "f16"), ("Down", "f16")):
+            n = prefix + name
+            b = dict(
+                name=n,
+                dtype=dtype,
+                shape=[16],
+                layout="native_contiguous",
+                alignment=256,
+                access="read_write",
+            )
+            data["metadata"]["buffers"].append(b)
+            package["buffer_contracts"].append(copy.deepcopy(b))
+            data["buffer_scopes"][n] = "workspace"
+        stages = (
+            ("dispatch", dispatch, {"D": "Dispatch"}),
+            ("up", projection, {"A": "Dispatch", "C": "Up"}),
+            ("quant", quant, {"X": "Up"}),
+            ("down", projection, {"C": "Down"}),
+            ("work", set(), {}),
+            ("combine", combine, {"Expert": "Down"}),
+        )
+        for stage, roles, links in stages:
+            n = prefix + stage
+            compiler.roles[n] = sorted(roles)
+            package["kernels"].append(
+                dict(
+                    name=n,
+                    symbol=stage,
+                    module=dict(sha256=stage),
+                    source=dict(sha256=stage),
+                    host_abi=dict(sha256=stage),
+                    args=[
+                        dict(kind="buffer", name=prefix + links[r] if r in links else r)
+                        for r in sorted(roles)
+                    ],
+                )
+            )
+        manifest["programs"]["prefill" if prefix == "raw" else "row/private"] = [
+            dict(kind="kernel", name=prefix + stage) for stage, _, _ in stages
+        ]
+    return data, package, manifest, compiler
+
+
 class WorkspaceTests(unittest.TestCase):
     def test_complete_serial_pairs_share_storage_and_remove_obsolete_names(self):
         d, p, m, c = fixture()
@@ -120,6 +187,93 @@ class WorkspaceTests(unittest.TestCase):
         d["metadata"]["additional"] = "rowsOut"
         with self.assertRaisesRegex(ValueError, "metadata"):
             share(d, p, m, c)
+
+    def test_expert_dispatch_up_and_down_lifetimes_share_storage(self):
+        d, p, m, c = expert_fixture()
+        result = share(d, p, m, c)
+        self.assertEqual(
+            result["aliases"], {"rows" + n: "raw" + n for n in ("Dispatch", "Up", "Down")}
+        )
+        self.assertEqual(result["saved_workspace_bytes"], 80)
+        self.assertEqual(len(d["metadata"]["buffers"]), 3)
+
+    def test_expert_staging_rejects_live_state_and_unclassified_uses(self):
+        for mode in ("frame", "side", "extra", "unused", "read_only"):
+            d, p, m, c = expert_fixture()
+            if mode == "frame":
+                m["prefill_plans"][0]["live_buffers"] = ["rawDown"]
+            elif mode == "side":
+                m["graph_branches"] = {"prefill": [["rawdispatch", "rawup", "rawquant", "rawdown"]]}
+            elif mode == "extra":
+                m["programs"]["row/private"].append(
+                    dict(kind="zero", destination="rowsDown", bytes=32)
+                )
+            elif mode == "unused":
+                kernel = copy.deepcopy(p["kernels"][0])
+                kernel["name"] = "unused"
+                p["kernels"].append(kernel)
+                c.roles["unused"] = c.roles["rawdispatch"]
+            else:
+                for b in d["metadata"]["buffers"] + p["buffer_contracts"]:
+                    if b["name"] in ("rawDown", "rowsDown"):
+                        b["access"] = "read_only"
+            with self.assertRaises(ValueError, msg=mode):
+                share(d, p, m, c)
+
+    def test_selected_row_variant_preserves_all_pointer_roles(self):
+        for changed in (False, True):
+            d, p, m, c = expert_fixture()
+            original = next(k for k in p["kernels"] if k["name"] == "rowsup")
+            variant = copy.deepcopy(original)
+            variant["name"] = "selected"
+            if changed:
+                variant["args"][c.roles["rowsup"].index("C")]["name"] = "OtherOutput"
+            p["kernels"].append(variant)
+            c.roles["selected"] = c.roles["rowsup"]
+            m["row_execution"]["variants"] = {"rowsup": [dict(kernels=["selected"])]}
+            if changed:
+                with self.assertRaisesRegex(ValueError, "unclassified"):
+                    share(d, p, m, c)
+            else:
+                self.assertEqual(share(d, p, m, c)["saved_workspace_bytes"], 80)
+
+    def test_distinct_expert_lifetimes_cannot_overlap_after_aliasing(self):
+        for alternate_code in (False, True):
+            d, p, m, c = expert_fixture()
+            buffer = copy.deepcopy(
+                next(b for b in d["metadata"]["buffers"] if b["name"] == "rowsDown")
+            )
+            buffer["name"] = "rowsDown2"
+            d["metadata"]["buffers"].append(buffer)
+            p["buffer_contracts"].append(copy.deepcopy(buffer))
+            d["buffer_scopes"]["rowsDown2"] = "workspace"
+            for stage, role in (("down", "C"), ("combine", "Expert")):
+                original = next(k for k in p["kernels"] if k["name"] == "rows" + stage)
+                kernel = copy.deepcopy(original)
+                kernel["name"] = "second" + stage
+                if alternate_code and stage == "down":
+                    kernel["module"] = dict(sha256="alternative")
+                kernel["args"][c.roles[original["name"]].index(role)]["name"] = "rowsDown2"
+                p["kernels"].append(kernel)
+                c.roles[kernel["name"]] = c.roles[original["name"]]
+            if alternate_code:
+                # Two different exact-code groups still share one physical owner.
+                # Their cross-group alias lifetimes must also be disjoint.
+                kernel = copy.deepcopy(next(k for k in p["kernels"] if k["name"] == "rawdown"))
+                kernel["name"], kernel["module"] = "rawalternative", dict(sha256="alternative")
+                p["kernels"].append(kernel)
+                c.roles["rawalternative"] = c.roles["rawdown"]
+                m["programs"]["prefill"].extend(
+                    [
+                        dict(kind="kernel", name="rawalternative"),
+                        dict(kind="kernel", name="rawcombine"),
+                    ]
+                )
+            ops = m["programs"]["row/private"]
+            ops.insert(4, dict(kind="kernel", name="seconddown"))
+            ops.append(dict(kind="kernel", name="secondcombine"))
+            with self.assertRaisesRegex(ValueError, "overlap"):
+                share(d, p, m, c)
 
     def test_shared_row_constructor_preserves_storage_but_keeps_interfaces_distinct(self):
         from tools.model.flash_next.rows import Rows

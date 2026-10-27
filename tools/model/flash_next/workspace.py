@@ -1,5 +1,6 @@
-"""Preserve shared QSA staging storage across prefill and row programs."""
+"""Preserve shared QSA and expert staging across prefill and row programs."""
 
+from bisect import bisect_right
 import json
 import math
 
@@ -10,6 +11,31 @@ from tools.model.publication import atomic_model, clone_model, commit_package, l
 PARTIAL = ("Out", "Max", "Den")
 PRODUCER = {"Query", "K", "V", "KS", "VS", "Selected", "Position", *PARTIAL}
 CONSUMER = {"Gate", "Output", *PARTIAL}
+
+DISPATCH = {"A", "D", "DS", "IDs", "RelativeSlot", "RowOffsets", "Scale", "SlotMap"}
+EXPERT = {
+    "A",
+    "AS",
+    "Book",
+    "C",
+    "Counts",
+    "Offsets",
+    "PAddresses",
+    "TileCount",
+    "TileExpert",
+    "TileRow",
+    "WSAddresses",
+}
+QUANT = {"Q", "S", "Signs", "X"}
+COMBINE = {"Expert", "Output", "Prob", "Shared", "SharedGate", "SlotMap"}
+# Producer roles, consumer roles, linked views, dtypes, adjacency requirement.
+# Expert down output survives independent shared-FFN work up to the combine.
+LIFETIMES = (
+    (PRODUCER, CONSUMER, tuple((r, r) for r in PARTIAL), ("f32",) * 3, True),
+    (DISPATCH, EXPERT, (("D", "A"),), ("i8",), True),
+    (EXPERT, QUANT, (("C", "X"),), ("f16",), True),
+    (EXPERT, COMBINE, (("C", "Expert"),), ("f16",), False),
+)
 
 
 def _buffers(op, kernels):
@@ -79,12 +105,11 @@ def _strings(value):
 
 
 def share(data, package, manifest, compiler):
-    """Merge only complete, serial QSA producer/consumer staging lifetimes.
+    """Merge certified serial QSA and routed-expert staging lifetimes.
 
-    The shape planner reuses its prefill pool for rows >=256. QSA Partial/Max/Den
-    are not row interfaces or frame state: each adjacent pair produces/consumes
-    them on the main stream. Match both exact exported ABIs and full storage
-    geometry; reject any extra use, frame lifetime or side-stream consumer.
+    Match exact exported primitives and complete storage geometry. Every use
+    must belong to a producer/consumer interval in one declared program, with
+    no frame, side-stream or overlapping alias lifetime.
     """
     if data["architecture"] != "flash_next" or manifest.get("mtp") is not None:
         raise ValueError("Workspace sharing requires the current Flash target-only contract")
@@ -99,7 +124,7 @@ def share(data, package, manifest, compiler):
     forbidden = _side_buffers(manifest, kernels)
     forbidden.update(manifest.get("reset_buffers", []))
     forbidden.update(n for p in manifest["prefill_plans"] for n in p.get("live_buffers", []))
-    pointers = {}
+    pointers, arguments = {}, {}
     for name, kernel in kernels.items():
         host = compiler.host(kernel)
         roles = {
@@ -107,30 +132,54 @@ def share(data, package, manifest, compiler):
             for a in host["ordered_arguments"]
             if a["ctype"] == "ctypes.c_void_p" and a["value"].endswith(".data_ptr()")
         }
-        if roles == PRODUCER or roles == CONSUMER:
+        if any(roles in (producer, consumer) for producer, consumer, *_ in LIFETIMES):
             pointers[name] = compiler.pointers(kernel)
+            arguments[name] = host["ordered_arguments"]
     groups, chains, pairs = {}, {}, []
     for program, ops in manifest["programs"].items():
-        for i, (first, second) in enumerate(zip(ops, ops[1:])):
-            if first["kind"] != "kernel" or second["kind"] != "kernel":
+        uses = {}
+        for i, op in enumerate(ops):
+            for name in _buffers(op, kernels):
+                uses.setdefault(name, []).append(i)
+        for i, first in enumerate(ops):
+            if first["kind"] != "kernel":
                 continue
-            a, b = pointers.get(first["name"], {}), pointers.get(second["name"], {})
-            if set(a) != PRODUCER or set(b) != CONSUMER:
-                continue
-            if any(a[r] != b[r] or a[r].get("offset", 0) for r in PARTIAL):
-                continue
-            triple = tuple(a[r]["name"] for r in PARTIAL)
-            if len(set(triple)) != 3:
-                continue
-            signature = [
-                [kernels[op["name"]][field] for field in ("module", "source", "host_abi", "symbol")]
-                for op in (first, second)
-            ]
-            signature.append([{k: v for k, v in buffers[n].items() if k != "name"} for n in triple])
-            key = json.dumps(signature, sort_keys=True)
-            groups.setdefault(key, set()).add(triple)
-            chains.setdefault(triple, set()).add(program)
-            pairs.append((triple, program, i))
+            a = pointers.get(first["name"], {})
+            for pattern, (producer, consumer, links, dtypes, adjacent) in enumerate(LIFETIMES):
+                if set(a) != producer:
+                    continue
+                views = [a[left] for left, _ in links]
+                if any(v.get("offset", 0) for v in views):
+                    continue
+                triple = tuple(v["name"] for v in views)
+                if len(set(triple)) != len(triple):
+                    continue
+                positions = [bisect_right(uses[n], i) for n in triple]
+                if any(position == len(uses[n]) for n, position in zip(triple, positions)):
+                    continue
+                next_uses = [uses[n][position] for n, position in zip(triple, positions)]
+                j = next_uses[0]
+                if any(index != j for index in next_uses) or (adjacent and j != i + 1):
+                    continue
+                second = ops[j]
+                b = pointers.get(second.get("name"), {}) if second["kind"] == "kernel" else {}
+                if set(b) != consumer or any(a[left] != b[right] for left, right in links):
+                    continue
+                signature = [pattern]
+                signature.extend(
+                    [kernels[op["name"]][field] for field in ("module", "source", "symbol")]
+                    for op in (first, second)
+                )
+                # Row defaults and launch expressions remain on each binding;
+                # storage equivalence needs the same code and ordered ABI.
+                signature.append([arguments[op["name"]] for op in (first, second)])
+                signature.append(
+                    [{k: v for k, v in buffers[n].items() if k != "name"} for n in triple]
+                )
+                key = json.dumps(signature, sort_keys=True)
+                groups.setdefault(key, set()).add(triple)
+                chains.setdefault(triple, set()).add(program)
+                pairs.append((triple, program, i, j, dtypes))
     groups = {
         key: triples
         for key, triples in groups.items()
@@ -138,51 +187,82 @@ def share(data, package, manifest, compiler):
     }
     selected = {triple for triples in groups.values() for triple in triples}
     covered = {}
-    for triple, program, i in pairs:
+    for triple, program, i, j, dtypes in pairs:
         if triple not in selected:
             continue
         if program not in prefill | rows:
-            raise ValueError("QSA staging lifetime outside declared prefill/row programs")
-        for n in triple:
+            raise ValueError("Staging lifetime outside declared prefill/row programs")
+        for n, dtype in zip(triple, dtypes):
             v = buffers[n]
-            if data["buffer_scopes"][n] != "workspace" or v["dtype"] != "f32" or v.get("data"):
-                raise ValueError("QSA staging must be mutable FP32 workspace")
+            if (
+                data["buffer_scopes"][n] != "workspace"
+                or v["dtype"] != dtype
+                or v["access"] != "read_write"
+                or v.get("data")
+            ):
+                raise ValueError("Staging must be mutable workspace with the primitive's dtype")
             if n in forbidden:
-                raise ValueError("QSA staging survives a frame or enters a parallel branch")
-            covered.setdefault(n, set()).update(((program, i), (program, i + 1)))
+                raise ValueError("Staging survives a frame or enters a parallel branch")
+            covered.setdefault(n, set()).update(((program, i), (program, j)))
     for program, ops in manifest["programs"].items():
         for i, op in enumerate(ops):
             for name in _buffers(op, kernels) & covered.keys():
                 if (program, i) not in covered[name]:
-                    raise ValueError("QSA staging has a use outside its producer/consumer pair")
+                    raise ValueError("Staging has a use outside its producer/consumer pair")
     used = {
-        k
-        for ops in manifest["programs"].values()
-        for op in ops
-        if op["kind"] == "kernel"
-        for k in [op["name"]]
+        op["name"] for ops in manifest["programs"].values() for op in ops if op["kind"] == "kernel"
     }
+    # A selected row variant occupies the same logical slot. Its complete
+    # pointer-role map and ordered ABI must preserve the certified lifetime.
+    for slot, variants in manifest["row_execution"].get("variants", {}).items():
+        if slot not in used:
+            continue
+        for variant in variants:
+            names = variant["kernels"]
+            if (
+                len(names) == 1
+                and slot in pointers
+                and names[0] in pointers
+                and pointers[slot] == pointers[names[0]]
+                and arguments[slot] == arguments[names[0]]
+            ):
+                used.add(names[0])
     if any(
         k["name"] not in used and any(a.get("name") in covered for a in k["args"])
         for k in package["kernels"]
     ):
-        raise ValueError("QSA staging has an unclassified binding")
+        raise ValueError("Staging has an unclassified binding")
     aliases = {}
     for triples in groups.values():
         original = [t for t in triples if chains[t] & prefill]
         if len(original) != 1:
-            raise ValueError("QSA staging needs one original prefill storage")
+            raise ValueError("Staging needs one original prefill storage")
         canonical = original[0]
         for triple in triples:
             if triple != canonical:
                 if not chains[triple] <= rows:
-                    raise ValueError("QSA storage belongs to another prefill program")
-                aliases.update(zip(triple, canonical))
+                    raise ValueError("Staging belongs to another prefill program")
+                for name, target in zip(triple, canonical):
+                    if aliases.setdefault(name, target) != target:
+                        raise ValueError("Conflicting staging aliases")
+    intervals = {}
+    for triple, program, i, j, _ in pairs:
+        if triple in selected:
+            for name in triple:
+                target = aliases.get(name, name)
+                intervals.setdefault((program, target), set()).add((i, j, name))
+    for values in intervals.values():
+        end, previous = -1, None
+        for i, j, name in sorted(values):
+            if i <= end and name != previous:
+                raise ValueError("Shared staging lifetimes overlap")
+            end, previous = max(end, j), name
     for kernel in package["kernels"]:
         for argument in kernel["args"]:
             if argument["kind"] in ("buffer", "buffer_slice"):
                 argument["name"] = aliases.get(argument["name"], argument["name"])
-    saved = sum(math.prod(buffers[n]["shape"]) * 4 for n in aliases)
+    widths = {"i8": 1, "f16": 2, "f32": 4}
+    saved = sum(math.prod(buffers[n]["shape"]) * widths[buffers[n]["dtype"]] for n in aliases)
     package["buffer_contracts"] = [
         b for b in package["buffer_contracts"] if b["name"] not in aliases
     ]
@@ -192,7 +272,7 @@ def share(data, package, manifest, compiler):
     for name in aliases:
         del data["buffer_scopes"][name]
     if set(aliases) & (set(_strings(data)) | set(_strings(package))):
-        raise ValueError("Removed QSA storage has additional metadata references")
+        raise ValueError("Removed staging has additional metadata references")
     return dict(aliases=aliases, saved_workspace_bytes=saved)
 
 
