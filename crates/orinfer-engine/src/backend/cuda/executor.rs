@@ -455,6 +455,57 @@ impl Executor {
         }
         load_stages.buffer_alloc_s += allocation_started.elapsed().as_secs_f64();
         allocations.weights.bytes = weight_layout.padding_bytes;
+        // Buffers below that no weights/paged/lazy/deferred path claims would
+        // each take an individual cuMemAlloc; carve them from one fixed arena
+        // so load cost scales with bytes instead of the buffer count.
+        let mut direct_offsets: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut direct_cursor: u64 = 0;
+        for b in &manifest.buffers {
+            if b.data.is_some()
+                && b.access == crate::artifact::Access::Read
+                && !used.contains(b.name.as_str())
+            {
+                continue;
+            }
+            let paged = expert_plan
+                .as_ref()
+                .is_some_and(|p| p.names.contains(&b.name));
+            let stride = lazy
+                .and_then(|kv| {
+                    kv.buffers
+                        .get(&b.name)
+                        .or_else(|| kv.prefill_workspace.get(&b.name))
+                })
+                .copied();
+            let deferred = stride.is_none() && deferred_workspace(b, scopes[&b.name])?;
+            if weight_layout.offsets.contains_key(&b.name) || paged || stride.is_some() || deferred
+            {
+                continue;
+            }
+            let bytes = initial_buffer_bytes(manifest, b, scopes[&b.name])? as u64;
+            direct_cursor = direct_cursor
+                .checked_next_multiple_of(b.alignment)
+                .ok_or("Fixed arena alignment overflow")?;
+            direct_offsets.insert(b.name.as_str(), direct_cursor);
+            direct_cursor = direct_cursor
+                .checked_add(bytes)
+                .ok_or("Fixed arena size overflow")?;
+        }
+        let mut fixed_base = 0;
+        if direct_cursor != 0 {
+            let allocation_started = Instant::now();
+            // SAFETY: The checked layout above owns the extent; Session frees
+            // the single base and never releases interior carve-outs.
+            unsafe {
+                check(
+                    sys::cuMemAlloc_v2(&mut fixed_base, direct_cursor as usize),
+                    "allocate fixed buffer arena",
+                )?;
+            }
+            s.buffers.push(fixed_base);
+            load_stages.cuda_allocations += 1;
+            load_stages.buffer_alloc_s += allocation_started.elapsed().as_secs_f64();
+        }
         let (mut weight_io_hash_s, mut weight_upload_s) = (0.0, 0.0);
         let mut weights = crate::weights::Weights::open(base, options.verify_weights)?;
         let mut uploads = Vec::new();
@@ -467,7 +518,7 @@ impl Executor {
                 continue;
             }
             let bytes = initial_buffer_bytes(manifest, b, scopes[&b.name])?;
-            let mut address = 0;
+            let address;
             let paged = expert_plan
                 .as_ref()
                 .is_some_and(|p| p.names.contains(&b.name));
@@ -505,15 +556,12 @@ impl Executor {
                     .borrow_mut()
                     .insert(b.name.clone(), reservation);
             } else {
-                // SAFETY: Validated extent, immediately transferred to Session.
-                unsafe {
-                    check(
-                        sys::cuMemAlloc_v2(&mut address, bytes),
-                        &format!("allocate {}", b.name),
-                    )?;
-                }
-                s.buffers.push(address);
-                load_stages.cuda_allocations += 1;
+                let offset = direct_offsets
+                    .get(b.name.as_str())
+                    .ok_or("Fixed buffer missing from its arena layout")?;
+                address = fixed_base
+                    .checked_add(*offset)
+                    .ok_or("Fixed buffer address overflow")?;
             }
             load_stages.buffer_alloc_s += allocation_started.elapsed().as_secs_f64();
             if address % b.alignment != 0 {
@@ -847,6 +895,13 @@ impl Executor {
             .keys()
             .map(|n| (n.clone(), executor.sizes[n]))
             .collect();
+        // Sequence buffers carved from the fixed arena are interior slices of
+        // one allocation: lease growth and idle reclaim must skip their free.
+        for name in direct_offsets.keys() {
+            if executor.allocations.sequence.addresses.contains_key(*name) {
+                executor.sequences[0].mark_fixed_slice(name);
+            }
+        }
         Ok((executor, stats))
     }
     pub(crate) fn sync(&self) -> Result<()> {

@@ -124,6 +124,13 @@ pub(super) struct Sequence {
     fixed_allocation: Option<u64>,
     fixed_slices: std::collections::BTreeSet<String>,
 }
+impl Sequence {
+    /// Mark a load-time buffer as an interior slice of one shared allocation
+    /// so lease growth and idle reclaim never free its address.
+    pub(crate) fn mark_fixed_slice(&mut self, name: &str) {
+        self.fixed_slices.insert(name.to_string());
+    }
+}
 
 pub(super) struct IdleSelection {
     limits: BTreeMap<String, usize>,

@@ -57,6 +57,23 @@ README 的六模型表格使用本节固定英译中请求的统一基准。MTP 
 单流使用 `runtime::requests::profile::profile_cached_generation` 的独立完整请求，按每种长度的全局预热与三次测量槽位汇总；多流使用 `runtime::requests::tests::benchmark::benchmark_fixed_requests`。均使用本轮 `cargo test --release --locked --offline --lib --no-run --message-format=json` 返回的实际测试可执行文件，并核对测量结果及容量限制日志。输入按各模型原生 chat template 和 tokenizer 生成，长背景在保留模板尾部的前提下裁剪到准确 token 数。模型数据及执行包沿用上述固定身份。
 
 
+## Flash Next 输入行解码与固定 buffer 分配（2026-10-27）
+
+CPU W8 embedding／E8P PLE 行准备改为先解析整包行号、去重后并行读取解码，再按原顺序组装上传；解码行 LRU 预算由 8/32 MiB 提高到 64/128 MiB。加载期除权重 arena 外不再逐 buffer `cuMemAlloc`：非 paged/lazy/deferred 的固定 buffer 从单个 arena 按对齐切分（`cuda_allocations` 1917→2），sequence 切片登记为固定 slice，lease 增长与空闲回收跳过其地址释放。行解码数学与组装顺序不变。
+
+Rust release `run-model`，`decode_only`、greedy、seed `20261002`、prefix 关闭。随机 token 夹具各请求 token 互不相同（行缓存冷、系统页缓存热），每种输入一次预热加三次测量，取后两次：
+
+| 输入 | 前 → 后 prefill TPS（首个请求） | 前 → 后 prefill TPS（后续请求） |
+| --- | ---: | ---: |
+| 随机 token 512 | 197.3 → 441.9 | 389.2–400.8 → 917.0–918.3 |
+| 随机 token 8192 | 384.9 → 811.7 | 394.2–400.3 → 813.8–816.0 |
+| 自然文本 512 | 406.0 → 485.3 | 1017.2–1017.7 → 1018.9–1023.5 |
+| 自然文本 8192 | 907.3 → 918.8 | 908.7–908.9 → 919.7–920.3 |
+
+所有改动前后请求的输出 token 逐项一致；decode 维持 29.3–30.2 TPS。serve 单流 28.2、8 路 124.9–125.4 TPS，MTP 3 草稿请求正常，无 worker 错误。随机 token 的剩余约 11% 差距来自逐 chunk 主机组装与 8K 输入的 PLE LRU 边缘换出，GPU kernel 分布不变。此前将随机 token 差距笼统归因于 CPU 行缓存未命中；本轮确认串行行读取/解码约占 2/3（可并行消除），其余在主机组装与 GPU 侧。
+
+加载分段中 `buffer_alloc_s` 约 5.9 s 不变：该成本与约 6 GiB 固定 buffer 的物理提交成正比，而非分配次数。合并分配在构建后页缓存被冲掉的场景实测完整加载 39.7 s，优于历史 45.7 s 冷启动记录；暖缓存加载维持约 14 s。`make check` 通过。
+
 ## Dense 模型与 vLLM 对照（2026-10-20–21）
 
 本节保留关闭 MTP 时的三长度、八档并发完整测量，用于与 vLLM 对照。2B 与 4B 使用共享组件 R5 包，9B 使用已接受的优化包。随后各日期章节保留对应版本的测量与适用范围。

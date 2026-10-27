@@ -340,53 +340,100 @@ impl Inputs {
         row: usize,
         budget: usize,
     ) -> Result<Row> {
-        let shard = sources
-            .partition_point(|s| s.first <= row)
-            .checked_sub(1)
-            .ok_or("CPU row outside table")?;
-        let source = &sources[shard];
-        let local = row - source.first;
-        if local >= source.rows {
-            return Err("CPU row outside table".into());
-        }
-        let key = (shard, local);
+        let key = shard_of(sources, row)?;
         if let Some(value) = cache.borrow_mut().get(key) {
             return Ok(value);
         }
-        let width = source.width;
-        let stride = if source.book.is_some() {
-            2 + width / 4
-        } else {
-            width
-        };
-        let mut packet = vec![0u8; stride];
-        source
-            .file
-            .read_exact_at(&mut packet, source.offset + (local * stride) as u64)
-            .map_err(|e| e.to_string())?;
-        let value = if let Some(book) = source.book {
-            decode(&packet, &self.tables[book])?
-        } else {
-            let mut scale = [0u8; 2];
-            source
-                .file
-                .read_exact_at(
-                    &mut scale,
-                    source.scale_offset.ok_or("Missing INT8 row scale")? + local as u64 * 2,
-                )
-                .map_err(|e| e.to_string())?;
-            let scale = f16::from_bits(u16::from_le_bytes(scale)).to_f32();
-            if !scale.is_finite() || scale <= 0.0 {
-                return Err("Invalid INT8 row scale".into());
-            }
-            packet
-                .iter()
-                .map(|&v| f16::from_f32((v as i8) as f32 * scale).to_bits())
-                .collect()
-        };
-        let value = Rc::new(value);
+        let value = load_row(sources, &self.tables, key.0, key.1)?;
         cache.borrow_mut().put(key, Rc::clone(&value), budget);
         Ok(value)
+    }
+    /// Read and decode every uncached row one packet needs before assembly.
+    /// Keys are sorted per table so each worker reads ascending file offsets;
+    /// decoded rows are inserted into the owning cache on the calling thread.
+    fn prefetch_rows(&self, embedding_rows: &[usize], ple_rows: &[usize]) -> Result<()> {
+        let missing = |sources: &[Source],
+                       rows: &[usize],
+                       cache: &RefCell<Cache>|
+         -> Result<Vec<(usize, usize)>> {
+            let mut need: Vec<(usize, usize)> = Vec::new();
+            {
+                let mut cache = cache.borrow_mut();
+                for &row in rows {
+                    let key = shard_of(sources, row)?;
+                    if cache.get(key).is_none() {
+                        need.push(key);
+                    }
+                }
+            }
+            need.sort_unstable();
+            need.dedup();
+            Ok(need)
+        };
+        let embedding_need = missing(&self.embedding, embedding_rows, &self.embedding_cache)?;
+        let ple_need = missing(&self.ple, ple_rows, &self.ple_cache)?;
+        let total = embedding_need.len() + ple_need.len();
+        if total == 0 {
+            return Ok(());
+        }
+        // Work items carry the owning table so one sorted list feeds a single
+        // parallel pass: false selects embedding shards, true selects PLE.
+        let keys: Vec<(bool, usize, usize)> = embedding_need
+            .iter()
+            .map(|&(shard, local)| (false, shard, local))
+            .chain(ple_need.iter().map(|&(shard, local)| (true, shard, local)))
+            .collect();
+        let mut decoded: Vec<Option<Vec<u16>>> = vec![None; total];
+        let threads = total.min(std::thread::available_parallelism().map_or(1, |n| n.get()));
+        let Inputs {
+            embedding,
+            ple,
+            tables,
+            ..
+        } = self;
+        if threads <= 1 {
+            for (key, out) in keys.iter().zip(decoded.iter_mut()) {
+                *out = Some(if key.0 {
+                    decode_row(ple, tables, key.1, key.2)?
+                } else {
+                    decode_row(embedding, tables, key.1, key.2)?
+                });
+            }
+        } else {
+            let chunk = total.div_ceil(threads);
+            std::thread::scope(|scope| -> Result<()> {
+                let mut handles = vec![];
+                for (keys, out) in keys.chunks(chunk).zip(decoded.chunks_mut(chunk)) {
+                    handles.push(scope.spawn(move || -> Result<()> {
+                        for (key, out) in keys.iter().zip(out.iter_mut()) {
+                            *out = Some(if key.0 {
+                                decode_row(ple, tables, key.1, key.2)?
+                            } else {
+                                decode_row(embedding, tables, key.1, key.2)?
+                            });
+                        }
+                        Ok(())
+                    }));
+                }
+                for handle in handles {
+                    handle.join().map_err(|_| "CPU row loader panicked")??;
+                }
+                Ok(())
+            })?;
+        }
+        for (key, value) in keys.iter().zip(decoded) {
+            let row = Rc::new(value.expect("every missing row was decoded"));
+            if key.0 {
+                self.ple_cache
+                    .borrow_mut()
+                    .put((key.1, key.2), row, PLE_CACHE_BUDGET);
+            } else {
+                self.embedding_cache
+                    .borrow_mut()
+                    .put((key.1, key.2), row, EMBEDDING_CACHE_BUDGET);
+            }
+        }
+        Ok(())
     }
     #[cfg(test)]
     pub(super) fn prepare(
@@ -426,18 +473,14 @@ impl Inputs {
             .copied()
             .collect();
         previous.reverse();
-        let mut embedding = Vec::with_capacity(tokens.len() * 5120);
-        let mut ple = Vec::with_capacity(embedding.capacity());
+        // Pass 1 resolves every row this packet needs without I/O; the missing
+        // set is then read and decoded in parallel before assembly, so cold
+        // prompts no longer pay one synchronous row read per lookup.
+        let mut embedding_rows: Vec<usize> = Vec::with_capacity(tokens.len());
+        let mut ple_rows: Vec<usize> =
+            Vec::with_capacity(if draft { 0 } else { tokens.len() * 16 });
         for &token in tokens {
-            let row = self.row(
-                &self.embedding,
-                &self.embedding_cache,
-                token as usize,
-                8 * 1024 * 1024,
-            )?;
-            for &value in row.iter() {
-                embedding.extend(value.to_le_bytes());
-            }
+            embedding_rows.push(token as usize);
             if draft {
                 continue;
             }
@@ -450,12 +493,9 @@ impl Inputs {
                     .unwrap_or(self.assets.eos);
                 mixed ^= prior as u64 * self.assets.multipliers[shift];
                 for head in (shift - 1) * 8..shift * 8 {
-                    let row =
-                        (mixed % self.assets.sizes[head] + self.assets.offsets[head]) as usize;
-                    let row = self.row(&self.ple, &self.ple_cache, row, 32 * 1024 * 1024)?;
-                    for &value in row.iter() {
-                        ple.extend(value.to_le_bytes());
-                    }
+                    ple_rows.push(
+                        (mixed % self.assets.sizes[head] + self.assets.offsets[head]) as usize,
+                    );
                 }
             }
             if token == self.assets.eos {
@@ -464,6 +504,36 @@ impl Inputs {
                 previous.push(token);
                 if previous.len() > 2 {
                     previous.remove(0);
+                }
+            }
+        }
+        self.prefetch_rows(&embedding_rows, &ple_rows)?;
+        let mut embedding = Vec::with_capacity(tokens.len() * 5120);
+        let mut ple = Vec::with_capacity(if draft { 0 } else { tokens.len() * 5120 });
+        let mut ple_cursor = 0;
+        for &token in tokens {
+            let row = self.row(
+                &self.embedding,
+                &self.embedding_cache,
+                token as usize,
+                EMBEDDING_CACHE_BUDGET,
+            )?;
+            for &value in row.iter() {
+                embedding.extend(value.to_le_bytes());
+            }
+            if draft {
+                continue;
+            }
+            for _ in 0..16 {
+                let row = self.row(
+                    &self.ple,
+                    &self.ple_cache,
+                    ple_rows[ple_cursor],
+                    PLE_CACHE_BUDGET,
+                )?;
+                ple_cursor += 1;
+                for &value in row.iter() {
+                    ple.extend(value.to_le_bytes());
                 }
             }
         }
@@ -495,6 +565,63 @@ impl Inputs {
             (format!("M{}_Ple", super::plan::arena_width(capacity)), ple),
         ])
     }
+}
+/// Decoded-row LRU budgets in bytes. Repetitive prompts stay cached across
+/// requests; cold rows are read and decoded in parallel instead.
+const EMBEDDING_CACHE_BUDGET: usize = 64 * 1024 * 1024;
+const PLE_CACHE_BUDGET: usize = 128 * 1024 * 1024;
+
+fn shard_of(sources: &[Source], row: usize) -> Result<(usize, usize)> {
+    let shard = sources
+        .partition_point(|s| s.first <= row)
+        .checked_sub(1)
+        .ok_or("CPU row outside table")?;
+    let local = row - sources[shard].first;
+    if local >= sources[shard].rows {
+        return Err("CPU row outside table".into());
+    }
+    Ok((shard, local))
+}
+fn decode_row(
+    sources: &[Source],
+    tables: &[Table],
+    shard: usize,
+    local: usize,
+) -> Result<Vec<u16>> {
+    let source = &sources[shard];
+    let width = source.width;
+    let stride = if source.book.is_some() {
+        2 + width / 4
+    } else {
+        width
+    };
+    let mut packet = vec![0u8; stride];
+    source
+        .file
+        .read_exact_at(&mut packet, source.offset + (local * stride) as u64)
+        .map_err(|e| e.to_string())?;
+    if let Some(book) = source.book {
+        return decode(&packet, &tables[book]);
+    }
+    let mut scale = [0u8; 2];
+    source
+        .file
+        .read_exact_at(
+            &mut scale,
+            source.scale_offset.ok_or("Missing INT8 row scale")? + local as u64 * 2,
+        )
+        .map_err(|e| e.to_string())?;
+    let scale = f16::from_bits(u16::from_le_bytes(scale)).to_f32();
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("Invalid INT8 row scale".into());
+    }
+    Ok(packet
+        .iter()
+        .map(|&v| f16::from_f32((v as i8) as f32 * scale).to_bits())
+        .collect())
+}
+fn load_row(sources: &[Source], tables: &[Table], shard: usize, local: usize) -> Result<Row> {
+    Ok(Rc::new(decode_row(sources, tables, shard, local)?))
 }
 fn decode(packet: &[u8], table: &Table) -> Result<Vec<u16>> {
     let scale = f16::from_bits(u16::from_le_bytes([packet[0], packet[1]])).to_f32();
@@ -766,8 +893,8 @@ mod tests {
             }
             history.push(token);
         }
-        assert!(inputs.embedding_cache.borrow().bytes <= 8 * 1024 * 1024);
-        assert!(inputs.ple_cache.borrow().bytes <= 32 * 1024 * 1024);
+        assert!(inputs.embedding_cache.borrow().bytes <= EMBEDDING_CACHE_BUDGET);
+        assert!(inputs.ple_cache.borrow().bytes <= PLE_CACHE_BUDGET);
         assert!(inputs.prepare(&[248320], &[]).is_err());
     }
 }
