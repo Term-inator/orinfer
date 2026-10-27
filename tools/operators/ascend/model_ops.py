@@ -4,7 +4,7 @@ import math
 
 import tilelang.language as T
 
-from tools.operators.ascend.vector_math import rsqrt_fp32
+from tools.operators.ascend.vector_math import div_127_fp32, div_fp32_scalar, rsqrt_fp32
 
 
 def norm(rows, width, eps=1e-20):
@@ -39,6 +39,91 @@ def norm(rows, width, eps=1e-20):
                 T.copy(a, precise[row, :])
                 T.tile.cast(y, a, "CAST_RINT", width)
                 T.copy(y, out[row, :])
+
+    return main
+
+
+def norm_quant(rows, width, eps=1e-20):
+    """Fused zero-centered RMSNorm and per-row INT8 quantization.
+
+    Bit-exact with the separate norm -> quantize pair: the normalized FP32
+    row rounds through BF16 exactly as the standalone kernels do before the
+    activation scale is fitted.
+    """
+
+    @T.prim_func
+    def main(
+        x: T.Tensor((rows, width), "bfloat16"),
+        weight: T.Tensor((width,), "float32"),
+        out: T.Tensor((rows, width), "int8"),
+        scales: T.Tensor((rows,), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+            xb = T.alloc_ub((1, width), "bfloat16")
+            a = T.alloc_ub((1, width), "float32")
+            w = T.alloc_ub((1, width), "float32")
+            squared = T.alloc_ub((1, width), "float32")
+            variance = T.alloc_ub((1, 1), "float32")
+            inverse = T.alloc_ub((1, 1), "float32")
+            correction = T.alloc_ub((1, 1), "float32")
+            y = T.alloc_ub((1, width), "bfloat16")
+            absolute = T.alloc_ub((1, width), "float32")
+            maximum = T.alloc_ub((1, 1), "float32")
+            scale = T.alloc_ub((1, 1), "float32")
+            divisor = T.alloc_ub((1, 1), "float32")
+            scale_residual = T.alloc_ub((1, 1), "float32")
+            scale_negative = T.alloc_ub((1, 1), "float32")
+            scale_high = T.alloc_ub((1, 1), "float32")
+            scale_low = T.alloc_ub((1, 1), "float32")
+            scale_tile = T.alloc_ub((1, width), "float32")
+            residual = T.alloc_ub((1, width), "float32")
+            quotient_low = T.alloc_ub((1, width), "float32")
+            product = T.alloc_ub((1, width), "float32")
+            rounded = T.alloc_ub((1, width), "float16")
+            yq = T.alloc_ub((1, width), "int8")
+            row = cid * 2 + vid
+            if row < rows:
+                T.copy(x[row, :], xb)
+                T.copy(weight[:], w)
+                T.tile.cast(a, xb, "CAST_NONE", width)
+                T.tile.mul(squared, a, a)
+                T.reduce_sum(squared, variance, dim=1)
+                T.tile.mul(variance, variance, 1.0 / width)
+                T.tile.add(variance, variance, eps)
+                rsqrt_fp32(variance, inverse, correction)
+                T.tile.mul(a, a, inverse[0, 0])
+                T.tile.mul(a, a, w)
+                T.tile.cast(y, a, "CAST_RINT", width)
+                T.tile.cast(a, y, "CAST_NONE", width)
+                T.tile.abs(absolute, a)
+                T.reduce_max(absolute, maximum, dim=1)
+                T.tile.max(maximum, maximum, 1e-12)
+                T.tile.fill(divisor, 127.0)
+                div_127_fp32(maximum, divisor, scale, scale_negative, scale_residual)
+                scale_high[0, 0] = T.reinterpret(
+                    "float32",
+                    T.bitwise_and(T.reinterpret("uint32", scale[0, 0]), T.uint32(4294963200)),
+                )
+                T.tile.sub(scale_low, scale, scale_high)
+                T.tile.broadcast(scale_tile, scale)
+                div_fp32_scalar(
+                    a,
+                    scale_tile,
+                    scale_high,
+                    scale_low,
+                    a,
+                    residual,
+                    absolute,
+                    quotient_low,
+                    product,
+                )
+                T.tile.min(a, a, 127.0)
+                T.tile.max(a, a, -127.0)
+                T.tile.round(a, a, width)
+                T.tile.cast(rounded, a, "CAST_RINT", width)
+                T.tile.cast(yq, rounded, "CAST_RINT", width)
+                T.copy(yq, out[row : row + 1, :])
+                T.copy(scale, scales[row : row + 1])
 
     return main
 
@@ -193,6 +278,94 @@ def swiglu_packed(rows, width, limit=10.0):
                 T.tile.mul(u, u, g)
                 T.tile.cast(y, u, "CAST_RINT", width)
                 T.copy(y, out[row, :])
+
+    return main
+
+
+def swiglu_packed_quant(rows, width, limit=10.0):
+    """Fused packed SiLU-and-up gate with per-row INT8 quantization.
+
+    Bit-exact with the separate swiglu_packed -> quantize pair: the gated FP32
+    row rounds through BF16 exactly as the standalone kernels do. The gated
+    row moves into the quantization layout through an in-UB copy, never
+    touching global memory.
+    """
+
+    @T.prim_func
+    def main(
+        packed: T.Tensor((rows, 2 * width), "bfloat16"),
+        out: T.Tensor((rows, width), "int8"),
+        scales: T.Tensor((rows,), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+            gb = T.alloc_ub((width,), "bfloat16")
+            ub = T.alloc_ub((width,), "bfloat16")
+            g = T.alloc_ub((width,), "float32")
+            u = T.alloc_ub((width,), "float32")
+            exp = T.alloc_ub((width,), "float32")
+            y = T.alloc_ub((width,), "bfloat16")
+            yb = T.alloc_ub((1, width), "bfloat16")
+            a = T.alloc_ub((1, width), "float32")
+            absolute = T.alloc_ub((1, width), "float32")
+            maximum = T.alloc_ub((1, 1), "float32")
+            scale = T.alloc_ub((1, 1), "float32")
+            divisor = T.alloc_ub((1, 1), "float32")
+            scale_residual = T.alloc_ub((1, 1), "float32")
+            scale_negative = T.alloc_ub((1, 1), "float32")
+            scale_high = T.alloc_ub((1, 1), "float32")
+            scale_low = T.alloc_ub((1, 1), "float32")
+            scale_tile = T.alloc_ub((1, width), "float32")
+            residual = T.alloc_ub((1, width), "float32")
+            quotient_low = T.alloc_ub((1, width), "float32")
+            product = T.alloc_ub((1, width), "float32")
+            rounded = T.alloc_ub((1, width), "float16")
+            yq = T.alloc_ub((1, width), "int8")
+            row = cid * 2 + vid
+            if row < rows:
+                T.copy(packed[row, :width], gb)
+                T.copy(packed[row, width:], ub)
+                T.tile.cast(g, gb, "CAST_NONE", width)
+                T.tile.cast(u, ub, "CAST_NONE", width)
+                T.tile.min(g, g, limit)
+                T.tile.min(u, u, limit)
+                T.tile.max(u, u, -limit)
+                T.tile.mul(exp, g, -1.0)
+                T.tile.exp(exp, exp)
+                T.tile.add(exp, exp, 1.0)
+                T.tile.div(g, g, exp)
+                T.tile.mul(u, u, g)
+                T.tile.cast(y, u, "CAST_RINT", width)
+                T.copy(y[:], yb[0, :])
+                T.tile.cast(a, yb, "CAST_NONE", width)
+                T.tile.abs(absolute, a)
+                T.reduce_max(absolute, maximum, dim=1)
+                T.tile.max(maximum, maximum, 1e-12)
+                T.tile.fill(divisor, 127.0)
+                div_127_fp32(maximum, divisor, scale, scale_negative, scale_residual)
+                scale_high[0, 0] = T.reinterpret(
+                    "float32",
+                    T.bitwise_and(T.reinterpret("uint32", scale[0, 0]), T.uint32(4294963200)),
+                )
+                T.tile.sub(scale_low, scale, scale_high)
+                T.tile.broadcast(scale_tile, scale)
+                div_fp32_scalar(
+                    a,
+                    scale_tile,
+                    scale_high,
+                    scale_low,
+                    a,
+                    residual,
+                    absolute,
+                    quotient_low,
+                    product,
+                )
+                T.tile.min(a, a, 127.0)
+                T.tile.max(a, a, -127.0)
+                T.tile.round(a, a, width)
+                T.tile.cast(rounded, a, "CAST_RINT", width)
+                T.tile.cast(yq, rounded, "CAST_RINT", width)
+                T.copy(yq, out[row : row + 1, :])
+                T.copy(scale, scales[row : row + 1])
 
     return main
 

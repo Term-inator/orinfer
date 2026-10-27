@@ -155,6 +155,91 @@ def swiglu(rows, width, limit=10.0):
     return main
 
 
+def swiglu_quant(rows, width, limit=10.0):
+    """Fused SiLU-and-up gate with per-row INT8 quantization.
+
+    Bit-exact with the separate swiglu -> quantize pair: the gated FP32 row
+    rounds through BF16 exactly as the standalone kernels do.
+    """
+
+    @T.prim_func
+    def main(
+        gate: T.Tensor((rows, width), "bfloat16"),
+        up: T.Tensor((rows, width), "bfloat16"),
+        out: T.Tensor((rows, width), "int8"),
+        scales: T.Tensor((rows,), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+            gb = T.alloc_ub((1, width), "bfloat16")
+            ub = T.alloc_ub((1, width), "bfloat16")
+            g = T.alloc_ub((1, width), "float32")
+            u = T.alloc_ub((1, width), "float32")
+            exponential = T.alloc_ub((1, width), "float32")
+            y = T.alloc_ub((1, width), "bfloat16")
+            a = T.alloc_ub((1, width), "float32")
+            absolute = T.alloc_ub((1, width), "float32")
+            maximum = T.alloc_ub((1, 1), "float32")
+            scale = T.alloc_ub((1, 1), "float32")
+            divisor = T.alloc_ub((1, 1), "float32")
+            scale_residual = T.alloc_ub((1, 1), "float32")
+            scale_negative = T.alloc_ub((1, 1), "float32")
+            scale_high = T.alloc_ub((1, 1), "float32")
+            scale_low = T.alloc_ub((1, 1), "float32")
+            scale_tile = T.alloc_ub((1, width), "float32")
+            residual = T.alloc_ub((1, width), "float32")
+            quotient_low = T.alloc_ub((1, width), "float32")
+            product = T.alloc_ub((1, width), "float32")
+            rounded = T.alloc_ub((1, width), "float16")
+            yq = T.alloc_ub((1, width), "int8")
+            row = cid * 2 + vid
+            if row < rows:
+                T.copy(gate[row, :], gb)
+                T.copy(up[row, :], ub)
+                T.tile.cast(g, gb, "CAST_NONE", width)
+                T.tile.cast(u, ub, "CAST_NONE", width)
+                T.tile.min(g, g, limit)
+                T.tile.min(u, u, limit)
+                T.tile.max(u, u, -limit)
+                T.tile.mul(exponential, g, -1.0)
+                T.tile.exp(exponential, exponential)
+                T.tile.add(exponential, exponential, 1.0)
+                T.tile.div(g, g, exponential)
+                T.tile.mul(u, g, u)
+                T.tile.cast(y, u, "CAST_RINT", width)
+                T.tile.cast(a, y, "CAST_NONE", width)
+                T.tile.abs(absolute, a)
+                T.reduce_max(absolute, maximum, dim=1)
+                T.tile.max(maximum, maximum, 1e-12)
+                T.tile.fill(divisor, 127.0)
+                div_127_fp32(maximum, divisor, scale, scale_negative, scale_residual)
+                scale_high[0, 0] = T.reinterpret(
+                    "float32",
+                    T.bitwise_and(T.reinterpret("uint32", scale[0, 0]), T.uint32(4294963200)),
+                )
+                T.tile.sub(scale_low, scale, scale_high)
+                T.tile.broadcast(scale_tile, scale)
+                div_fp32_scalar(
+                    a,
+                    scale_tile,
+                    scale_high,
+                    scale_low,
+                    a,
+                    residual,
+                    absolute,
+                    quotient_low,
+                    product,
+                )
+                T.tile.min(a, a, 127.0)
+                T.tile.max(a, a, -127.0)
+                T.tile.round(a, a, width)
+                T.tile.cast(rounded, a, "CAST_RINT", width)
+                T.tile.cast(yq, rounded, "CAST_RINT", width)
+                T.copy(yq, out[row : row + 1, :])
+                T.copy(scale, scales[row : row + 1])
+
+    return main
+
+
 def mhc_split_sinkhorn(rows, iterations=20, eps=1e-6):
     """Padded row strides: 24 mixes in 32 lanes, four gates in eight lanes."""
 

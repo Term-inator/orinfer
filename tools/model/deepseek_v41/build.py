@@ -154,6 +154,56 @@ class Builder:
         )
         return out, scales
 
+    def norm_quant(self, x, weight, width, output="norm.quant", rows=None):
+        rows = self.rows if rows is None else rows
+        out = self.temp(output, (rows, width), "i8")
+        scales = self.temp(output + ".scale", (rows,), "f32")
+        self.kernel(
+            model_ops,
+            "norm_quant",
+            {"rows": rows, "width": width},
+            [
+                ("x", x, "bf16", (rows, width), "read"),
+                ("weight", weight, "f32", (width,), "read"),
+                ("out", out, "i8", (rows, width), "write"),
+                ("scales", scales, "f32", (rows,), "write"),
+            ],
+        )
+        return out, scales
+
+    def swiglu_quant(self, gate, up, width, output="swiglu.quant", rows=None):
+        rows = self.rows if rows is None else rows
+        out = self.temp(output, (rows, width), "i8")
+        scales = self.temp(output + ".scale", (rows,), "f32")
+        self.kernel(
+            vector,
+            "swiglu_quant",
+            {"rows": rows, "width": width},
+            [
+                ("gate", gate, "bf16", (rows, width), "read"),
+                ("up", up, "bf16", (rows, width), "read"),
+                ("out", out, "i8", (rows, width), "write"),
+                ("scales", scales, "f32", (rows,), "write"),
+            ],
+        )
+        return out, scales
+
+    def swiglu_packed_quant(self, packed, width, output="expert.act.quant", rows=None):
+        rows = self.rows if rows is None else rows
+        out = self.temp(output, (rows, width), "i8")
+        scales = self.temp(output + ".scale", (rows,), "f32")
+        self.kernel(
+            model_ops,
+            "swiglu_packed_quant",
+            {"rows": rows, "width": width},
+            [
+                ("packed", packed, "bf16", (rows, 2 * width), "read"),
+                ("out", out, "i8", (rows, width), "write"),
+                ("scales", scales, "f32", (rows,), "write"),
+            ],
+        )
+        return out, scales
+
     def projection(
         self,
         x,
@@ -479,10 +529,9 @@ class Builder:
         sine = coordinates["long_sin" if compressed else "base_sin"]
         quant, scales = self.quant(x, 5120)
         qa = self.w8(quant, scales, prefix + ".wq_a", 1280, 5120, "q.a")
-        qr, _ = self.norm(
-            qa, self.matrix(prefix + ".q_norm.weight", "f32", 1280, 1), 1280, "q.normalized"
+        q8, qs = self.norm_quant(
+            qa, self.matrix(prefix + ".q_norm.weight", "f32", 1280, 1), 1280, "q.norm.quant"
         )
-        q8, qs = self.quant(qr, 1280)
         query = self.w8(q8, qs, prefix + ".wq_b", 4096, 1280, "q.b", first=self.rank * 4096)
         query = self.rope(query, 8, 512, cosine, sine, "q.rope")
         kv = self.w8(quant, scales, prefix + ".wkv", 512, 5120, "kv")
@@ -698,18 +747,7 @@ class Builder:
         quant, scale = self.quant(x, 5120)
         gate = self.w8(quant, scale, prefix + ".shared_experts.w1", 2304, 5120, "shared.gate")
         up = self.w8(quant, scale, prefix + ".shared_experts.w3", 2304, 5120, "shared.up")
-        act = self.temp("shared.act", (rows, 2304))
-        self.kernel(
-            vector,
-            "swiglu",
-            {"rows": rows, "width": 2304},
-            [
-                ("gate", gate, "bf16", (rows, 2304), "read"),
-                ("up", up, "bf16", (rows, 2304), "read"),
-                ("out", act, "bf16", (rows, 2304), "write"),
-            ],
-        )
-        act8, act_scale = self.quant(act, 2304, "shared.quant")
+        act8, act_scale = self.swiglu_quant(gate, up, 2304, "shared.act.quant")
         shared = self.w8(
             act8, act_scale, prefix + ".shared_experts.w2", 5120, 2304, "shared.output"
         )
@@ -807,17 +845,9 @@ class Builder:
                 "groups": counts,
             }
         )
-        activation = self.temp("expert.act", (expert_rows, 2304))
-        self.kernel(
-            model_ops,
-            "swiglu_packed",
-            {"rows": expert_rows, "width": 2304},
-            [
-                ("packed", packed_output, "bf16", (expert_rows, 4608), "read"),
-                ("out", activation, "bf16", (expert_rows, 2304), "write"),
-            ],
+        down8, down_scale = self.swiglu_packed_quant(
+            packed_output, 2304, "expert.act.quant", rows=expert_rows
         )
-        down8, down_scale = self.quant(activation, 2304, "expert.quant", rows=expert_rows)
         self.steps.append(
             {
                 "op": "w4",
