@@ -315,8 +315,8 @@ class Model:
         # A draft head refresh can occur at a completely filled context and
         # runs only head operators. execute separately rejects body overflow.
         index_cap = index_capacity(min(self.capacity, self.position + m), self.capacity)
-        if all_logits and (verify or self.is_mtp or m > 128):
-            raise ValueError("Decode batch head supports target rows 1..128")
+        if all_logits and (verify or m > 128):
+            raise ValueError("Decode batch head supports rows 1..128")
         key = (m, index_cap, verify, True) if all_logits else (m, index_cap, verify)
         if key in self.plans:
             return self.plans[key]

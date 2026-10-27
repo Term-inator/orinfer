@@ -2,12 +2,19 @@
 
 import copy
 from contextlib import ExitStack
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import torch
 
 from tools.model.flash_next.planning import Planner
+from tools.model.flash_next.bindings import Bindings
+from tools.model.flash_next.draft import DraftRows
+from tools.model.flash_next.storage import Weights
+from tools.model.compile import construct
 from tools.model.flash_next.tests.test_config import fixture
 
 
@@ -125,6 +132,73 @@ class PlanningTests(unittest.TestCase):
             self.assertIsNone(target.plans.get((rows, 4096, False)))
         self.assertEqual(first.position, 0)
         self.assertEqual(target.plans, {})
+        head = first.trace(128, all_logits=True)
+        self.assertEqual(tuple(head["output"].shape), (128, 248320))
+
+    def test_draft_row_emission_keeps_interfaces_and_affine_row_counts(self):
+        target_assembly, draft_assembly = assembly("text"), assembly("mtp")
+        target = Planner(target_assembly, 4096, None)
+        draft = Planner(draft_assembly, 4096, None, target=target)
+        emitted = {}
+
+        class Compiler:
+            def emit(self, old, name, pointers, rows, **kwargs):
+                emitted[name] = dict(pointers=pointers, multiplier=kwargs.get("multiplier", 1))
+                return dict(name=name), dict(name=name, capacity=rows)
+
+        def artifact(binding, recipe, dynamic):
+            primitive, _ = construct(recipe.build, dynamic=dynamic)
+            return recipe.key, (primitive, None, None)
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("tools.model.flash_next.bindings.source_identity", return_value="test"),
+            patch.object(Bindings, "artifact", artifact),
+        ):
+            weights = Weights(SimpleNamespace(config=fixture()), Path(tmp))
+            weights.buffers.update(target_assembly["buffers"] | draft_assembly["buffers"])
+            weights.scopes.update({n: "weights" for n in weights.buffers})
+            target_bindings = Bindings(target, weights, Path(tmp), Path(tmp) / "cache")
+            target_bindings.compiler = Compiler()
+            target_bindings.fixed("FlashDecode_Logits", "f32", [128, 248320])
+            target_bindings.fixed("FlashDecode_Selected", "i32", [128, 2])
+            child = Bindings(draft, weights, Path(tmp), Path(tmp) / "cache", shared=target_bindings)
+            body, _ = DraftRows(child).build()
+            self.assertIs(child.kernels, target_bindings.kernels)
+            self.assertIs(child.buffers, target_bindings.buffers)
+            self.assertEqual(len(child.groups["draft_rows"]["head"]), 9)
+            self.assertEqual(len(child.groups["causal_rows"]["draft"]), 19)
+            fc = [
+                v
+                for v in emitted.values()
+                if any(
+                    p["name"].endswith("W_fc_hidden.weight_value") for p in v["pointers"].values()
+                )
+            ]
+            self.assertEqual(len(fc), 1)
+            self.assertEqual(fc[0]["multiplier"], 4)
+            experts = [
+                v
+                for v in emitted.values()
+                if "Counts" in v["pointers"] and any(n in v["pointers"] for n in ("P", "W"))
+            ]
+            self.assertEqual(len(experts), 2)
+            self.assertTrue(all(v["multiplier"] == 10 for v in experts))
+            for v in experts:
+                self.assertNotIn("PAddresses", v["pointers"])
+                self.assertNotIn("WSAddresses", v["pointers"])
+            private = [v for n, v in emitted.items() if n.startswith("causal_rows/draft/")]
+            self.assertTrue(
+                any(
+                    v["pointers"].get("Step", {}).get("name") == "MtpPosition"
+                    or any(p["name"] == "MtpPosition" for p in v["pointers"].values())
+                    for v in private
+                )
+            )
+            self.assertEqual(child.buffers["DraftRows_Hidden"]["shape"], [512, 4, 2560])
+            self.assertEqual(child.scopes["State_48_pending"], "sequence")
+            self.assertEqual(tuple(body["condition"].shape), (512, 4, 2560))
+            self.assertFalse(any(n.startswith("Scratch") for n in child.buffers))
 
     def test_identity_or_context_errors_precede_fake_allocation(self):
         target = Planner(assembly("text"), 4096, None)

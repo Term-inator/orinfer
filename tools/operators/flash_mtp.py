@@ -10,6 +10,39 @@ from kernels.model.greedy import greedy_partials, greedy_merge
 from tools.operators.common import configure, write_json, error
 
 
+def dynamic_fusion():
+    from tools.model.compile import construct, compile_function
+    from kernels.model.rows import explicit_rows
+
+    cases = []
+    for width in (65, 2560):
+        primitive, passes = construct(lambda: fm.fuse(512, width), dynamic=True)
+        kernel = compile_function(explicit_rows(primitive), pass_configs=passes)
+        embedding = torch.randn(512, width, device="cuda").half()
+        hidden = torch.randn(512, 4, width, device="cuda").half()
+        out = torch.empty_like(hidden)
+        for rows in (1, 2, 3, 7, 127, 511, 512):
+            out.fill_(-123)
+            kernel.adapter.func(
+                embedding, hidden, out, rows, stream=torch.cuda.current_stream().cuda_stream
+            )
+            expected = (embedding.float()[:, None] + hidden.float()).half()
+            assert torch.equal(out[:rows], expected[:rows]), (width, rows)
+            assert (out[rows:] == -123).all(), (width, rows, "tail")
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                kernel.adapter.func(
+                    embedding, hidden, out, rows, stream=torch.cuda.current_stream().cuda_stream
+                )
+            embedding.neg_()
+            hidden.neg_()
+            graph.replay()
+            assert torch.equal(out[:rows], -expected[:rows]), (width, rows, "replay")
+            assert (out[rows:] == -123).all(), (width, rows, "replay tail")
+            cases.append(dict(width=width, rows=rows, exact=True, changed_graph=True, tail=True))
+    return cases
+
+
 def prefill_ring():
     """Every 512-row draft window survives a 4096-row target capture and wrap."""
     width, capacity = 10240, 4096
@@ -40,10 +73,18 @@ def prefill_ring():
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--ring-only", action="store_true")
+    scope = p.add_mutually_exclusive_group()
+    scope.add_argument("--ring-only", action="store_true")
+    scope.add_argument("--fusion-only", action="store_true")
     a = p.parse_args()
     configure()
     report = {"complete": False, "norm": [], "history": [], "pending": [], "greedy": []}
+    if not a.ring_only:
+        report["dynamic_fusion"] = dynamic_fusion()
+    if a.fusion_only:
+        report["complete"] = True
+        write_json(a.output / "results.json", report)
+        return
     report["prefill_ring"] = prefill_ring()
     if a.ring_only:
         report["complete"] = True

@@ -12,6 +12,7 @@ from safetensors.numpy import save_file
 from tools.model.flash_next.storage import Weights, payload_hash
 from tools.model.safetensors_source import local_header
 from tools.quantization.e8p import basis
+from tools.model.flash_next.tests.test_config import fixture
 
 
 def piece(root, number, first, count, arrays):
@@ -65,7 +66,7 @@ class NativeStorageTests(unittest.TestCase):
                 for i, (first, count) in enumerate(((0, 2), (2, 1)))
             ]
             source = SimpleNamespace(
-                config={"quantization_config": {}},
+                config=fixture(),
                 parts=dict(expert=parts, dense=dense_parts),
                 shape=lambda name: (3, 2, 128) if name == "expert" else (3, 5),
             )
@@ -93,28 +94,40 @@ class NativeStorageTests(unittest.TestCase):
                     weights.buffers[name]["data"]["sha256"],
                     payload_hash(path, begin + left, right - left),
                 )
+            weights.dense("dense", "output_hc_down.weight")
             before = {
                 name: path.read_bytes()
                 for name, filename in weights.mapping.items()
                 if (path := weights.directory / filename).is_file()
             }
-            source.config = {"quantization_config": {"component": "mtp"}}
-            draft = Weights(source, weights.root)
+            draft_source = SimpleNamespace(
+                config=fixture("mtp"), parts=source.parts, shape=source.shape
+            )
+            draft = Weights(draft_source, weights.root)
             # MTP has its own output HC mixer. Even identical logical names
             # must not overwrite target files or collide in the native arena.
-            draft.dense("dense", "output.weight")
+            draft.dense("dense", "output_hc_down.weight")
             draft.expert("expert", "blk.48.ffn_down_exps.weight")
             self.assertFalse(set(weights.buffers) & set(draft.buffers))
             self.assertFalse(set(weights.mapping.values()) & set(draft.mapping.values()))
             for name, payload in before.items():
                 self.assertEqual((weights.directory / weights.mapping[name]).read_bytes(), payload)
             with safe_open(
-                draft.directory / draft.mapping[draft.logical["output.weight"]["weight"]],
+                draft.directory / draft.mapping[draft.logical["output_hc_down.weight"]["weight"]],
                 framework="np",
             ) as stream:
                 np.testing.assert_array_equal(
-                    stream.get_tensor(draft.logical["output.weight"]["weight"]), dense
+                    stream.get_tensor(draft.logical["output_hc_down.weight"]["weight"]), dense
                 )
+            target_logical = dict(weights.logical)
+            weights.attach_mtp(draft)
+            self.assertEqual(weights.logical, target_logical)
+            self.assertTrue(set(draft.buffers) <= set(weights.buffers))
+            for name in draft.buffers:
+                self.assertEqual(weights.scopes[name], "weights")
+                self.assertEqual(weights.mapping[name], draft.mapping[name])
+            with self.assertRaisesRegex(ValueError, "collides"):
+                weights.attach_mtp(draft)
 
     def test_basis_disagreement_and_bad_k_major_layout_are_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

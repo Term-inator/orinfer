@@ -35,7 +35,9 @@ def norm(rows: int, width: int, dynamic_rows: bool = False):
     return main
 
 
-@orin_jit
+# CUDA 12.8 NVRTC crashes on this vectorized FP32 add / FP16 store,
+# as for residual_add. Scalar additions retain the same FP16 boundary.
+@orin_jit(pass_configs={"tirx.disable_vectorize": True})
 def fuse(rows: int, hidden: int, branches: int = 4, dynamic_rows: bool = False):
     rows = row_count(rows, dynamic_rows)
 

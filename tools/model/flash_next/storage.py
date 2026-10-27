@@ -98,6 +98,7 @@ class Weights:
             save_file(
                 {name: np.ascontiguousarray(value) for name, value in arrays.items()}, str(path)
             )
+
             begin, header = local_header(path)
             self.shard(
                 filename,
@@ -118,6 +119,24 @@ class Weights:
                     if name != "__metadata__"
                 ],
             )
+
+    def attach_mtp(self, draft):
+        """Join physical arenas; each planner retains its own logical HC roles."""
+        from tools.model.flash_next.config import validate_pair
+
+        validate_pair(draft.source.config, self.source.config, 1)
+        if "output.weight" in draft.logical:
+            raise ValueError("MTP must share the target output head")
+        if self.root.resolve() != draft.root.resolve():
+            raise ValueError("MTP and target weights must share the publication root")
+        if set(self.buffers) & set(draft.buffers) or set(self.mapping.values()) & set(
+            draft.mapping.values()
+        ):
+            raise ValueError("MTP weight arena collides with the target")
+        self.buffers.update(draft.buffers)
+        self.scopes.update(draft.scopes)
+        self.mapping.update(draft.mapping)
+        return self.finish()
 
     def expert(self, original, name):
         parts = self.source.parts[original]

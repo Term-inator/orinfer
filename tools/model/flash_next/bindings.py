@@ -30,16 +30,29 @@ DTYPES = {
 
 
 class Bindings:
-    def __init__(self, planner, weights, output, cache):
+    def __init__(self, planner, weights, output, cache, *, shared=None):
+        if shared is not None and (
+            not planner.is_mtp
+            or weights is not shared.weights
+            or planner.mode is not shared.planner.mode
+            or planner.weights["output.weight"] is not shared.planner.weights["output.weight"]
+        ):
+            raise ValueError("Draft bindings must share their target arena and head")
         self.planner, self.weights, self.output = planner, weights, output
         self.buffers, self.scopes = weights.buffers, weights.scopes
         self.names = dict(planner.storage_names)
-        self.keep = list(planner.tensors.values())
-        self.recipes, self.kernels, self.dynamic, self.groups = {}, [], [], {}
+        self.keep = shared.keep if shared is not None else []
+        self.keep.extend(planner.tensors.values())
+        self.recipes = {}
+        self.kernels, self.dynamic, self.groups = (
+            (shared.kernels, shared.dynamic, shared.groups) if shared is not None else ([], [], {})
+        )
         self.cache = BuildCache(cache)
         self.identity = dict(source=source_identity(), context=planner.capacity)
-        self.compiler = Compiler(
-            weights.root / "cache", weights.root / "cache", output, self.buffers
+        self.compiler = (
+            shared.compiler
+            if shared is not None
+            else Compiler(weights.root / "cache", weights.root / "cache", output, self.buffers)
         )
         for name, tensor in planner.tensors.items():
             if name not in self.buffers:
@@ -47,7 +60,7 @@ class Bindings:
                     name,
                     DTYPES[tensor.dtype],
                     list(tensor.shape),
-                    "workspace" if name == "PositionOut" else "sequence",
+                    "workspace" if name in ("PositionOut", "MtpPositionOut") else "sequence",
                 )
 
     def fixed(self, name, dtype, shape, scope="workspace"):
@@ -85,7 +98,8 @@ class Bindings:
         storage = tensor.untyped_storage()
         identity = storage._cdata
         if identity not in self.names:
-            name = name or f"Scratch{len(self.names)}"
+            prefix = "DraftScratch" if self.planner.is_mtp else "Scratch"
+            name = name or f"{prefix}{len(self.names)}"
             self.fixed(
                 name, DTYPES[tensor.dtype], [storage.nbytes() // tensor.element_size()], scope
             )
@@ -113,9 +127,12 @@ class Bindings:
 
     def artifact(self, recipe, dynamic):
         key = recipe.key + ("-dynamic" if dynamic else "-fixed")
+        expert = recipe.key.startswith(("expert-gu-", "expert-down-"))
+        if expert and self.planner.is_mtp:
+            key += "-resident"
         if key not in self.recipes:
             function, passes = construct(recipe.build, dynamic=dynamic)
-            if recipe.key.startswith(("expert-gu-", "expert-down-")):
+            if expert and not self.planner.is_mtp:
                 from kernels.model.expert_addresses import indirect_experts
 
                 function = indirect_experts(function)
@@ -187,7 +204,11 @@ class Bindings:
             name = name_override or f"{program}/{section}/k{slot}"
             # A dynamic expert projection counts routed assignments, ten per row.
             multiplier = (
-                10 if key.startswith(("expert-gu-", "expert-down-", "rotate-a8-ffn-")) else 1
+                10
+                if key.startswith(("expert-gu-", "expert-down-", "rotate-a8-ffn-"))
+                else self.planner.C
+                if label.startswith("mtp-fc-hidden:")
+                else 1
             )
             kernel, launch = self.compiler.emit(
                 dict(name=name),
