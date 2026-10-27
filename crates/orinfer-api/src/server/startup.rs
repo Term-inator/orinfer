@@ -72,6 +72,28 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
                 match initialize() {
                     Ok((mut loaded, context, vision, worker_codec)) => {
                         worker_lifecycle.ready();
+                        // The first user request would otherwise pay lease
+                        // mapping, packet plans and module loading: measured
+                        // ~0.6s of extra first-prompt TTFT on Flash Next.
+                        let warm_started = Instant::now();
+                        let greedy = orinfer_engine::sampling::Options {
+                            temperature: 0.0,
+                            ..Default::default()
+                        };
+                        if let Err(error) =
+                            loaded.model.generate(&[0], 1, &greedy, || false, |_| true)
+                        {
+                            let message = format!("Model warmup failed: {error}");
+                            worker_lifecycle.fail(
+                                orinfer_engine::error::EngineError::take(message.clone(), true),
+                            );
+                            let _ = ready_sender.send(Err(message));
+                            return;
+                        }
+                        eprintln!(
+                            "WARMUP READY after {:.3}s",
+                            warm_started.elapsed().as_secs_f64()
+                        );
                         let mtp_drafts = loaded.model.mtp_drafts();
                         let ready = (context, vision, mtp_drafts, Arc::clone(&worker_codec));
                         if ready_sender.send(Ok(ready)).is_ok() {
