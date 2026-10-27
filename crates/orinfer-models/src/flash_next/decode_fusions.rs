@@ -166,7 +166,97 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
         return Err("Unregistered activation fusion".into());
     }
     build_hc_finish(manifest, kernels)?;
+    build_hc_combine_norm(manifest, kernels)?;
     build_conv_history(manifest, kernels)
+}
+
+/// The fused combine+norm kernel replaces the separate pair in single-token
+/// decode; its host ABI order is Block, Inject, Normed, Output, Residual,
+/// Weight. The removed norm keeps identical rounding boundaries.
+fn build_hc_combine_norm(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
+    let contracts: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
+    let mut fused: BTreeSet<_> = kernels
+        .iter()
+        .filter(|k| k.symbol == "hc_combine_norm_kernel")
+        .map(|k| k.name.as_str())
+        .collect();
+    let buffers: BTreeMap<_, _> = manifest
+        .buffers
+        .iter()
+        .map(|b| (b.name.as_str(), b))
+        .collect();
+    let check = |k: &Kernel, i: usize, dtype: Dtype, bytes: usize, immutable: bool| -> Result<()> {
+        let name = binding(k, i)?;
+        let b = buffers.get(name).ok_or("Missing HC combine-norm buffer")?;
+        if b.dtype != dtype
+            || b.bytes()? != bytes
+            || b.data.is_some() != immutable
+            || b.access
+                != if immutable {
+                    Access::Read
+                } else {
+                    Access::ReadWrite
+                }
+        {
+            return Err(format!("Invalid HC combine-norm buffer: {name}"));
+        }
+        Ok(())
+    };
+    for (program, operations) in &mut manifest.programs {
+        if program != "decode" {
+            continue;
+        }
+        let mut skip = BTreeSet::new();
+        for index in 0..operations.len().saturating_sub(1) {
+            let Operation::Kernel { name } = &operations[index] else {
+                continue;
+            };
+            if !fused.contains(name.as_str()) {
+                continue;
+            }
+            let Operation::Kernel { name: norm_name } = &operations[index + 1] else {
+                return Err("HC combine-norm fusion requires an adjacent norm".into());
+            };
+            let fused_kernel = contracts[name.as_str()];
+            let norm = contracts
+                .get(norm_name.as_str())
+                .copied()
+                .ok_or("Missing HC combine-norm contract")?;
+            // Host ABI order: Block, Inject, Normed, Output, Residual, Weight.
+            if fused_kernel.args.len() != 6
+                || fused_kernel.grid != [1, 4, 1]
+                || fused_kernel.block != [256, 1, 1]
+                || norm.symbol != "main_kernel"
+                || norm.args.len() != 3
+                || norm.grid != [1, 4, 1]
+                || norm.block != [256, 1, 1]
+            {
+                return Err("Unexpected HC combine-norm ABI/geometry".into());
+            }
+            connect(fused_kernel, 2, norm, 0)?;
+            connect(fused_kernel, 4, norm, 1)?;
+            connect(fused_kernel, 5, norm, 2)?;
+            check(fused_kernel, 0, Dtype::F16, 2560 * 2, false)?;
+            check(fused_kernel, 1, Dtype::F16, 4 * 2, false)?;
+            check(fused_kernel, 2, Dtype::F16, 4 * 2560 * 2, false)?;
+            check(fused_kernel, 3, Dtype::F16, 4 * 2560 * 2, false)?;
+            check(fused_kernel, 4, Dtype::F16, 4 * 2560 * 2, false)?;
+            check(fused_kernel, 5, Dtype::F32, 4 * 2560 * 4, true)?;
+            skip.insert(index + 1);
+            fused.remove(name.as_str());
+        }
+        if !skip.is_empty() {
+            *operations = std::mem::take(operations)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, op)| (!skip.contains(&i)).then_some(op))
+                .collect();
+        }
+    }
+    if !fused.is_empty() {
+        return Err("Unregistered HC combine-norm fusion".into());
+    }
+    Ok(())
 }
 
 fn build_conv_history(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
@@ -546,6 +636,85 @@ mod tests {
                 assert!(build(&mut m, &k).is_err());
             }
         }
+    }
+    fn combine_norm_fixture() -> (Manifest, Vec<Kernel>) {
+        let (mut m, _) = fixture(false);
+        let definitions = [
+            ("Block", "f16", 2560, false),
+            ("Inject", "f16", 4, false),
+            ("Normed", "f16", 10240, false),
+            ("Output", "f16", 10240, false),
+            ("Residual", "f16", 10240, false),
+            ("Weight", "f32", 10240, true),
+        ];
+        m.buffers = definitions
+            .into_iter()
+            .map(|(name, dtype, n, immutable)| {
+                let mut b = serde_json::json!({"name":name,"dtype":dtype,"shape":[n],
+                "layout":"native_contiguous","alignment":256,
+                "access":if immutable {"read"}else{"read_write"}});
+                if immutable {
+                    b["data"] = serde_json::json!({"tensor":name,"sha256":"0".repeat(64)});
+                }
+                serde_json::from_value(b).unwrap()
+            })
+            .collect();
+        let identity = serde_json::json!({"file":"kernel.cubin","sha256":"0".repeat(64)});
+        let specs = [
+            (
+                "hc_combine_norm_kernel",
+                vec!["Block", "Inject", "Normed", "Output", "Residual", "Weight"],
+                [1, 4, 1],
+                [256, 1, 1],
+            ),
+            (
+                "main_kernel",
+                vec!["Normed", "Residual", "Weight"],
+                [1, 4, 1],
+                [256, 1, 1],
+            ),
+        ];
+        let k: Vec<Kernel> = specs
+            .into_iter()
+            .enumerate()
+            .map(|(i, (symbol, args, grid, block))| {
+                serde_json::from_value(serde_json::json!({"name":format!("decode/body/k{i}"),
+                    "symbol":symbol,"module":identity,"source":identity,"host_abi":identity,
+                    "grid":grid,"block":block,"shared_memory_bytes":0,"cooperative":false,
+                    "args":args.iter().map(|name|serde_json::json!({"kind":"buffer","name":name})).collect::<Vec<_>>()
+                })).unwrap()
+            })
+            .collect();
+        m.programs.insert(
+            "decode".into(),
+            k.iter()
+                .map(|k| Operation::Kernel {
+                    name: k.name.clone(),
+                })
+                .collect(),
+        );
+        (m, k)
+    }
+    #[test]
+    fn combine_norm_removes_only_the_validated_adjacent_norm() {
+        let (mut m, k) = combine_norm_fixture();
+        build(&mut m, &k).unwrap();
+        assert_eq!(m.programs["decode"].len(), 1);
+        let (mut m, mut k) = combine_norm_fixture();
+        k[1].args[2] = Argument::Buffer {
+            name: "Output".into(),
+        };
+        assert!(build(&mut m, &k).is_err());
+        let (mut m, mut k) = combine_norm_fixture();
+        k[0].block = [128, 1, 1];
+        assert!(build(&mut m, &k).is_err());
+        let (mut m, k) = combine_norm_fixture();
+        m.buffers[0].shape[0] -= 1;
+        assert!(build(&mut m, &k).is_err());
+        let (mut m, k) = combine_norm_fixture();
+        let ops = m.programs.remove("decode").unwrap();
+        m.programs.insert("verify_m4".into(), ops);
+        assert!(build(&mut m, &k).is_err());
     }
     fn fixture(gu: bool) -> (Manifest, Vec<Kernel>) {
         let width = if gu { 2560 } else { 640 };

@@ -74,6 +74,14 @@ Rust release `run-model`，`decode_only`、greedy、seed `20261002`、prefix 关
 
 加载分段中 `buffer_alloc_s` 约 5.9 s 不变：该成本与约 6 GiB 固定 buffer 的物理提交成正比，而非分配次数。合并分配在构建后页缓存被冲掉的场景实测完整加载 39.7 s，优于历史 45.7 s 冷启动记录；暖缓存加载维持约 14 s。`make check` 通过。
 
+## Flash Next HC combine-norm 融合（2026-10-27）
+
+新增 `--hc-combine-norm` 构建开关：把 decode 程序中 94 对相邻的 HC combine 与 norm 绑定替换为位等价的融合 kernel（`kernels/model/hyperconnection.py` 的 `hc_combine_norm`，流 dtype FP16；融合版在 M=1..4096 全部行数与分开链逐位一致）。Rust 侧 `decode_fusions` 按符号 `hc_combine_norm_kernel` 注册融合：校验 host ABI 顺序（Block, Inject, Normed, Output, Residual, Weight）、几何与 buffer dtype/尺寸后删除相邻 norm 操作；decode 程序 1772 → 1678 op。融合 kernel 实测 6.0 μs/次（0.56 ms/步）。
+
+宿主机复刻编译工具链（`artifacts/host-compiler`，与 orinfer-compiler:0.1.3 同版本：Python 3.12.15/torch 2.14.1+orinfer1/tilelang 0.1.15/sm87）完成本次重建：`--hc-combine-norm --projection-kinds w8 --projection-shape 2560 640` 过滤重建约 10 分钟，发布通过 Rust 计划检查。
+
+Rust release `run-model`，自然文本夹具，输出 token 与基线逐项一致；decode 30.29–30.31 → 30.42–30.43 TPS（+0.4%），prefill −0.9%（伴随的 W8 640×2560 重调在噪声内）。结论：单对 combine+norm 融合的收益上限小；本轮价值在于打通"保留族 kernel 重编译 + Rust 融合注册"闭环，供后续更大粒度的 HC 块融合使用。SM87 向量化 BF16 trap 以固定工具链复现（BF16 特异、FP16 全安全），但标量路径已达带宽上限，不构成优化项。
+
 ## Dense 模型与 vLLM 对照（2026-10-20–21）
 
 本节保留关闭 MTP 时的三长度、八档并发完整测量，用于与 vLLM 对照。2B 与 4B 使用共享组件 R5 包，9B 使用已接受的优化包。随后各日期章节保留对应版本的测量与适用范围。

@@ -340,6 +340,12 @@ def rebuild(args):
                 dict(complete=False, finished=number, total=len(groups), operators=records),
             )
             print("BUILT", number, "/", len(groups), spec, "cache" if hit else "tuned", flush=True)
+        if args.hc_combine_norm:
+            from tools.model.hc_fusion import publish as publish_hc_combine_norm
+
+            replacements.update(
+                publish_hc_combine_norm(data, package, manifest, compiler, args.output / "hc")
+            )
         package["kernels"] = [replacements.get(k["name"], k) for k in package["kernels"]]
         package["dynamic_batch_kernels"] = [
             launches.get(k["name"], k) for k in package["dynamic_batch_kernels"]
@@ -407,6 +413,11 @@ def main():
         help="Rebuild only declared prefill projections; preserve other certified bindings",
     )
     p.add_argument("--prefill-tuning-rows", type=int, nargs="+", default=[512, 2048, 4096])
+    p.add_argument(
+        "--hc-combine-norm",
+        action="store_true",
+        help="Replace decode HC combine bindings with the bit-identical fused combine-norm kernel",
+    )
     p.add_argument(
         "--projection-kinds",
         nargs="+",
