@@ -192,20 +192,28 @@ impl Cache {
                 .max(self.statistics.resident_bytes);
         }
     }
-    pub fn resolve(&self, key: Key) -> Key {
-        if let Some(((path, offset), bytes)) = self
+    fn bank_extent(&self, path: &Path, offset: usize, bytes: usize) -> Option<(usize, usize)> {
+        let ((bank_path, first), len) = self
             .banks
-            .range((key.path.clone(), 0)..=(key.path.clone(), key.offset))
-            .next_back()
-            && *path == key.path
-            && key
-                .offset
-                .checked_add(key.bytes)
-                .is_some_and(|end| end <= offset + bytes)
-        {
+            .range((path.into(), 0)..=(path.into(), offset))
+            .next_back()?;
+        (bank_path == path
+            && offset
+                .checked_add(bytes)
+                .is_some_and(|end| end <= first + len))
+        .then_some((*first, *len))
+    }
+    /// Conservative read bound for a gathered staging part, including a cold
+    /// complete-bank fill. Payload identity is still checked by each reader.
+    pub fn bank_bytes(&self, source: &crate::weights::TensorSource) -> Option<usize> {
+        self.bank_extent(&source.path, source.offset, source.bytes)
+            .map(|(_, bytes)| bytes)
+    }
+    pub fn resolve(&self, key: Key) -> Key {
+        if let Some((offset, bytes)) = self.bank_extent(&key.path, key.offset, key.bytes) {
             let bank = Key {
-                offset: *offset,
-                bytes: *bytes,
+                offset,
+                bytes,
                 ..key.clone()
             };
             if bank.charge() + self.statistics.bank_metadata_bytes <= self.statistics.capacity_bytes
