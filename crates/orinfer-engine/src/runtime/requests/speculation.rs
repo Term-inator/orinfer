@@ -311,11 +311,14 @@ impl ModelRuntime {
                 .map(|(i, n)| requests[*i].draft_acceptance.expected(n - 1))
                 .sum();
             allocations.insert(width, selected.clone());
+            // A verification round rides the same joined weight pass as one
+            // plain iteration; only the extra draft tokens add real cost. A
+            // rows*context prior priced each owner as its own prefill chunk
+            // and froze batched speculation out of every probe.
             candidates.push(control::Candidate {
                 width,
                 expected_tokens,
-                prior_seconds: self.predict_iteration(requests, &selected)
-                    + self.mtp_seconds_per_token * (width - 1) as f64,
+                prior_seconds: baseline + self.mtp_seconds_per_token * (width - 1) as f64,
             });
         }
         candidates.sort_by_key(|c| c.width);
@@ -879,21 +882,30 @@ impl ModelRuntime {
             if !segments.is_empty()
                 && (segments.len() >= 2 || self.manifest.packet_table().is_some())
             {
-                let (plan, bindings) = self
-                    .model_package
-                    .cached_batch(&segments, orinfer_model_sdk::abi::BatchOperation::Draft)?;
-                self.upload_spec_bindings(
-                    &segments,
-                    orinfer_model_sdk::abi::BatchOperation::Draft,
-                    bindings,
-                )?;
-                self.execution.execute_cached_batch_operation(
-                    orinfer_model_sdk::abi::BatchOperation::Draft,
-                    segments.iter().map(|s| (s.slot, s.tokens)).collect(),
-                    &plan,
-                    true,
-                    true,
-                )?;
+                // A package binds at most its declared draft lanes per packet;
+                // wider cohorts split into sequential draft packets.
+                let lanes = spec
+                    .batch_draft_profiles
+                    .last()
+                    .copied()
+                    .unwrap_or(segments.len());
+                for chunk in segments.chunks(lanes.max(1)) {
+                    let (plan, bindings) = self
+                        .model_package
+                        .cached_batch(chunk, orinfer_model_sdk::abi::BatchOperation::Draft)?;
+                    self.upload_spec_bindings(
+                        chunk,
+                        orinfer_model_sdk::abi::BatchOperation::Draft,
+                        bindings,
+                    )?;
+                    self.execution.execute_cached_batch_operation(
+                        orinfer_model_sdk::abi::BatchOperation::Draft,
+                        chunk.iter().map(|s| (s.slot, s.tokens)).collect(),
+                        &plan,
+                        true,
+                        true,
+                    )?;
+                }
             } else if let Some(segment) = segments.first() {
                 self.execution.activate_sequence(segment.slot)?;
                 self.launch_rows(&spec.draft_program, 1, ExecutionPhase::Decode)?;

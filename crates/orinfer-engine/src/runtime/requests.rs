@@ -1104,16 +1104,27 @@ impl ModelRuntime {
         {
             return upper;
         }
-        if selected.iter().any(|(_, n)| *n > 1) {
+        if selected
+            .iter()
+            .any(|(i, n)| *n > 1 && requests[*i].prefilling)
+        {
             // Joined projections/expert tiles pay one weight pass. A cold
             // linear rows*context prior greatly overestimates prompt work and
             // can permanently prevent the scheduler from trying useful tiles.
             let prompt_s: f64 = selected
                 .iter()
-                .filter(|(_, n)| *n > 1)
+                .filter(|(i, n)| *n > 1 && requests[*i].prefilling)
                 .map(|(i, n)| self.prefill_costs.chunk_upper(*n, requests[*i].offset + n))
                 .sum();
-            let decode_rows = selected.iter().filter(|(_, n)| *n == 1).count();
+            // Decoding requests wider than one row are verification segments of
+            // the same joined packet: they extend the decode row count instead
+            // of each paying a separate prefill weight pass. Summing their
+            // chunk costs froze batched speculation out of every probe.
+            let decode_rows = selected
+                .iter()
+                .filter(|(i, n)| *n == 1 || !requests[*i].prefilling)
+                .map(|(_, n)| *n)
+                .sum::<usize>();
             // The window covers complete execution, including shifted MTP warm
             // and endpoint/cache work; these costs do not vanish in a joint body.
             let endpoints = (key.3 >> 8) & 255;
