@@ -30,16 +30,19 @@ pub(super) type BatchGraphCache = BTreeMap<BatchGraphKey, (Handle, u64, usize)>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SharedGraphKey {
     pub operations: std::rc::Rc<Vec<crate::execution::Invocation>>,
-    pub addresses: Vec<u64>,
 }
 impl Ord for SharedGraphKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let operations = if std::rc::Rc::ptr_eq(&self.operations, &other.operations) {
+        if std::rc::Rc::ptr_eq(&self.operations, &other.operations) {
             std::cmp::Ordering::Equal
         } else {
             self.operations.cmp(&other.operations)
-        };
-        operations.then_with(|| self.addresses.cmp(&other.addresses))
+        }
+    }
+}
+impl std::borrow::Borrow<[crate::execution::Invocation]> for SharedGraphKey {
+    fn borrow(&self) -> &[crate::execution::Invocation] {
+        self.operations.as_slice()
     }
 }
 impl PartialOrd for SharedGraphKey {

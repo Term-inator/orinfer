@@ -1243,6 +1243,7 @@ impl Executor {
         let address = |name: &str| self.address(name, invocation.sequence, &invocation.views);
         match &invocation.operation {
             Operation::Kernel { name } => {
+                let prepare_at = Instant::now();
                 let direct = self.direct.as_ref().ok_or("Missing direct bindings")?;
                 let kernels = direct.kernels.borrow();
                 let k = kernels
@@ -1281,6 +1282,9 @@ impl Executor {
                 } else {
                     &k.spec
                 };
+                let mut stats = self.batch_statistics.get();
+                stats.kernel_prepare_s += prepare_at.elapsed().as_secs_f64();
+                self.batch_statistics.set(stats);
                 self.ensure_experts(spec, &values)?;
                 self.ensure_weights(spec)?;
                 super::launch_kernel(
@@ -1610,6 +1614,7 @@ impl Executor {
         expert_only: bool,
         pieces: Option<bool>,
     ) -> Result<()> {
+        let prepare_at = Instant::now();
         let mut regions = parallel_regions(
             operations,
             &self.parallel_regions.borrow(),
@@ -1632,6 +1637,9 @@ impl Executor {
                     })
             });
         }
+        let mut stats = self.batch_statistics.get();
+        stats.parallel_prepare_s += prepare_at.elapsed().as_secs_f64();
+        self.batch_statistics.set(stats);
         if regions.is_empty() {
             return self.piece_on(operations, self.session.stream, pieces);
         }
@@ -1831,11 +1839,21 @@ impl Executor {
             self.batch_statistics.set(stats);
         }
     }
-    fn shared_addresses(&self, op: &Invocation) -> Result<Option<Vec<u64>>> {
+    fn is_shared_operation(&self, op: &Invocation) -> Result<bool> {
         if op.sequence.is_some() {
-            return Ok(None);
+            return Ok(false);
         }
-        let names: Vec<&str> = match &op.operation {
+        let shared = |name: &str| -> Result<bool> {
+            let target = op.views.get(name).map_or(name, |view| view.buffer.as_str());
+            if self.pointers.is_private(target) {
+                return Ok(false);
+            }
+            if !self.pointers.contains_key(target) {
+                return Err("Unknown shared invocation buffer".into());
+            }
+            Ok(true)
+        };
+        match &op.operation {
             Operation::Kernel { name } => {
                 if self
                     .expert_cache
@@ -1843,50 +1861,49 @@ impl Executor {
                     .as_ref()
                     .is_some_and(|pager| pager.consumes(name))
                 {
-                    return Ok(None);
+                    return Ok(false);
                 }
                 let direct = self.direct.as_ref().ok_or("Missing direct bindings")?;
                 let kernels = direct.kernels.borrow();
                 let kernel = kernels.get(name).ok_or("Missing shared kernel")?;
-                let mut addresses = vec![];
                 for argument in &kernel.spec.args {
                     if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } = argument
+                        && !shared(name)?
                     {
-                        let target = op
-                            .views
-                            .get(name)
-                            .map_or(name.as_str(), |v| v.buffer.as_str());
-                        if self.pointers.is_private(target) {
-                            return Ok(None);
-                        }
-                        addresses.push(self.address(name, None, &op.views)?);
+                        return Ok(false);
                     }
                 }
-                return Ok(Some(addresses));
+                Ok(true)
             }
             Operation::Copy {
                 source,
                 destination,
                 ..
-            } => vec![source, destination],
-            Operation::Zero { destination, .. } => vec![destination],
-        };
-        if names.iter().any(|name| {
-            let target = op.views.get(*name).map_or(*name, |v| v.buffer.as_str());
-            self.pointers.is_private(target)
-        }) {
-            return Ok(None);
+            } => Ok(shared(source)? && shared(destination)?),
+            Operation::Zero { destination, .. } => shared(destination),
         }
-        names
-            .into_iter()
-            .map(|name| self.address(name, None, &op.views))
-            .collect::<Result<Vec<_>>>()
-            .map(Some)
     }
     /// Share stateless pieces across changing request membership. Private stages
     /// remain direct; pointer-table contents are uploaded before any replay.
     fn invoke_shared_pieces(&self, operations: &[Invocation], allow_capture: bool) -> Result<()> {
         self.invoke_shared_pieces_on(operations, allow_capture, self.session.stream)
+    }
+    fn launch_shared_graph(
+        &self,
+        graph: Handle,
+        stream: sys::CUstream,
+        reused: bool,
+    ) -> Result<()> {
+        // SAFETY: Cache admission accepts only session-owned names. Their
+        // addresses cannot be rebound; complete operation views form the key.
+        unsafe {
+            check(sys::cuGraphLaunch(graph, stream), "shared batch piece")?;
+        }
+        let mut stats = self.batch_statistics.get();
+        stats.graph_hits += usize::from(reused);
+        stats.shared_graph_hits += usize::from(reused);
+        self.batch_statistics.set(stats);
+        Ok(())
     }
     fn invoke_shared_pieces_on(
         &self,
@@ -1897,16 +1914,35 @@ impl Executor {
         use super::executor::SharedGraphKey;
         let mut cursor = 0;
         while cursor < operations.len() {
+            let prepare_at = Instant::now();
+            let record_prepare = || {
+                let mut stats = self.batch_statistics.get();
+                stats.shared_graph_prepare_s += prepare_at.elapsed().as_secs_f64();
+                self.batch_statistics.set(stats);
+            };
+            // A previous admission already checked every scope in this exact
+            // slice. Session addresses and kernel bindings are immutable, so a
+            // hit can replay without rebuilding its classification or key.
+            let cached_tail = self
+                .shared_graphs
+                .borrow_mut()
+                .get_mut(&operations[cursor..])
+                .map(|(graph, last)| {
+                    let tick = self.batch_graph_clock.get().wrapping_add(1);
+                    self.batch_graph_clock.set(tick);
+                    *last = tick;
+                    *graph
+                });
+            if let Some(graph) = cached_tail {
+                record_prepare();
+                return self.launch_shared_graph(graph, stream, true);
+            }
             let start = cursor;
-            let mut addresses = vec![];
-            while cursor < operations.len() {
-                let Some(mut pointers) = self.shared_addresses(&operations[cursor])? else {
-                    break;
-                };
-                addresses.append(&mut pointers);
+            while cursor < operations.len() && self.is_shared_operation(&operations[cursor])? {
                 cursor += 1;
             }
             if cursor == start {
+                record_prepare();
                 self.invoke_on(&operations[cursor], stream)?;
                 cursor += 1;
                 continue;
@@ -1914,36 +1950,44 @@ impl Executor {
             let piece = &operations[start..cursor];
             // Tiny pieces do not amortize instantiation or an extra graph launch.
             if !(8..=BATCH_GRAPH_NODES).contains(&piece.len()) {
+                record_prepare();
                 for op in piece {
                     self.invoke_on(op, stream)?;
                 }
                 continue;
             }
-            let key = SharedGraphKey {
-                operations: std::rc::Rc::new(piece.to_vec()),
-                addresses,
-            };
             let tick = self.batch_graph_clock.get().wrapping_add(1);
             self.batch_graph_clock.set(tick);
             let cached = self
                 .shared_graphs
                 .borrow_mut()
-                .get_mut(&key)
+                .get_mut(piece)
                 .map(|(graph, last)| {
                     *last = tick;
                     *graph
                 });
+            record_prepare();
             let graph = if let Some(graph) = cached {
                 Some(graph)
             } else {
-                let count = {
+                let (count, key) = {
                     let mut trials = self.shared_graph_trials.borrow_mut();
-                    if trials.len() >= 512 && !trials.contains_key(&key) {
+                    if trials.len() >= 512 && !trials.contains_key(piece) {
                         trials.clear();
                     }
-                    let count = trials.entry(key.clone()).or_default();
-                    *count += 1;
-                    *count
+                    let count = if let Some(count) = trials.get_mut(piece) {
+                        *count += 1;
+                        *count
+                    } else {
+                        trials.insert(
+                            SharedGraphKey {
+                                operations: std::rc::Rc::new(piece.to_vec()),
+                            },
+                            1,
+                        );
+                        1
+                    };
+                    (count, trials.get_key_value(piece).unwrap().0.clone())
                 };
                 if !allow_capture || count < 2 {
                     None
@@ -1962,15 +2006,7 @@ impl Executor {
                 }
             };
             if let Some(graph) = graph {
-                // SAFETY: All piece addresses are weights/workspace, retained by
-                // the session. Current resolved addresses are part of the key.
-                unsafe {
-                    check(sys::cuGraphLaunch(graph, stream), "shared batch piece")?;
-                }
-                let mut stats = self.batch_statistics.get();
-                stats.graph_hits += usize::from(cached.is_some());
-                stats.shared_graph_hits += usize::from(cached.is_some());
-                self.batch_statistics.set(stats);
+                self.launch_shared_graph(graph, stream, cached.is_some())?;
             } else {
                 for op in piece {
                     self.invoke_on(op, stream)?;
@@ -2212,12 +2248,9 @@ impl Executor {
         // A fully indirect plan captures only session-owned table/workspace
         // addresses. Changing request membership cannot invalidate those pointers.
         let shared = if !operations.is_empty() {
-            let mut addresses = Vec::new();
             let mut indirect = true;
             for call in operations {
-                if let Some(mut resolved) = self.shared_addresses(call)? {
-                    addresses.append(&mut resolved);
-                } else {
+                if !self.is_shared_operation(call)? {
                     indirect = false;
                     break;
                 }
@@ -2225,7 +2258,6 @@ impl Executor {
             if indirect {
                 Some(super::executor::SharedGraphKey {
                     operations: prepared.retain(),
-                    addresses,
                 })
             } else {
                 None
@@ -2684,8 +2716,20 @@ mod graph_cache_tests {
     fn indirect_graph_identity_tracks_shape_and_workspace_not_request_slots() {
         use super::super::executor::{BatchGraphKey, SharedGraphKey};
         let graph = SharedGraphKey {
-            operations: std::rc::Rc::new(vec![]),
-            addresses: vec![42],
+            operations: std::rc::Rc::new(vec![Invocation {
+                operation: Operation::Kernel {
+                    name: "shared".into(),
+                },
+                sequence: None,
+                launch: None,
+                views: BTreeMap::from([(
+                    "Input".into(),
+                    crate::execution::BufferView {
+                        buffer: "workspace".into(),
+                        offset: 0,
+                    },
+                )]),
+            }]),
         };
         let first = BatchGraphKey {
             operation: orinfer_model_sdk::abi::BatchOperation::Ordinary,
@@ -2695,7 +2739,11 @@ mod graph_cache_tests {
         };
         let mut next = first.clone();
         assert_eq!(first, next);
-        next.shared.as_mut().unwrap().addresses[0] = 43;
+        std::rc::Rc::make_mut(&mut next.shared.as_mut().unwrap().operations)[0]
+            .views
+            .get_mut("Input")
+            .unwrap()
+            .buffer = "other_workspace".into();
         assert_ne!(first, next);
         next = first.clone();
         next.rows = 3;
@@ -2733,35 +2781,40 @@ mod graph_cache_tests {
         assert!(prepared.matches(&retained));
         let key = super::super::executor::SharedGraphKey {
             operations: retained.clone(),
-            addresses: vec![42],
         };
         let mut equal = key.clone();
         assert_eq!(key.cmp(&equal), std::cmp::Ordering::Equal);
         equal.operations = std::rc::Rc::new(original.as_ref().clone());
         assert_eq!(key.cmp(&equal), std::cmp::Ordering::Equal);
-        equal.addresses[0] = 43;
-        assert_eq!(key.cmp(&equal), std::cmp::Ordering::Less);
+        let cache = BTreeMap::from([(key.clone(), 7)]);
+        assert_eq!(cache.get(original.as_slice()), Some(&7));
         let borrowed = BatchOperations {
             calls: &original,
             retained: None,
         };
         assert!(borrowed.matches(&retained));
         assert!(!std::rc::Rc::ptr_eq(&borrowed.retain(), &retained));
-        for field in 0..4 {
+        for field in 0..6 {
             let mut changed = original.as_ref().clone();
             match field {
                 0 => changed[0].launch.as_mut().unwrap().grid[0] = 3,
                 1 => changed[0].launch.as_mut().unwrap().arguments[0].1 = 3,
                 2 => changed[0].views.get_mut("Pointers").unwrap().offset = 24,
-                _ => changed[0].sequence = Some(7),
+                3 => changed[0].sequence = Some(7),
+                4 => changed[0].views.get_mut("Pointers").unwrap().buffer = "OtherPointers".into(),
+                _ => {
+                    changed[0].operation = Operation::Kernel {
+                        name: "other".into(),
+                    }
+                }
             }
             let changed = std::rc::Rc::new(changed);
             assert!(!prepared.matches(&changed));
             let changed_key = super::super::executor::SharedGraphKey {
-                operations: changed,
-                addresses: key.addresses.clone(),
+                operations: changed.clone(),
             };
             assert_ne!(key.cmp(&changed_key), std::cmp::Ordering::Equal);
+            assert!(!cache.contains_key(changed.as_slice()));
         }
     }
 
