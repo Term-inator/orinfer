@@ -5,7 +5,7 @@ mod weights;
 
 use super::{
     hccl::{Communicator, Element, RootInfo},
-    kernels::{Kernel, Program, Template},
+    kernels::{Kernel, Template},
     operators::{GroupedInputs, GroupedShape, GroupedW4A8},
     runtime::{Buffer, Limits, Session, Ticket},
 };
@@ -93,6 +93,7 @@ enum Instruction {
         experts: usize,
         buffers: [String; 6],
         workspace: String,
+        groups: Option<String>,
     },
     Route {
         indices: String,
@@ -117,12 +118,6 @@ enum Instruction {
 }
 enum Step {
     Graph(super::graph::Graph),
-    Reduce {
-        source: Buffer,
-        destination: Buffer,
-        elements: u64,
-        element: Element,
-    },
     W4(String),
     Route {
         indices: Buffer,
@@ -143,6 +138,19 @@ enum Step {
         buffer: Buffer,
     },
 }
+/// One launch inside a captured segment: kernels, HCCL SUM collectives and
+/// repeatable ACLNN grouped matmuls replay together inside one ACL Graph.
+#[derive(Clone)]
+enum SegmentOp {
+    Kernel(Kernel),
+    Reduce {
+        source: Buffer,
+        destination: Buffer,
+        elements: u64,
+        element: Element,
+    },
+    W4(Rc<GroupedW4A8>),
+}
 struct Execution {
     packet: Packet,
     body: Vec<Step>,
@@ -152,7 +160,7 @@ struct Worker {
     session: Session,
     comm: Communicator,
     buffers: BTreeMap<String, Buffer>,
-    w4: BTreeMap<String, GroupedW4A8>,
+    w4: BTreeMap<String, Rc<GroupedW4A8>>,
     packets: BTreeMap<usize, Execution>,
     checkpoint: Checkpoint,
     hasher: Hasher,
@@ -162,6 +170,7 @@ struct Worker {
     rank: u32,
     templates: BTreeMap<PathBuf, Rc<Template>>,
     phases: LoadPhases,
+    steps: BTreeMap<usize, packet::StepStats>,
 }
 
 /// Host-to-device chunk and pipeline depth; in-flight pinned memory stays
@@ -461,6 +470,7 @@ impl Worker {
             rank: rank.rank,
             templates: BTreeMap::new(),
             phases,
+            steps: BTreeMap::new(),
         };
         for packet in rank.packets {
             let body = worker.compile(&packet.body, package, snapshots)?;
@@ -505,7 +515,7 @@ impl Worker {
         snapshots: bool,
     ) -> Result<Vec<Step>> {
         let mut steps = vec![];
-        let mut pending = vec![];
+        let mut pending: Vec<SegmentOp> = vec![];
         for instruction in instructions {
             if let Instruction::Snapshot { name, buffer } = instruction {
                 // Snapshots only observe device state for tracing; without
@@ -537,72 +547,102 @@ impl Worker {
                     }
                 };
                 let t = Instant::now();
-                pending.push(Kernel::bind(&self.session, &template, &operands)?);
+                pending.push(SegmentOp::Kernel(Kernel::bind(
+                    &self.session,
+                    &template,
+                    &operands,
+                )?));
                 self.phases.binds.0 += 1;
                 self.phases.binds.1 += t.elapsed().as_secs_f64();
+                continue;
+            }
+            if let Instruction::Reduce {
+                source,
+                destination,
+                elements,
+                fp32,
+            } = instruction
+            {
+                let source = get(&self.buffers, source)?;
+                let destination = get(&self.buffers, destination)?;
+                let element = if *fp32 {
+                    Element::Float32
+                } else {
+                    Element::Bfloat16
+                };
+                self.check_reduce(&source, &destination, *elements, element)?;
+                pending.push(SegmentOp::Reduce {
+                    source,
+                    destination,
+                    elements: *elements,
+                    element,
+                });
+                continue;
+            }
+            if let Instruction::W4 {
+                name,
+                rows,
+                input,
+                output,
+                experts,
+                buffers,
+                workspace,
+                groups,
+            } = instruction
+            {
+                let b = buffers
+                    .iter()
+                    .map(|n| get(&self.buffers, n))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut ends = vec![0; *experts];
+                *ends.last_mut().ok_or("Empty W4 expert bank")? = *rows as i64;
+                let counts = match groups {
+                    Some(name) => Some(get(&self.buffers, name)?),
+                    None => None,
+                };
+                let t = Instant::now();
+                let plan = Rc::new(GroupedW4A8::prepare_with_workspace(
+                    &self.session,
+                    GroupedShape {
+                        rows: *rows,
+                        input: *input,
+                        output: *output,
+                        experts: *experts,
+                    },
+                    &ends,
+                    GroupedInputs {
+                        activation: &b[0],
+                        weight: &b[1],
+                        weight_scale: &b[2],
+                        assist: &b[3],
+                        token_scale: &b[4],
+                        output: &b[5],
+                    },
+                    Some(&get(&self.buffers, workspace)?),
+                    counts.as_ref(),
+                )?);
+                self.phases.aclnn.0 += 1;
+                self.phases.aclnn.1 += t.elapsed().as_secs_f64();
+                if self.w4.insert(name.clone(), Rc::clone(&plan)).is_some() {
+                    return Err("Duplicate W4 binding".into());
+                }
+                // The repeatable ACLNN executor bakes its group partition
+                // into the captured graph, so replays would keep using the
+                // counts present at capture time instead of the rows the
+                // in-graph regroup kernel writes. Enqueue at runtime; the
+                // capture path stays behind an explicit experiment switch.
+                if std::env::var_os("ORINFER_A2_W4_CAPTURE").is_some() {
+                    pending.push(SegmentOp::W4(plan));
+                } else {
+                    self.capture_pending(&mut pending, &mut steps)?;
+                    steps.push(Step::W4(name.clone()));
+                }
                 continue;
             }
             if !pending.is_empty() {
                 self.capture_pending(&mut pending, &mut steps)?;
             }
             steps.push(match instruction {
-                Instruction::Reduce {
-                    source,
-                    destination,
-                    elements,
-                    fp32,
-                } => Step::Reduce {
-                    source: get(&self.buffers, source)?,
-                    destination: get(&self.buffers, destination)?,
-                    elements: *elements,
-                    element: if *fp32 {
-                        Element::Float32
-                    } else {
-                        Element::Bfloat16
-                    },
-                },
-                Instruction::W4 {
-                    name,
-                    rows,
-                    input,
-                    output,
-                    experts,
-                    buffers,
-                    workspace,
-                } => {
-                    let b = buffers
-                        .iter()
-                        .map(|n| get(&self.buffers, n))
-                        .collect::<Result<Vec<_>>>()?;
-                    let mut ends = vec![0; *experts];
-                    *ends.last_mut().ok_or("Empty W4 expert bank")? = *rows as i64;
-                    let t = Instant::now();
-                    let plan = GroupedW4A8::prepare_with_workspace(
-                        &self.session,
-                        GroupedShape {
-                            rows: *rows,
-                            input: *input,
-                            output: *output,
-                            experts: *experts,
-                        },
-                        &ends,
-                        GroupedInputs {
-                            activation: &b[0],
-                            weight: &b[1],
-                            weight_scale: &b[2],
-                            assist: &b[3],
-                            token_scale: &b[4],
-                            output: &b[5],
-                        },
-                        Some(&get(&self.buffers, workspace)?),
-                    )?;
-                    self.phases.aclnn.0 += 1;
-                    self.phases.aclnn.1 += t.elapsed().as_secs_f64();
-                    if self.w4.insert(name.clone(), plan).is_some() {
-                        return Err("Duplicate W4 binding".into());
-                    }
-                    Step::W4(name.clone())
-                }
                 Instruction::Route {
                     indices,
                     gather,
@@ -628,7 +668,10 @@ impl Worker {
                     scales: get(&self.buffers, scales)?,
                     mask: get(&self.buffers, mask)?,
                 },
-                Instruction::Snapshot { .. } | Instruction::Kernel { .. } => unreachable!(),
+                Instruction::Snapshot { .. }
+                | Instruction::Kernel { .. }
+                | Instruction::Reduce { .. }
+                | Instruction::W4 { .. } => unreachable!(),
             });
         }
         if !pending.is_empty() {
@@ -637,23 +680,90 @@ impl Worker {
         Ok(steps)
     }
 
-    /// Captures one contiguous kernel run. Every segment executes once before
-    /// capture: CANN's first-use lazy state must exist before the capture
-    /// region records the launches, and skipping repeats of already-executed
-    /// templates produced invalid replay output.
-    fn capture_pending(&mut self, pending: &mut Vec<Kernel>, steps: &mut Vec<Step>) -> Result<()> {
-        let program = Program::new(&self.session, &pending.iter().collect::<Vec<_>>())?;
+    fn check_reduce(
+        &self,
+        source: &Buffer,
+        destination: &Buffer,
+        elements: u64,
+        element: Element,
+    ) -> Result<()> {
+        self.session.require(source)?;
+        self.session.require(destination)?;
+        if source.overlaps(destination) && source.pointer() != destination.pointer() {
+            return Err("HCCL AllReduce requires identical or disjoint spans".into());
+        }
+        let bytes = elements
+            .checked_mul(element.bytes())
+            .ok_or("HCCL reduction byte size overflow")?;
+        if elements == 0 || bytes > source.bytes() as u64 || bytes > destination.bytes() as u64 {
+            return Err("HCCL reduction outside buffer".into());
+        }
+        Ok(())
+    }
+
+    /// Captures one contiguous mixed run of kernels, collectives and grouped
+    /// matmuls. Every segment executes once before capture: CANN's first-use
+    /// lazy state must exist before the capture region records the launches,
+    /// and skipping repeats of already-executed templates produced invalid
+    /// replay output.
+    fn capture_pending(
+        &mut self,
+        pending: &mut Vec<SegmentOp>,
+        steps: &mut Vec<Step>,
+    ) -> Result<()> {
+        let stream = self.session.compute_stream();
+        let _current = self.session.context.enter()?;
         let t = Instant::now();
-        program.enqueue(&self.session)?.wait()?;
+        for op in pending.iter() {
+            self.submit_segment_op(op, stream)?;
+        }
+        self.session.synchronize()?;
         self.phases.warmups.0 += 1;
         self.phases.warmups.1 += t.elapsed().as_secs_f64();
+        let comm = self.comm.clone();
+        let ops = pending.clone();
         let t = Instant::now();
-        let graph = program.capture(&self.session)?;
+        // SAFETY: The keepalive segment retains every bound kernel, buffer,
+        // communicator and ACLNN plan used by the replayed launches; all
+        // addresses are stable for the lifetime of the captured graph.
+        let graph = unsafe {
+            super::graph::Graph::capture(&self.session, Box::new(ops.clone()), move |stream| {
+                for op in ops.iter() {
+                    match op {
+                        SegmentOp::Kernel(kernel) => kernel.launch_on_stream(stream)?,
+                        SegmentOp::Reduce {
+                            source,
+                            destination,
+                            elements,
+                            element,
+                        } => {
+                            comm.reduce_on_stream(stream, source, destination, *elements, *element)?
+                        }
+                        SegmentOp::W4(plan) => plan.execute_on_stream(stream)?,
+                    }
+                }
+                Ok(())
+            })?
+        };
         self.phases.captures.0 += 1;
         self.phases.captures.1 += t.elapsed().as_secs_f64();
         steps.push(Step::Graph(graph));
         pending.clear();
         Ok(())
+    }
+    fn submit_segment_op(&self, op: &SegmentOp, stream: super::api::Handle) -> Result<()> {
+        match op {
+            SegmentOp::Kernel(kernel) => kernel.launch_on_stream(stream),
+            SegmentOp::Reduce {
+                source,
+                destination,
+                elements,
+                element,
+            } => self
+                .comm
+                .reduce_on_stream(stream, source, destination, *elements, *element),
+            SegmentOp::W4(plan) => plan.execute_on_stream(stream),
+        }
     }
     fn reset(&self) -> Result<()> {
         for execution in self.packets.values() {
@@ -789,6 +899,7 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                     experts,
                     buffers: bindings,
                     workspace,
+                    groups,
                     ..
                 } = instruction
                 {
@@ -814,6 +925,9 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
                         || buffers
                             .get(workspace)
                             .is_none_or(|&bytes| bytes < 100663808)
+                        || groups
+                            .as_ref()
+                            .is_some_and(|name| buffers.get(name).copied() != Some(experts * 8))
                     {
                         return Err("W4 packet operand/workspace extent differs".into());
                     }

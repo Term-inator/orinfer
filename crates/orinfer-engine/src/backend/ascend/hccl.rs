@@ -157,7 +157,7 @@ impl Element {
             Self::Bfloat16 => 11,
         }
     }
-    fn bytes(self) -> u64 {
+    pub(super) fn bytes(self) -> u64 {
         match self {
             Self::Int8 => 1,
             Self::Bfloat16 => 2,
@@ -242,6 +242,7 @@ impl Drop for NativeComm {
         std::mem::forget(Arc::clone(&self.api));
     }
 }
+#[derive(Clone)]
 pub struct Communicator {
     native: Rc<NativeComm>,
     rank: u32,
@@ -341,6 +342,34 @@ impl Communicator {
                 },
             )
         }
+    }
+    /// Submits one validated SUM collective on an explicit stream. Used by
+    /// captured segments that replay the collective inside an ACL Graph.
+    pub(super) fn reduce_on_stream(
+        &self,
+        stream: super::api::Handle,
+        source: &Buffer,
+        destination: &Buffer,
+        count: u64,
+        element: Element,
+    ) -> Result<()> {
+        let native = &self.native;
+        // SAFETY: The caller validated extents and datatype when the segment
+        // was compiled; buffers are retained by the captured graph.
+        native.status(
+            unsafe {
+                (native.api.reduce)(
+                    source.pointer(),
+                    destination.pointer(),
+                    count,
+                    element.native(),
+                    0,
+                    native.handle,
+                    stream,
+                )
+            },
+            "HCCL AllReduce",
+        )
     }
     pub fn all_to_all_v(
         &self,

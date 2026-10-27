@@ -2,7 +2,7 @@ use super::{Step, Worker, get, upload};
 use crate::{artifact::Result, backend::ascend::runtime::Buffer};
 use safetensors::Dtype;
 use serde::Deserialize;
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Instant};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +27,28 @@ pub(super) struct Coordinates {
 pub(super) struct Best {
     pub value: f32,
     pub token: u32,
+}
+
+/// Per-row-count execution accounting for one request segment. All seconds
+/// are wall time on this rank's worker thread; counts are per forward.
+#[derive(Default)]
+pub(super) struct StepStats {
+    forwards: usize,
+    coordinate_s: f64,
+    hash_s: f64,
+    body_s: f64,
+    head_s: f64,
+    download_s: f64,
+    graph: (usize, f64),
+    reduce: (usize, f64),
+    w4: (usize, f64),
+    route: (usize, f64),
+    route_dl: (usize, f64),
+    route_cpu: (usize, f64),
+    route_up: (usize, f64),
+    route_grp: (usize, f64),
+    lookup: (usize, f64),
+    embed: (usize, f64),
 }
 
 fn ints(values: &[i32]) -> Vec<u8> {
@@ -126,32 +148,54 @@ impl Worker {
             .remove(&rows)
             .ok_or_else(|| format!("No A2 packet for {rows} rows"))?;
         let result = (|| {
+            let t = Instant::now();
             self.coordinate(&execution.packet.coordinates, history.len(), rows)?;
+            let coordinate = t.elapsed().as_secs_f64();
+            let t = Instant::now();
             let mut hashes = vec![];
             let mut valid = vec![];
             self.hasher
                 .hash_into(history, tokens, &mut hashes, &mut valid)?;
+            let hash = t.elapsed().as_secs_f64();
+            let t = Instant::now();
             for step in &execution.body {
                 self.step(step, tokens, &hashes, &valid, history.len(), trace)?;
             }
+            let body = t.elapsed().as_secs_f64();
             if !logits {
                 self.session.synchronize()?;
+                let stats = self.steps.entry(rows).or_default();
+                stats.forwards += 1;
+                stats.coordinate_s += coordinate;
+                stats.hash_s += hash;
+                stats.body_s += body;
                 return Ok(None);
             }
+            let t = Instant::now();
             for step in &execution.head {
                 self.step(step, tokens, &hashes, &valid, history.len(), trace)?;
             }
+            let head = t.elapsed().as_secs_f64();
+            let t = Instant::now();
             let raw_value =
                 self.session
                     .download(&get(&self.buffers, &execution.packet.best_value)?, 0, 4)?;
             let raw_index =
                 self.session
                     .download(&get(&self.buffers, &execution.packet.best_index)?, 0, 4)?;
+            let download = t.elapsed().as_secs_f64();
             let value = f32::from_le_bytes(raw_value.try_into().unwrap());
             let local = i32::from_le_bytes(raw_index.try_into().unwrap());
             if !value.is_finite() || !(0..16160).contains(&local) {
                 return Err("Nonfinite/invalid native model output".into());
             }
+            let stats = self.steps.entry(rows).or_default();
+            stats.forwards += 1;
+            stats.coordinate_s += coordinate;
+            stats.hash_s += hash;
+            stats.body_s += body;
+            stats.head_s += head;
+            stats.download_s += download;
             Ok(Some(Best {
                 value,
                 token: execution.packet.vocab_first + local as u32,
@@ -160,7 +204,113 @@ impl Worker {
         self.packets.insert(rows, execution);
         result
     }
+    /// Prints and clears per-row-count step accounting for this rank.
+    pub(super) fn report_steps(&mut self) {
+        for (rows, s) in std::mem::take(&mut self.steps) {
+            if s.forwards == 0 {
+                continue;
+            }
+            let n = s.forwards as f64;
+            let ms = |v: f64| v * 1000.0 / n;
+            let each = |c: (usize, f64)| (c.0 as f64 / n, c.1 * 1000.0 / n);
+            let (gn, gt) = each(s.graph);
+            let (rn, rt) = each(s.reduce);
+            let (wn, wt) = each(s.w4);
+            let (un, ut) = each(s.route);
+            let (ln, lt) = each(s.lookup);
+            eprintln!(
+                "A2 rank {} rows={rows} x{} avg: coordinate={:.2}ms hash={:.3}ms body={:.2}ms head={:.2}ms dl={:.2}ms | graph {:.0}x{:.3}ms reduce {:.0}x{:.3}ms w4 {:.0}x{:.3}ms route {:.0}x{:.2}ms(dl={:.2} cpu={:.3} up={:.2} grp={:.2}) lookup {:.0}x{:.2}ms embed={:.3}ms",
+                self.rank,
+                s.forwards,
+                ms(s.coordinate_s),
+                ms(s.hash_s),
+                ms(s.body_s),
+                ms(s.head_s),
+                ms(s.download_s),
+                gn,
+                gt,
+                rn,
+                rt,
+                wn,
+                wt,
+                un,
+                ut,
+                ms(s.route_dl.1),
+                ms(s.route_cpu.1),
+                ms(s.route_up.1),
+                ms(s.route_grp.1),
+                ln,
+                lt,
+                ms(s.embed.1),
+            );
+        }
+    }
     fn step(
+        &mut self,
+        step: &Step,
+        tokens: &[u32],
+        hashes: &[i64],
+        valid: &[bool],
+        position: usize,
+        trace: Option<&Path>,
+    ) -> Result<()> {
+        // Synchronized profiling isolates device execution per step type by
+        // fencing after every submission; it changes timing, not values.
+        if std::env::var_os("ORINFER_A2_SYNC_PROFILE").is_some() {
+            let t = Instant::now();
+            let submission = match step {
+                Step::Graph(program) => program.enqueue(&self.session).map(|_| ()),
+                Step::W4(name) => self
+                    .w4
+                    .get(name)
+                    .ok_or("W4 binding missing".to_string())
+                    .and_then(|plan| plan.enqueue(&self.session).map(|_| ())),
+                _ => Ok(()),
+            };
+            let result = submission.and_then(|()| self.session.synchronize());
+            let elapsed = t.elapsed().as_secs_f64();
+            let stats = self.steps.entry(tokens.len()).or_default();
+            match step {
+                Step::Graph(_) => {
+                    stats.graph.0 += 1;
+                    stats.graph.1 += elapsed;
+                }
+                Step::W4(_) => {
+                    stats.w4.0 += 1;
+                    stats.w4.1 += elapsed;
+                }
+                _ => {}
+            }
+            return result;
+        }
+        let t = Instant::now();
+        let result = self.step_inner(step, tokens, hashes, valid, position, trace);
+        let elapsed = t.elapsed().as_secs_f64();
+        let rows = tokens.len();
+        let stats = self.steps.entry(rows).or_default();
+        match step {
+            Step::Graph(_) => {
+                stats.graph.0 += 1;
+                stats.graph.1 += elapsed;
+            }
+            Step::W4(_) => {}
+            Step::Route { .. } => {
+                stats.route.0 += 1;
+                stats.route.1 += elapsed;
+            }
+            Step::Lookup { .. } => {
+                stats.lookup.0 += 1;
+                stats.lookup.1 += elapsed;
+            }
+            Step::Embed(_) => {
+                stats.embed.0 += 1;
+                stats.embed.1 += elapsed;
+            }
+            Step::Snapshot { .. } => {}
+        }
+        result
+    }
+    fn step_inner(
         &mut self,
         step: &Step,
         tokens: &[u32],
@@ -172,20 +322,6 @@ impl Worker {
         match step {
             Step::Graph(program) => {
                 program.enqueue(&self.session)?;
-            }
-            Step::Reduce {
-                source,
-                destination,
-                elements,
-                element,
-            } => {
-                self.comm.all_reduce_sum(
-                    &self.session,
-                    source,
-                    destination,
-                    *elements,
-                    *element,
-                )?;
             }
             Step::W4(name) => {
                 self.w4
@@ -200,7 +336,10 @@ impl Worker {
                 groups,
                 rows,
             } => {
+                let t = Instant::now();
                 let ids = self.session.download(indices, 0, indices.bytes())?;
+                let dl = t.elapsed().as_secs_f64();
+                let t = Instant::now();
                 let ids = ids
                     .as_chunks::<4>()
                     .0
@@ -237,17 +376,31 @@ impl Worker {
                     }
                     *end = count as i64;
                 }
+                let cpu = t.elapsed().as_secs_f64();
                 // Unreferenced zero rows pad the fixed expert packet. Their
                 // final bank is never restored into a real token output.
                 ends[47] = (rows * 6) as i64;
+                let t = Instant::now();
                 upload(&self.session, gather, &ints(&selected))?;
                 upload(&self.session, restore, &ints(&map))?;
+                let up = t.elapsed().as_secs_f64();
+                let t = Instant::now();
                 for name in groups {
                     self.w4
                         .get(name)
                         .ok_or("Routed W4 binding missing")?
                         .update_groups(&self.session, &ends)?;
                 }
+                let grp = t.elapsed().as_secs_f64();
+                let stats = self.steps.entry(*rows).or_default();
+                stats.route_dl.0 += 1;
+                stats.route_dl.1 += dl;
+                stats.route_cpu.0 += 1;
+                stats.route_cpu.1 += cpu;
+                stats.route_up.0 += 1;
+                stats.route_up.1 += up;
+                stats.route_grp.0 += 1;
+                stats.route_grp.1 += grp;
             }
             Step::Embed(destination) => {
                 let embedding = self.checkpoint.read("embed.weight")?;

@@ -313,16 +313,19 @@ impl GroupedW4A8 {
         ends: &[i64],
         input: GroupedInputs<'_>,
     ) -> Result<Self> {
-        Self::prepare_with_workspace(session, shape, ends, input, None)
+        Self::prepare_with_workspace(session, shape, ends, input, None, None)
     }
     /// Plans on this session's single compute stream may share one stable
     /// workspace allocation. Parallel branches require disjoint workspaces.
+    /// An external `groups` buffer lets a device kernel own the per-expert
+    /// row counts instead of host uploads through update_groups.
     pub fn prepare_with_workspace(
         session: &Session,
         shape: GroupedShape,
         ends: &[i64],
         input: GroupedInputs<'_>,
         workspace: Option<&Buffer>,
+        groups: Option<&Buffer>,
     ) -> Result<Self> {
         shape.validate(ends)?;
         let buffers = [
@@ -348,6 +351,15 @@ impl GroupedW4A8 {
                 return Err("ACLNN workspace must not alias an operand".into());
             }
         }
+        if let Some(groups) = groups {
+            session.require(groups)?;
+            if groups.bytes() != shape.experts * 8 {
+                return Err("External W4A8 group counts extent differs".into());
+            }
+            if buffers.iter().any(|buffer| buffer.overlaps(groups)) {
+                return Err("External W4A8 groups must not alias an operand".into());
+            }
+        }
         session.synchronize()?;
         let _current = session.context.enter()?;
         let api = Api::load()?;
@@ -370,8 +382,18 @@ impl GroupedW4A8 {
             .map(|tensor| TensorList::new(&api, vec![tensor]))
             .collect::<Result<Vec<_>>>()?;
         let group_data = group_counts(ends);
-        let group_buffer = session.allocate(group_data.len())?;
-        session.upload(&group_buffer, 0, &group_data)?.wait()?;
+        let owned;
+        let group_buffer = match groups {
+            Some(external) => {
+                session.upload(external, 0, &group_data)?.wait()?;
+                external.clone()
+            }
+            None => {
+                owned = session.allocate(group_data.len())?;
+                session.upload(&owned, 0, &group_data)?.wait()?;
+                owned
+            }
+        };
         let groups = Tensor::new(&api, &group_buffer, &[e], 9, 64)?;
         let (mut workspace_bytes, mut executor) = (0u64, ptr::null_mut());
         check(
@@ -528,6 +550,29 @@ impl GroupedW4A8 {
         }?;
         *self.last.borrow_mut() = Some(ticket.clone());
         Ok(ticket)
+    }
+    /// Submits the repeatable executor on an explicit stream without a
+    /// completion fence. Used by captured segments that replay the grouped
+    /// matmul inside an ACL Graph.
+    pub(super) fn execute_on_stream(&self, stream: super::api::Handle) -> Result<()> {
+        let prepared = &self.prepared;
+        let workspace = prepared
+            .workspace
+            .as_ref()
+            .map_or(ptr::null_mut(), Buffer::pointer);
+        // SAFETY: Prepared owns every operand, workspace and executor; the
+        // captured graph retains it through capture and every replay.
+        check(
+            unsafe {
+                (prepared.api.execute)(
+                    workspace,
+                    prepared.workspace_bytes as u64,
+                    prepared.executor,
+                    stream,
+                )
+            },
+            "execute ACLNN grouped W4A8",
+        )
     }
 }
 

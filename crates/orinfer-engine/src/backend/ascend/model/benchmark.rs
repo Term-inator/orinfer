@@ -135,8 +135,12 @@ pub fn run(
                 let mut history = vec![];
                 while let Ok(command) = commands.recv() {
                     let result = match command {
-                        Command::Stop => break,
+                        Command::Stop => {
+                            worker.report_steps();
+                            break;
+                        }
                         Command::Reset => {
+                            worker.report_steps();
                             history.clear();
                             worker.reset().map(|_| None)
                         }

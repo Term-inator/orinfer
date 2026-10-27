@@ -716,16 +716,26 @@ class Builder:
         expert_rows = rows * 6
         gather = self.temp("expert.gather", (expert_rows,), "i32")
         restore = self.temp("expert.restore", (rows, 8), "i32")
+        counts = self.temp(f"L{layer}.counts", (48,), "i64")
+        route_errors = self.temp("route.errors", (rows + 1,), "i32")
         up_name, down_name = f"{self.prefix}L{layer}.up", f"{self.prefix}L{layer}.down"
-        self.steps.append(
+        self.kernel(
+            routing,
+            "regroup",
             {
-                "op": "route",
-                "indices": indices,
-                "gather": gather,
-                "restore": restore,
-                "groups": [up_name, down_name],
                 "rows": rows,
-            }
+                "experts": 384,
+                "local": 48,
+                "selected": 6,
+                "base": self.rank * 48,
+            },
+            [
+                ("indices", indices, "i32", (rows, 8), "read"),
+                ("gather", gather, "i32", (expert_rows,), "write"),
+                ("restore", restore, "i32", (rows, 8), "write"),
+                ("counts", counts, "i64", (48,), "write"),
+                ("errors", route_errors, "i32", (rows + 1,), "write"),
+            ],
         )
         gathered = self.temp("expert.input", (expert_rows, 5120), "i8")
         gathered_scale = self.temp("expert.input.scale", (expert_rows,), "f32")
@@ -794,6 +804,7 @@ class Builder:
                 "experts": 48,
                 "buffers": [gathered, *definitions[0][3], gathered_scale, packed_output],
                 "workspace": workspace,
+                "groups": counts,
             }
         )
         activation = self.temp("expert.act", (expert_rows, 2304))
@@ -817,6 +828,7 @@ class Builder:
                 "experts": 48,
                 "buffers": [down8, *definitions[1][3], down_scale, expert_output],
                 "workspace": workspace,
+                "groups": counts,
             }
         )
         routed = self.temp("expert.local", (rows, 5120), "f32")

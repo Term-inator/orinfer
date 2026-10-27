@@ -85,3 +85,55 @@ def route(rows, experts=384, selected=6, routed_scale=1.5):
                 T.copy(ow[0, :], weights[row, :])
 
     return main
+
+
+def regroup(rows, experts=384, local=48, selected=6, base=0):
+    """Regroup router indices into expert-major rows for this rank.
+
+    The scan order matches the host reference exactly: local experts in
+    ascending order, then token row, then route lane. Unmatched gather lanes
+    stay -1 and the final local expert absorbs the fixed zero-row padding,
+    so the grouped matmul, gather and combine inputs are byte-identical to
+    the host-routed packet. Only the first `selected` lanes carry routes.
+    """
+    lanes = (selected + 7) // 8 * 8
+    packed = rows * selected
+
+    @T.prim_func
+    def main(
+        indices: T.Tensor((rows, lanes), "int32"),
+        gather: T.Tensor((packed,), "int32"),
+        restore: T.Tensor((rows, lanes), "int32"),
+        counts: T.Tensor((local,), "int64"),
+        errors: T.Tensor((rows + 1,), "int32"),
+    ):
+        with T.Kernel(1, is_npu=True) as (cid, vid):
+            flag = T.alloc_ub((8,), "int32")
+            flag[0] = 0
+            # The scan counter lives in the last errors slot: a global scalar
+            # read-modify-write, because this codegen cannot pre-allocate a
+            # unified-buffer cell that only scalar code mutates.
+            errors[rows] = 0
+            for slot in T.serial(packed):
+                gather[slot] = -1
+            for row in T.serial(rows):
+                for lane in T.serial(lanes):
+                    restore[row, lane] = -1
+            for expert in T.serial(local):
+                begin = errors[rows]
+                for row in T.serial(rows):
+                    for lane in T.serial(selected):
+                        if indices[row, lane] == base + expert:
+                            position = errors[rows]
+                            gather[position] = row
+                            restore[row, lane] = position
+                            errors[rows] = position + 1
+                counts[expert] = T.cast(errors[rows] - begin, "int64")
+            counts[local - 1] = counts[local - 1] + T.cast(packed - errors[rows], "int64")
+            for row in T.serial(rows):
+                for lane in T.serial(selected):
+                    if indices[row, lane] < 0 or indices[row, lane] >= experts:
+                        flag[0] = 1
+            T.copy(flag[:1], errors[0:1])
+
+    return main

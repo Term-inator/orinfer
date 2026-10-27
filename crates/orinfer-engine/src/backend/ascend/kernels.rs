@@ -195,6 +195,7 @@ impl Bound {
     }
 }
 
+#[derive(Clone)]
 pub struct Kernel {
     bound: Rc<Bound>,
 }
@@ -286,6 +287,11 @@ impl Kernel {
     }
     pub fn template(&self) -> &Rc<Template> {
         &self.bound.template
+    }
+    /// Submits this kernel on an explicit stream without a completion fence.
+    /// Used by captured segments that replay the launch inside an ACL Graph.
+    pub(super) fn launch_on_stream(&self, stream: Handle) -> Result<()> {
+        self.bound.launch(stream)
     }
     pub fn enqueue(&self, session: &Session) -> Result<Ticket> {
         session.same_context(&self.bound.context)?;

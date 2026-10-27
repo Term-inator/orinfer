@@ -180,6 +180,7 @@ fn matmul_k(
             output: &y,
         },
         workspace.as_ref(),
+        None,
     )?;
     if workspace.is_none() {
         *workspace = plan.workspace();

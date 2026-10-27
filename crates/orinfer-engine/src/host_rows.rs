@@ -1,6 +1,6 @@
 //! Immutable conditional-memory row stores and deterministic ownership plans.
 use crate::artifact::Result;
-use memmap2::{Mmap, MmapOptions};
+use memmap2::MmapOptions;
 use safetensors::{Dtype, SafeTensors};
 use std::{collections::HashMap, fs::File, path::Path};
 pub mod validation;
@@ -94,7 +94,7 @@ impl RowPlan {
 }
 
 struct Plane {
-    mapping: Mmap,
+    file: File,
     start: usize,
     row_bytes: usize,
     rows: usize,
@@ -103,7 +103,7 @@ impl Plane {
     fn open(path: &Path, tensor: &str, dtype: Dtype) -> Result<Self> {
         let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         // SAFETY: Deployment assets are immutable for this read-only mapping's
-        // lifetime. No tensor slice escapes the retained mapping.
+        // lifetime. The header mapping is dropped before any row reads.
         let mapping = unsafe { MmapOptions::new().map(&file) }.map_err(|e| e.to_string())?;
         let (header, metadata) = SafeTensors::read_metadata(&mapping).map_err(|e| e.to_string())?;
         let info = metadata.info(tensor).ok_or("Missing host-row tensor")?;
@@ -113,21 +113,31 @@ impl Plane {
         let rows = info.shape[0];
         let row_bytes = (info.data_offsets.1 - info.data_offsets.0) / rows;
         let start = 8 + header + info.data_offsets.0;
+        drop(mapping);
         Ok(Self {
-            mapping,
+            file,
             start,
             row_bytes,
             rows,
         })
     }
-    fn row(&self, row: usize) -> &[u8] {
+    /// pread one row into an exact slice. ZFS mmap page-fault readiness
+    /// contends badly when several rank threads randomly read a
+    /// multi-hundred-GiB table, while positional reads resolve through the
+    /// ARC without that contention.
+    fn read_row_at(&self, row: usize, target: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        if target.len() != self.row_bytes {
+            return Err("Host-row read target extent differs".into());
+        }
         let begin = self.start + row * self.row_bytes;
-        &self.mapping[begin..begin + self.row_bytes]
+        self.file
+            .read_exact_at(target, begin as u64)
+            .map_err(|e| e.to_string())
     }
 }
 
-/// Exact byte-preserving INT8 rows plus FP32 group scales. mmap does not
-/// register the complete table with ACL or force global NUMA page migration.
+/// Exact byte-preserving INT8 rows plus FP32 group scales, read positionally.
 pub struct Int8Rows {
     weight: Plane,
     scale: Plane,
@@ -170,7 +180,10 @@ impl Int8Rows {
     }
     /// Packet layout is [unique row, INT8 values followed by FP32 scales].
     /// All IDs and the budget are checked before modifying the destination.
+    /// Rows resolve in parallel: the backing table is a random-read store,
+    /// and cache-miss stalls from sequential reads would idle the device.
     pub fn gather_into(&self, ids: &[u64], out: &mut Vec<u8>, max_bytes: usize) -> Result<()> {
+        use rayon::prelude::*;
         let bytes = ids
             .len()
             .checked_mul(self.row_bytes)
@@ -180,13 +193,19 @@ impl Int8Rows {
             self.shard.local(row)?;
         }
         out.clear();
-        out.reserve(bytes);
-        for &row in ids {
-            let row = usize::try_from(row).map_err(|_| "Host row offset overflow")?;
-            out.extend_from_slice(self.weight.row(row));
-            out.extend_from_slice(self.scale.row(row));
-        }
-        Ok(())
+        out.resize(bytes, 0);
+        let weight_bytes = self.weight.row_bytes;
+        let result: Result<()> =
+            out.par_chunks_mut(self.row_bytes)
+                .enumerate()
+                .try_for_each(|(index, packet)| {
+                    let row =
+                        usize::try_from(ids[index]).map_err(|_| "Host row offset overflow")?;
+                    let (values, scales) = packet.split_at_mut(weight_bytes);
+                    self.weight.read_row_at(row, values)?;
+                    self.scale.read_row_at(row, scales)
+                });
+        result
     }
 }
 
