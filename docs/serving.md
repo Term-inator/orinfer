@@ -10,7 +10,7 @@
 
 服务加载一次模型，由单个 GPU worker 执行请求。CPU 使用模型目录中的 `tokenizer.json`、`chat_template.jinja` 和 `generation_config.json` 渲染模板及分词；在线推理直接使用 Rust 运行时和预编译 kernel。
 
-权重加载采用并行读取和有界的 pinned 缓冲区，并与异步 GPU 上传重叠。`--load-workers N` 可设置 1–32 个读取线程；默认按可用 CPU 核心选择，最多 4 个。Session 复用读取线程和暂存缓冲，暂存内存最多 256 MiB，在模型销毁前等待读取及 DMA 完成后释放。开启 `--verify-weights` 时使用完整校验路径，启动较慢。
+权重加载采用并行读取和有界的 pinned 缓冲区，并与异步 GPU 上传重叠。`--load-workers N` 可设置 1–32 个读取线程；默认按可用 CPU 核心选择，最多 4 个。Session 复用读取线程和暂存缓冲，暂存内存最多 256 MiB。源字节读取完成后，末尾 DMA 保留在 Session 的 stream 中，后续同 stream 计算按序消费；缓冲复用前等待对应事件，跨 stream 的 dense 权重交接保留显式同步。模型销毁前等待读取及 DMA 完成后释放暂存缓冲。开启 `--verify-weights` 时使用完整校验路径，启动较慢。
 
 执行包中的全部 kernel 资产仍校验 hash；普通文本、配置的 MTP、视觉及小 batch 计划预加载 CUDA 模块，其余计划在首次使用时加载，并在 CUDA Graph 捕获前完成绑定。延迟加载的形状会在首次执行时承担模块加载开销。
 
@@ -37,7 +37,7 @@
 
 本项目的 x86_64/SM120 独显部署按 CUDA 空闲显存校验请求状态、KV 和工作区，主机缓存与有界前处理采用各自预算。主机 RAM 与 GPU 显存分别计费，swap 不增加显存容量。
 
-紧凑专家池复用跨层全局 SLRU，淘汰后直接复用物理槽位；地址表按真实路由在计算 stream 上提交，上传完成前保留原始压缩字节和 scale 的完整性。`run-model` 的 `expert_cache` 报告包含 `route_wait_s`、`transition_s`、`upload_s`、`read_wait_s`、`dma_wait_s` 和 `upload_chunks`：读取/DMA等待是上传耗时的组成部分，路由等待包含此前 GPU 计算的完成时间；这些值用于定位成本，完整请求性能以实际生成结果与总耗时验收。
+紧凑专家池复用跨层全局 SLRU，淘汰后直接复用物理槽位；地址表按真实路由在计算 stream 上提交，上传完成前保留原始压缩字节和 scale 的完整性。`run-model` 的 `expert_cache` 报告包含 `route_wait_s`、`transition_s`、`upload_s`、`read_wait_s`、`dma_wait_s` 和 `upload_chunks`：读取及槽位复用时的 DMA 等待是上传提交耗时的组成部分；末尾传输可与后续 CPU 提交重叠，路由等待包含此前 GPU 计算和传输的完成时间；这些值用于定位成本，完整请求性能以实际生成结果与总耗时验收。
 
 `reader_service_s` 和 `file_read_s` 分别累计各读取线程的服务时间与文件读取时间；`host_cache` 的 `lock_wait_s`、`metadata_s`、`copy_s` 和 `fill_s` 累计互斥锁等待、文件身份检查、命中复制和缓存填充耗时。这些线程累计值可以相互重叠，不能与上传墙钟时间相加。
 

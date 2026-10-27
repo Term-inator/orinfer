@@ -198,9 +198,16 @@ impl Pager {
             });
         }
         drop(buffers);
-        // Upload reuses session-owned bounded staging and confirms DMA completion
-        // before returning, so either stream may consume the tensor.
+        // Dense consumers may run on either stream. Finish the main-stream
+        // upload before handing this bank to those consumers.
         weight_upload::upload(session, uploads, self.workers)?;
+        // SAFETY: The session owns this stream and all pending upload slots.
+        unsafe {
+            check(
+                sys::cuStreamSynchronize(session.stream),
+                "dense weight upload",
+            )?;
+        }
         Ok(())
     }
 }

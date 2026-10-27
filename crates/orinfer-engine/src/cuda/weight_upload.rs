@@ -83,10 +83,33 @@ struct Slot {
     event: sys::CUevent,
     registered: bool,
 }
+impl Slot {
+    fn completed(&self, wait: bool) -> Result<Option<f64>> {
+        // SAFETY: The CUDA owner retains this event and its registered slot.
+        unsafe {
+            let status = sys::cuEventQuery(self.event);
+            if status == sys::CUresult::CUDA_ERROR_NOT_READY {
+                if !wait {
+                    return Ok(None);
+                }
+                let at = Instant::now();
+                check(
+                    sys::cuEventSynchronize(self.event),
+                    "weight upload completion",
+                )?;
+                Ok(Some(at.elapsed().as_secs_f64()))
+            } else {
+                check(status, "weight upload completion query")?;
+                Ok(Some(0.))
+            }
+        }
+    }
+}
 pub(super) struct Staging {
     stream: sys::CUstream,
     pending: bool,
     slots: Vec<Slot>,
+    in_flight: VecDeque<usize>,
     readers: Option<Readers>,
 }
 impl Drop for Staging {
@@ -140,6 +163,7 @@ impl Staging {
             stream: session.stream,
             pending: false,
             slots: Vec::with_capacity(count),
+            in_flight: VecDeque::new(),
             readers: None,
         };
         for _ in 0..count {
@@ -446,6 +470,8 @@ impl Reader {
     }
 }
 
+/// Submit all source bytes on the session stream. Staging owns pending DMA;
+/// consumers use that stream, and CPU readback must synchronize it explicitly.
 pub(super) fn upload(
     session: &Session,
     uploads: Vec<Upload>,
@@ -517,21 +543,32 @@ fn upload_with_cache(
             )?;
         }
         pool.pending = false;
+        pool.in_flight.clear();
     }
     let staging_s = staging_at.elapsed().as_secs_f64();
-    let mut pending = uploads.into_iter().flat_map(|upload| {
-        let source = Arc::new(upload.source);
-        let destination = upload.destination;
-        (0..source.bytes).step_by(PAYLOAD_BYTES).map(move |offset| {
-            let bytes = (source.bytes - offset).min(PAYLOAD_BYTES);
-            (
-                Arc::clone(&source),
-                offset,
-                bytes,
-                destination + offset as u64,
-            )
+    let mut previous_dma_wait_s = 0.;
+    // Successful calls can leave their last transfers queued. Delay this wait
+    // until slots are needed again, allowing the owner to submit GPU consumers.
+    while let Some(&index) = pool.in_flight.front() {
+        previous_dma_wait_s += pool.slots[index].completed(true)?.unwrap();
+        pool.in_flight.pop_front();
+    }
+    let mut pending = uploads
+        .into_iter()
+        .flat_map(|upload| {
+            let source = Arc::new(upload.source);
+            let destination = upload.destination;
+            (0..source.bytes).step_by(PAYLOAD_BYTES).map(move |offset| {
+                let bytes = (source.bytes - offset).min(PAYLOAD_BYTES);
+                (
+                    Arc::clone(&source),
+                    offset,
+                    bytes,
+                    destination + offset as u64,
+                )
+            })
         })
-    });
+        .peekable();
     if pool
         .readers
         .as_ref()
@@ -543,6 +580,7 @@ fn upload_with_cache(
         pool.readers = Some(Readers::new(workers, pool.slots.len())?);
     }
     pool.pending = true;
+    let mut in_flight = VecDeque::new();
     let result = {
         let readers = pool.readers.as_ref().unwrap();
         let jobs_tx = readers.jobs.as_ref().unwrap();
@@ -570,9 +608,9 @@ fn upload_with_cache(
         (|| {
             let mut active = 0;
             let mut reading = 0;
-            let mut in_flight = VecDeque::new();
             let mut statistics = Statistics {
                 staging_s,
+                dma_wait_s: previous_dma_wait_s,
                 ..Default::default()
             };
             for slot in 0..pool.slots.len() {
@@ -582,24 +620,10 @@ fn upload_with_cache(
             while active != 0 {
                 while let Some(&index) = in_flight.front() {
                     let slot: &Slot = &pool.slots[index];
-                    // SAFETY: Only the CUDA owner queries events. A completed
-                    // event releases this slot for a new CPU read, never sooner.
-                    unsafe {
-                        let status = sys::cuEventQuery(slot.event);
-                        if status == sys::CUresult::CUDA_ERROR_NOT_READY {
-                            if reading != 0 {
-                                break;
-                            }
-                            let at = Instant::now();
-                            check(
-                                sys::cuEventSynchronize(slot.event),
-                                "weight upload completion",
-                            )?;
-                            statistics.dma_wait_s += at.elapsed().as_secs_f64();
-                        } else {
-                            check(status, "weight upload completion query")?;
-                        }
-                    }
+                    let Some(wait_s) = slot.completed(reading == 0)? else {
+                        break;
+                    };
+                    statistics.dma_wait_s += wait_s;
                     in_flight.pop_front();
                     if enqueue(index, &mut pending)? {
                         reading += 1;
@@ -639,6 +663,9 @@ fn upload_with_cache(
                 }
                 in_flight.push_back(job.slot);
                 statistics.chunks += 1;
+                if reading == 0 && pending.peek().is_none() {
+                    break;
+                }
             }
             Ok(statistics)
         })()
@@ -649,7 +676,9 @@ fn upload_with_cache(
         drop(pool.readers.take());
     }
     if result.is_ok() {
-        // Every slot's DMA event completed before active reached zero.
+        // All reads completed. Events retain the last DMA slots until their
+        // next reuse; Session cleanup also synchronizes before releasing them.
+        pool.in_flight = in_flight;
         pool.pending = false;
     }
     if let (Some(cache), Ok(statistics)) = (cache, &result) {
@@ -788,6 +817,12 @@ mod tests {
             .unwrap();
         }
         session.buffers.push(destination);
+        let mut snapshot = 0;
+        // SAFETY: Session owns this separate consumer destination.
+        unsafe {
+            check(sys::cuMemAlloc_v2(&mut snapshot, bytes), "test snapshot").unwrap();
+        }
+        session.buffers.push(snapshot);
         let source = TensorSource {
             path: file.path().into(),
             offset: 173,
@@ -795,7 +830,7 @@ mod tests {
         };
         let mut slots = None;
         for round in 0..3 {
-            let data: Vec<_> = (0..bytes).map(|i| (i * 37 + round * 19) as u8).collect();
+            let mut data: Vec<_> = (0..bytes).map(|i| (i * 37 + round * 19) as u8).collect();
             fs::write(file.path(), &data).unwrap();
             let statistics = upload(
                 &session,
@@ -807,6 +842,53 @@ mod tests {
             )
             .unwrap();
             assert_eq!(statistics.chunks, 3);
+            assert!(
+                !session
+                    .weight_staging
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .in_flight
+                    .is_empty()
+            );
+            // Queue a consumer before immediately reusing staging for changed
+            // bytes. It must observe the first upload even without a CPU wait.
+            // SAFETY: Both destinations cover this range on the upload stream.
+            unsafe {
+                check(
+                    sys::cuMemcpyDtoDAsync_v2(snapshot, destination, source.bytes, session.stream),
+                    "test ordered consumer",
+                )
+                .unwrap();
+            }
+            let original = data;
+            data = original.iter().map(|v| v.wrapping_add(11)).collect();
+            fs::write(file.path(), &data).unwrap();
+            upload(
+                &session,
+                vec![Upload {
+                    source: source.clone(),
+                    destination,
+                }],
+                1,
+            )
+            .unwrap();
+            let mut consumed = vec![0; source.bytes];
+            // SAFETY: Finish both uploads and the intervening consumer before
+            // reading its complete destination into this CPU allocation.
+            unsafe {
+                check(
+                    sys::cuStreamSynchronize(session.stream),
+                    "test ordered upload ready",
+                )
+                .unwrap();
+                check(
+                    sys::cuMemcpyDtoH_v2(consumed.as_mut_ptr().cast(), snapshot, consumed.len()),
+                    "test ordered readback",
+                )
+                .unwrap();
+            }
+            assert_eq!(consumed, original[173..]);
             let pointers: Vec<_> = session
                 .weight_staging
                 .borrow()
@@ -822,8 +904,13 @@ mod tests {
                 slots = Some(pointers);
             }
             let mut result = vec![0; source.bytes];
-            // SAFETY: Upload completed all DMA; both ranges cover source.bytes.
+            // SAFETY: Synchronize the upload stream before CPU readback.
             unsafe {
+                check(
+                    sys::cuStreamSynchronize(session.stream),
+                    "test upload ready",
+                )
+                .unwrap();
                 check(
                     sys::cuMemcpyDtoH_v2(result.as_mut_ptr().cast(), destination, result.len()),
                     "test readback",
@@ -1032,9 +1119,13 @@ mod gpu_tests {
             )
             .unwrap();
             let mut readback = vec![0u8; source.bytes];
-            // SAFETY: Upload synchronizes every staging event before returning;
-            // source and destination cover the complete tensor extent.
+            // SAFETY: Synchronize the upload stream; both ranges cover the tensor.
             unsafe {
+                check(
+                    sys::cuStreamSynchronize(session.stream),
+                    "test upload ready",
+                )
+                .unwrap();
                 check(
                     sys::cuMemcpyDtoH_v2(readback.as_mut_ptr().cast(), destination, readback.len()),
                     "test readback",
@@ -1058,9 +1149,13 @@ mod gpu_tests {
             let stats = upload(&session, pieces, workers).unwrap();
             assert_eq!(stats.chunks, 97);
             let mut compact = vec![0u8; 97 * 137];
-            // SAFETY: The complete upload drained all slot events and the
-            // registered destination covers this compact readback extent.
+            // SAFETY: Synchronize queued uploads before reading this complete extent.
             unsafe {
+                check(
+                    sys::cuStreamSynchronize(session.stream),
+                    "test upload ready",
+                )
+                .unwrap();
                 check(
                     sys::cuMemcpyDtoH_v2(compact.as_mut_ptr().cast(), destination, compact.len()),
                     "test scattered readback",
@@ -1096,8 +1191,13 @@ mod gpu_tests {
         )
         .unwrap();
         let mut output = vec![0u8; source.bytes];
-        // SAFETY: Cache-backed and direct uploads both completed their DMA.
+        // SAFETY: Synchronize queued cache-backed uploads before CPU readback.
         unsafe {
+            check(
+                sys::cuStreamSynchronize(session.stream),
+                "test upload ready",
+            )
+            .unwrap();
             check(
                 sys::cuMemcpyDtoH_v2(output.as_mut_ptr().cast(), destination, output.len()),
                 "test cache readback",

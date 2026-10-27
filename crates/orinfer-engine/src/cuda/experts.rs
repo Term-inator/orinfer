@@ -702,6 +702,14 @@ mod gpu_tests {
                     "Initialized bytes survive logical eviction while a neighbor owns the page"
                 );
             }
+            // SAFETY: Uploaded weights are queued on this owned stream.
+            unsafe {
+                check(
+                    sys::cuStreamSynchronize(s.stream),
+                    "test expert upload ready",
+                )
+                .unwrap();
+            }
             for expert in wanted {
                 let reservations = s.expert_buffers.borrow();
                 for (name, width) in [("weights", stride), ("scales", 17)] {
