@@ -70,6 +70,16 @@ bash tools/operators/run.sh tools/model/sampling.py artifacts/sampling-build \
 
 Rust 执行器为大块共享工作区保留 CUDA 虚拟地址，在首次上传或执行依赖程序前映射并清零物理内存，保留映射供 Graph replay 使用。文本启动可延后视觉、音频和采样 scratch 的物理分配；请求准入预留尚未映射的计算工作区与采样行。`LOAD STAGES.deferred_workspace_bytes` 记录启动时延后的逻辑字节，scheduler 的 `batch_execution` 记录映射次数、物理字节、耗时及实际采样 packet／行数。该运行时优化可加载已有匹配执行包；批量采样需重建采样包并配合当前引擎使用。
 
+Flash Next 行程序保留形状规划器已有的共享 prefill 临时存储身份。已有 target-only 包可通过正式构建入口合并 QSA 的 `Out/Max/Den` 暂存区：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/workspace-build \
+  --model artifacts/models/source-model \
+  --model-output artifacts/models/model-with-shared-workspace --workspace-only
+```
+
+该步骤匹配相同 kernel 资产、导出 ABI 和完整存储几何，检查相邻生产／消费算子的全部用途；涉及跨层存活、请求状态、侧 stream 或额外用途时返回错误。构建器移除重复 buffer，重新生成 Rust 绑定库并原子发布，权重与算子算术保持一致。本机已测 target-only 包减少 774 MiB 逻辑工作区，长 prefill 的物理映射减少 776 MiB（CUDA 映射粒度为 2 MiB）；短请求按需映射的字节可能保持相同，准入仍为后续工作区保留预算。重建后应验证完整 logits、分层 prefill 暂停期间执行混合 packet、请求隔离、取消复用和 prefix 恢复，再按实际请求选择专家常驻容量。
+
 Qwen3_5 的 `gdn_execution` 明确声明 prefill 的 sequential/chunked 策略，以及 decode 的 dense/deferred 策略和日志容量；构建、验证、恢复与提交消费同一契约。原生适配器依据显式契约校验策略及其全部状态和工作区。Attention 的 INT8 读取与临时 FP16 KV 暂存候选按完整流水线实测选择，以小行数、非对齐尾部和大 prefill 的实测结果决定选择区间。
 
 `auxiliary_tuning.py` 可为已有原生包测量并发布 MoE top-k、QSA 选择和 FP16 PLE norm/gate 融合，参数为 `--model`、`--model-output` 和 `--output`；`--families router` 只处理共享 MoE 路由。Flash Next 正式 `build.py` 包含该步骤，Qwen3_5 构建器复用同一 MoE 调优器。几何来自 checkpoint 签名及物理 buffer 视图，支持展开或扁平 workspace；数值、尾部和 Graph 检查通过后才参与选择。QSA 与 PLE 汇总多长度测量选择一个配置，Rust 适配器验证完整生产者链后应用融合并生成执行顺序。

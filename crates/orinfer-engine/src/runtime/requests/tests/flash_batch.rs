@@ -251,6 +251,10 @@ fn validate_layered_prefill() {
         &fixture.model,
         LoadOptions {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            resident_experts: fixture
+                .resident_experts
+                .map_or(Default::default(), crate::execution::ResidentExperts::Count),
+            host_weight_cache_bytes: 16usize << 30,
             prefix_cache_bytes: 0,
             mtp_drafts: fixture.mtp_drafts,
             ..Default::default()
@@ -326,9 +330,15 @@ fn validate_layered_prefill() {
                     another.input_tokens.truncate(short_chunk);
                     another.input_tokens[0] = alternate_token;
                     let mut other = model.start_request(another, &|| false).unwrap();
+                    let mixed_before = model.scheduler_statistics.mixed_iterations;
                     model
-                        .with_request(&mut other, |m, r| m.advance_prefill(r, short_chunk, false))
+                        .execute_selected(
+                            &mut [&mut decoder, &mut other],
+                            &[(0, 1), (1, short_chunk)],
+                            &mut vec![],
+                        )
                         .unwrap();
+                    assert!(model.scheduler_statistics.mixed_iterations > mixed_before);
                     model.finish_request(&mut other, false).unwrap();
                 }
             }
@@ -1258,6 +1268,10 @@ fn validate_flash_mixed_segments() {
         &fixture.model,
         LoadOptions {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            resident_experts: fixture
+                .resident_experts
+                .map_or(Default::default(), crate::execution::ResidentExperts::Count),
+            host_weight_cache_bytes: 16usize << 30,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..Default::default()
@@ -1542,7 +1556,16 @@ fn validate_flash_prefix_cache() {
         let mut warm = model.start_request(input(source, 4), &|| false).unwrap();
         assert_eq!(
             warm.prefix.statistics.cached_tokens,
-            source.input_tokens.len()
+            source.input_tokens.len(),
+            "Prefix retention: budget={}, retained={}, lengths={:?}",
+            model.prefix_cache.budget,
+            model.prefix_cache.bytes,
+            model
+                .prefix_cache
+                .entries
+                .values()
+                .map(|entry| entry.tokens.len())
+                .collect::<Vec<_>>()
         );
         let mut actual = vec![];
         while !warm.is_finished() {

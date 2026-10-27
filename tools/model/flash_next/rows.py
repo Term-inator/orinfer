@@ -164,7 +164,8 @@ class Rows:
                             role
                         ]
                     else:
-                        name = f"FlashRows{rows}_Scratch{len(storage_names)}"
+                        # Preserve the planner's existing shared prefill storage.
+                        name = old or f"FlashRows{rows}_Scratch{len(storage_names)}"
                         count = tensor.untyped_storage().nbytes()
                     if name not in self.b.buffers:
                         from tools.model.flash_next.bindings import DTYPES
