@@ -3,11 +3,11 @@ use crate::artifact::Result;
 use memmap2::MmapMut;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::Metadata,
     os::unix::fs::MetadataExt,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Condvar},
 };
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -53,6 +53,7 @@ pub struct Statistics {
     pub peak_resident_bytes: usize,
     pub lookups: u64,
     pub hits: u64,
+    pub coalesced_reads: u64,
     pub requested_bytes: u64,
     pub hit_bytes: u64,
     pub evictions: u64,
@@ -68,6 +69,7 @@ impl Statistics {
         Self {
             lookups: self.lookups - before.lookups,
             hits: self.hits - before.hits,
+            coalesced_reads: self.coalesced_reads - before.coalesced_reads,
             requested_bytes: self.requested_bytes - before.requested_bytes,
             hit_bytes: self.hit_bytes - before.hit_bytes,
             evictions: self.evictions - before.evictions,
@@ -89,6 +91,8 @@ pub(super) struct Cache {
     entries: HashMap<Key, Entry>,
     order: BTreeMap<u64, Key>,
     clock: u64,
+    pending: HashSet<Key>,
+    pub ready: Arc<Condvar>,
     banks: BTreeMap<(std::path::PathBuf, usize), usize>,
     pub statistics: Statistics,
 }
@@ -98,6 +102,8 @@ impl Cache {
             entries: HashMap::new(),
             order: BTreeMap::new(),
             clock: 0,
+            pending: HashSet::new(),
+            ready: Arc::new(Condvar::new()),
             banks: BTreeMap::new(),
             statistics: Statistics {
                 capacity_bytes: capacity,
@@ -110,14 +116,22 @@ impl Cache {
     pub fn acquire(&mut self, key: &Key, requested_bytes: usize) -> Option<Arc<MmapMut>> {
         self.statistics.lookups += 1;
         self.statistics.requested_bytes += requested_bytes as u64;
+        let payload = self.lease(key)?;
+        self.statistics.hits += 1;
+        self.statistics.hit_bytes += requested_bytes as u64;
+        Some(payload)
+    }
+    /// A waiter already counted its request before joining an in-progress fill.
+    pub fn lease(&mut self, key: &Key) -> Option<Arc<MmapMut>> {
         let entry = self.entries.get_mut(key)?;
         self.order.remove(&entry.stamp);
         self.clock += 1;
         entry.stamp = self.clock;
         self.order.insert(entry.stamp, key.clone());
-        self.statistics.hits += 1;
-        self.statistics.hit_bytes += requested_bytes as u64;
         Some(Arc::clone(&entry.payload))
+    }
+    pub fn is_pending(&self, key: &Key) -> bool {
+        self.pending.contains(key)
     }
     /// Small declared expert tensors can share one cached bank. Register only
     /// extents that fit the uploader; the cache budget still decides admission.
@@ -174,7 +188,10 @@ impl Cache {
     }
     pub fn reserve(&mut self, key: &Key) -> Result<bool> {
         let charge = key.charge();
-        if self.entries.contains_key(key) || charge > self.statistics.capacity_bytes {
+        if self.entries.contains_key(key)
+            || self.pending.contains(key)
+            || charge > self.statistics.capacity_bytes
+        {
             return Ok(false);
         }
         while self.statistics.resident_bytes + self.statistics.pending_bytes + charge
@@ -196,6 +213,7 @@ impl Cache {
             self.statistics.resident_bytes -= entry.charge;
             self.statistics.evictions += 1;
         }
+        self.pending.insert(key.clone());
         self.statistics.pending_bytes += charge;
         self.statistics.peak_resident_bytes = self
             .statistics
@@ -204,7 +222,9 @@ impl Cache {
         Ok(true)
     }
     pub fn cancel(&mut self, key: &Key) {
+        assert!(self.pending.remove(key));
         self.statistics.pending_bytes -= key.charge();
+        self.ready.notify_all();
     }
     pub fn commit(&mut self, key: Key, data: MmapMut) -> Result<()> {
         let charge = key.charge();

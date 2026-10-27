@@ -302,6 +302,29 @@ fn cache_lock(
     guard
 }
 
+/// Cancel on every read/allocation error so waiting readers can finish too.
+struct CacheFill<'a> {
+    cache: &'a Mutex<host_weights::Cache>,
+    key: host_weights::Key,
+    active: bool,
+}
+impl CacheFill<'_> {
+    fn commit(mut self, data: memmap2::MmapMut, fill_s: f64) -> Result<()> {
+        let mut guard = cache_lock(self.cache);
+        guard.statistics.fill_s += fill_s;
+        let result = guard.commit(self.key.clone(), data);
+        self.active = false;
+        result
+    }
+}
+impl Drop for CacheFill<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            cache_lock(self.cache).cancel(&self.key);
+        }
+    }
+}
+
 impl Reader {
     /// Reuse shard descriptors and accept EOF tails on sector-aligned direct reads.
     fn read(
@@ -345,20 +368,42 @@ impl Reader {
                 source.path.display()
             ));
         }
-        let mut key =
-            cache.map(|_| host_weights::Key::new(&source.path, &metadata, absolute, bytes));
+        let mut fill = None;
         let mut read_absolute = absolute;
         let mut read_bytes = bytes;
         if let Some(cache) = cache {
-            let (resolved, payload) = {
+            let (resolved, payload, reserved) = {
                 let mut guard = cache_lock(cache);
                 guard.statistics.metadata_s += metadata_s;
-                let resolved = guard.resolve(key.take().unwrap());
-                let payload = guard.acquire(&resolved, bytes);
-                (resolved, payload)
+                let resolved = guard.resolve(host_weights::Key::new(
+                    &source.path,
+                    &metadata,
+                    absolute,
+                    bytes,
+                ));
+                let mut payload = guard.acquire(&resolved, bytes);
+                if payload.is_none() && guard.is_pending(&resolved) {
+                    guard.statistics.coalesced_reads += 1;
+                    loop {
+                        let ready = Arc::clone(&guard.ready);
+                        guard = ready.wait(guard).unwrap();
+                        payload = guard.lease(&resolved);
+                        if payload.is_some() || !guard.is_pending(&resolved) {
+                            break;
+                        }
+                    }
+                }
+                let reserved = payload.is_none() && guard.reserve(&resolved)?;
+                (resolved, payload, reserved)
             };
             (read_absolute, read_bytes) = resolved.extent();
-            key = Some(resolved);
+            if reserved {
+                fill = Some(CacheFill {
+                    cache,
+                    key: resolved,
+                    active: true,
+                });
+            }
             if let Some(payload) = payload {
                 if target.len() < bytes {
                     return Err("Weight chunk exceeds staging slot".into());
@@ -380,25 +425,15 @@ impl Reader {
         {
             return Err("Weight bank exceeds its file or staging extent".into());
         }
-        let store = |skip: usize, target: &[u8]| -> Result<usize> {
-            if let Some((cache, key)) = cache.zip(key.as_ref())
-                && cache_lock(cache).reserve(key)?
-            {
-                // Reserve first, then fault/copy pages without holding the
-                // shared cache lock. All workers' pending bytes are billed.
-                let fill_at = Instant::now();
-                let mut data = match memmap2::MmapMut::map_anon(read_bytes) {
-                    Ok(data) => data,
-                    Err(error) => {
-                        cache_lock(cache).cancel(key);
-                        return Err(format!("Host weight cache allocation: {error}"));
-                    }
-                };
+        let mut store = |skip: usize, target: &[u8]| -> Result<usize> {
+            if let Some(fill) = fill.take() {
+                // The complete fill was reserved before I/O. Other readers
+                // wait without holding the mutex, then lease these exact bytes.
+                let at = Instant::now();
+                let mut data = memmap2::MmapMut::map_anon(read_bytes)
+                    .map_err(|error| format!("Host weight cache allocation: {error}"))?;
                 data.copy_from_slice(&target[skip..skip + read_bytes]);
-                let fill_s = fill_at.elapsed().as_secs_f64();
-                let mut guard = cache_lock(cache);
-                guard.statistics.fill_s += fill_s;
-                guard.commit(key.clone(), data)?;
+                fill.commit(data, at.elapsed().as_secs_f64())?;
             }
             Ok(skip + absolute - read_absolute)
         };
@@ -784,6 +819,125 @@ mod tests {
                 .read(&source, 0, source.bytes, &mut target, Some(&cache))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn concurrent_bank_read_reuses_the_pending_fill() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), [7u8; 32768]).unwrap();
+        let source = TensorSource {
+            path: file.path().into(),
+            offset: 0,
+            bytes: 32768,
+        };
+        let key =
+            host_weights::Key::new(file.path(), &file.as_file().metadata().unwrap(), 0, 32768);
+        let cache = Arc::new(Mutex::new(host_weights::Cache::new(1 << 20)));
+        assert!(cache.lock().unwrap().reserve(&key).unwrap());
+        let (done, completed) = mpsc::channel();
+        let reader_cache = Arc::clone(&cache);
+        let thread = std::thread::spawn(move || {
+            let mut reader = Reader::default();
+            let mut target = memmap2::MmapMut::map_anon(SLOT_BYTES).unwrap();
+            let skip = reader
+                .read(&source, 0, 32768, &mut target, Some(&reader_cache))
+                .unwrap();
+            assert!(target[skip..skip + 32768].iter().all(|&x| x == 7));
+            done.send(reader.file_read_s).unwrap();
+        });
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while cache.lock().unwrap().statistics.lookups == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let mut payload = memmap2::MmapMut::map_anon(32768).unwrap();
+        payload.fill(7);
+        cache.lock().unwrap().commit(key, payload).unwrap();
+        let disk_s = completed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            disk_s, 0.,
+            "A pending complete-bank fill must avoid another disk read"
+        );
+        assert_eq!(cache.lock().unwrap().statistics.pending_bytes, 0);
+    }
+
+    #[test]
+    fn cancelled_bank_fill_wakes_waiters_and_read_errors_release_reservations() {
+        for remove in [false, true] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            fs::write(file.path(), [9u8; 32768]).unwrap();
+            let source = TensorSource {
+                path: file.path().into(),
+                offset: 0,
+                bytes: 32768,
+            };
+            let key =
+                host_weights::Key::new(file.path(), &file.as_file().metadata().unwrap(), 0, 32768);
+            let cache = Arc::new(Mutex::new(host_weights::Cache::new(1 << 20)));
+            assert!(cache.lock().unwrap().reserve(&key).unwrap());
+            let fill = CacheFill {
+                cache: &cache,
+                key,
+                active: true,
+            };
+            let (done, completed) = mpsc::channel();
+            let reader_cache = Arc::clone(&cache);
+            let thread = std::thread::spawn(move || {
+                let mut reader = Reader::default();
+                let mut target = memmap2::MmapMut::map_anon(SLOT_BYTES).unwrap();
+                let result = reader
+                    .read(&source, 0, 32768, &mut target, Some(&reader_cache))
+                    .map(|skip| target[skip..skip + 32768].iter().all(|&x| x == 9));
+                done.send(result).unwrap();
+            });
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while cache.lock().unwrap().statistics.coalesced_reads == 0 {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            if remove {
+                fs::remove_file(file.path()).unwrap();
+            }
+            drop(fill);
+            let result = completed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            thread.join().unwrap();
+            assert_eq!(result.is_err(), remove);
+            if !remove {
+                assert!(result.unwrap());
+            }
+            assert_eq!(cache.lock().unwrap().statistics.pending_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn cache_fill_bounds_error_cancels_its_claim() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), [1u8; 4096]).unwrap();
+        let source = TensorSource {
+            path: file.path().into(),
+            offset: 0,
+            bytes: 4096,
+        };
+        let cache = Mutex::new(host_weights::Cache::new(1 << 20));
+        let mut reader = Reader::default();
+        assert!(
+            reader
+                .read(&source, 0, 4096, &mut [0; 32], Some(&cache))
+                .is_err()
+        );
+        assert_eq!(cache.lock().unwrap().statistics.pending_bytes, 0);
+        let mut target = memmap2::MmapMut::map_anon(SLOT_BYTES).unwrap();
+        assert!(
+            reader
+                .read(&source, 0, 4096, &mut target, Some(&cache))
+                .is_ok()
+        );
+        assert_eq!(cache.lock().unwrap().statistics.pending_bytes, 0);
     }
 
     #[test]
@@ -1210,6 +1364,87 @@ mod gpu_tests {
             3,
             "File changes invalidate cached bytes"
         );
+        // A reader waiting on a shared bank must also leave a failed upload
+        // when the leader cancels and the underlying file becomes unreadable.
+        let joined = Arc::new(Mutex::new(host_weights::Cache::new(1 << 20)));
+        let bank = TensorSource {
+            path: path.clone(),
+            offset: 173,
+            bytes: 32768,
+        };
+        let key = host_weights::Key::new(
+            &path,
+            &std::fs::metadata(&path).unwrap(),
+            bank.offset,
+            bank.bytes,
+        );
+        joined.lock().unwrap().register_bank(&bank);
+        assert!(joined.lock().unwrap().reserve(&key).unwrap());
+        let other = Arc::clone(&joined);
+        let changed_path = path.clone();
+        let cancel = std::thread::spawn(move || {
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while other.lock().unwrap().statistics.coalesced_reads == 0 {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            std::fs::write(changed_path, []).unwrap();
+            other.lock().unwrap().cancel(&key);
+        });
+        let row = TensorSource {
+            path: path.clone(),
+            offset: bank.offset + 17,
+            bytes: 131,
+        };
+        assert!(
+            upload_experts(
+                &session,
+                vec![Upload {
+                    source: row.clone(),
+                    destination
+                }],
+                4,
+                &joined
+            )
+            .is_err()
+        );
+        cancel.join().unwrap();
+        assert_eq!(joined.lock().unwrap().statistics.pending_bytes, 0);
+        assert!(
+            session
+                .weight_staging
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .readers
+                .is_none()
+        );
+        std::fs::write(&path, &changed).unwrap();
+        upload_experts(
+            &session,
+            vec![Upload {
+                source: row.clone(),
+                destination,
+            }],
+            4,
+            &joined,
+        )
+        .unwrap();
+        let mut restored = vec![0; row.bytes];
+        // SAFETY: The same owner stream completes before this bounded readback.
+        unsafe {
+            check(
+                sys::cuStreamSynchronize(session.stream),
+                "test restored cache upload",
+            )
+            .unwrap();
+            check(
+                sys::cuMemcpyDtoH_v2(restored.as_mut_ptr().cast(), destination, restored.len()),
+                "test restored cache readback",
+            )
+            .unwrap();
+        }
+        assert_eq!(restored, changed[row.offset..row.offset + row.bytes]);
         std::fs::remove_file(path).unwrap();
     }
 }
