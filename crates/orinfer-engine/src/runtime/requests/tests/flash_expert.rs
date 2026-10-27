@@ -82,7 +82,8 @@ fn validate_flash_compact_expert_owners() {
         &fixture.model,
         LoadOptions {
             resident_experts: crate::execution::ResidentExperts::Count(8),
-            host_weight_cache_bytes: 16usize << 30,
+            // Force real host eviction and CPU/GPU coverage transitions.
+            host_weight_cache_bytes: 256usize << 20,
             cuda_graph: crate::execution::CudaGraphMode::Off,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
@@ -202,7 +203,11 @@ fn validate_flash_compact_expert_owners() {
         assert_eq!(stats.dynamic_graph_captures, 0);
         assert!(model.execution.graphs.borrow().is_empty());
     }
-    std::fs::write(fixture.output,serde_json::to_vec_pretty(&json!({"owners":2,"reverse_admission":true,"cancelled_arena_reuse":true,"batch_shrink":true,"logits_and_committed_state_exact":true,"serial_reference":true,"expert_parallel_branches":branches})).unwrap()).unwrap();
+    let host = model.expert_cache_statistics().unwrap().host_cache;
+    assert!(host.evictions > 0 && host.gpu_priority_evictions > 0);
+    assert_eq!(host.pending_bytes, 0);
+    assert!(host.resident_bytes <= host.capacity_bytes);
+    std::fs::write(fixture.output,serde_json::to_vec_pretty(&json!({"owners":2,"reverse_admission":true,"cancelled_arena_reuse":true,"batch_shrink":true,"logits_and_committed_state_exact":true,"serial_reference":true,"host_cache_pressure":true,"gpu_priority_evictions":host.gpu_priority_evictions,"expert_parallel_branches":branches})).unwrap()).unwrap();
 }
 
 #[test]

@@ -246,6 +246,7 @@ pub(super) struct Pager {
     clock: u64,
     workers: usize,
     host_cache: Arc<Mutex<host_weights::Cache>>,
+    host_priority: bool,
     pub statistics: Statistics,
     poisoned: bool,
 }
@@ -292,6 +293,7 @@ impl Pager {
             clock: 0,
             workers,
             host_cache: Arc::new(Mutex::new(host_cache)),
+            host_priority: false,
             statistics: Statistics {
                 capacity_experts: plan.capacity,
                 mapped_bytes,
@@ -315,25 +317,54 @@ impl Pager {
         }
         Ok(pages)
     }
+    fn host_residency(&self, key: Key, present: bool) -> Result<()> {
+        let bank = &self.banks[key.0];
+        let mut cache = self.host_cache.lock().unwrap();
+        for name in &bank.buffers {
+            let source = &self.sources[name];
+            // Whole small banks (scales) are shared by many GPU owners.
+            if source.bytes <= weight_upload::PAYLOAD_BYTES {
+                continue;
+            }
+            let stride = source.bytes / bank.experts;
+            let first = source
+                .offset
+                .checked_add(key.1 * stride)
+                .ok_or("Host residency range overflow")?;
+            for offset in (0..stride).step_by(weight_upload::PAYLOAD_BYTES) {
+                cache.set_gpu_resident(
+                    &source.path,
+                    first + offset,
+                    (stride - offset).min(weight_upload::PAYLOAD_BYTES),
+                    present,
+                )?;
+            }
+        }
+        Ok(())
+    }
     fn release(&mut self, s: &Session, key: Key) -> Result<()> {
         if let Some(slots) = &mut self.slots {
-            return slots.release(key);
-        }
-        for page in self.pages(s, key)? {
-            let n = self
-                .refs
-                .get_mut(&page)
-                .ok_or("Lost expert page ownership")?;
-            if n.owners == 1 {
-                s.expert_buffers
-                    .borrow_mut()
-                    .get_mut(&page.0)
-                    .unwrap()
-                    .unmap_page(s, page.1)?;
-                self.refs.remove(&page);
-            } else {
-                n.owners -= 1;
+            slots.release(key)?;
+        } else {
+            for page in self.pages(s, key)? {
+                let n = self
+                    .refs
+                    .get_mut(&page)
+                    .ok_or("Lost expert page ownership")?;
+                if n.owners == 1 {
+                    s.expert_buffers
+                        .borrow_mut()
+                        .get_mut(&page.0)
+                        .unwrap()
+                        .unmap_page(s, page.1)?;
+                    self.refs.remove(&page);
+                } else {
+                    n.owners -= 1;
+                }
             }
+        }
+        if self.host_priority {
+            self.host_residency(key, false)?;
         }
         Ok(())
     }
@@ -375,6 +406,7 @@ impl Pager {
             self.release(s, key)?;
         }
         let mut uploads = vec![];
+        let mut loaded = vec![];
         for &key in &wanted {
             self.clock = self
                 .clock
@@ -391,6 +423,9 @@ impl Pager {
                     self.prob.insert(old, self.clock);
                 }
                 continue;
+            }
+            if self.host_priority {
+                loaded.push(key);
             }
             let capacity = self.statistics.capacity_experts;
             if self.prob.keys.len() + self.hot.keys.len() >= capacity
@@ -473,6 +508,24 @@ impl Pager {
         let uploaded = weight_upload::upload_experts(s, uploads, self.workers, &self.host_cache)?;
         if let Some(slots) = &self.slots {
             slots.publish(s, bank, self.banks[bank].experts)?;
+        }
+        // Only staged sources are GPU-covered. First enable priority after
+        // actual host eviction pressure; fitting CPU working sets stay on LRU.
+        if !self.host_priority && self.host_cache.lock().unwrap().statistics.evictions > 0 {
+            self.host_priority = true;
+            for &key in self
+                .prob
+                .keys
+                .keys()
+                .chain(self.hot.keys.keys())
+                .chain(self.transient.iter())
+            {
+                self.host_residency(key, true)?;
+            }
+        } else if self.host_priority {
+            for key in loaded {
+                self.host_residency(key, true)?;
+            }
         }
         self.statistics.host_cache = self.host_cache.lock().unwrap().statistics;
         self.statistics.upload_s += upload_at.elapsed().as_secs_f64();
