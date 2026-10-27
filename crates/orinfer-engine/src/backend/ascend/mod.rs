@@ -1,4 +1,14 @@
-//! Read-only CANN discovery. Model programs must register a separate executor.
+//! CANN discovery and thread-affine native execution resources.
+mod api;
+pub mod graph;
+pub mod hccl;
+pub mod kernels;
+pub mod model;
+pub mod operators;
+pub mod runtime;
+#[cfg(test)]
+mod tests;
+pub mod validation;
 use super::Inventory;
 use crate::artifact::Result;
 use libloading::Library;
@@ -6,6 +16,7 @@ use std::{
     ffi::{CStr, c_char},
     path::Path,
     ptr,
+    sync::{Arc, Mutex},
 };
 
 type Init = unsafe extern "C" fn(*const c_char) -> i32;
@@ -13,12 +24,15 @@ type Finalize = unsafe extern "C" fn() -> i32;
 type Count = unsafe extern "C" fn(*mut u32) -> i32;
 type Soc = unsafe extern "C" fn() -> *const c_char;
 
-struct Runtime {
+struct Driver {
     _library: Library,
     finalize: Finalize,
     initialized: bool,
+    count: Count,
+    soc: Soc,
+    path: std::path::PathBuf,
 }
-impl Drop for Runtime {
+impl Drop for Driver {
     fn drop(&mut self) {
         if self.initialized {
             // SAFETY: This owner successfully initialized ACL, owns no device
@@ -33,11 +47,12 @@ fn check(status: i32, operation: &str) -> Result<()> {
     if status == 0 {
         Ok(())
     } else {
+        crate::error::record_ascend(status);
         Err(format!("{operation}: ACL error {status}"))
     }
 }
 
-fn inspect_library(path: &Path) -> Result<Inventory> {
+fn open_library(path: &Path) -> Result<Driver> {
     // SAFETY: CANN is an explicitly selected native dependency. The Library
     // owner stays live for every function pointer and ACL lifetime below.
     let library = unsafe { Library::new(path) }.map_err(|e| format!("{}: {e}", path.display()))?;
@@ -59,24 +74,34 @@ fn inspect_library(path: &Path) -> Result<Inventory> {
                 .map_err(|e| e.to_string())?,
         )
     };
-    let mut runtime = Runtime {
+    let mut runtime = Driver {
         _library: library,
         finalize,
         initialized: false,
+        count,
+        soc,
+        path: path.into(),
     };
     // SAFETY: Null selects default ACL configuration. Only a successful init
     // transfers finalization ownership; an existing caller's ACL is not closed.
     check(unsafe { init(ptr::null()) }, "aclInit")?;
     runtime.initialized = true;
+    Ok(runtime)
+}
+
+fn inventory(runtime: &Driver) -> Result<Inventory> {
     let mut devices = 0;
-    // SAFETY: ACL initialized successfully and devices is a live writable u32.
-    check(unsafe { count(&mut devices) }, "aclrtGetDeviceCount")?;
+    check(
+        // SAFETY: ACL initialized successfully and devices is a live writable u32.
+        unsafe { (runtime.count)(&mut devices) },
+        "aclrtGetDeviceCount",
+    )?;
     let soc_name = if devices == 0 {
         None
     } else {
         // SAFETY: ACL owns the returned static NUL-terminated SoC name while
         // the initialized runtime is retained; copy it before finalization.
-        let name = unsafe { soc() };
+        let name = unsafe { (runtime.soc)() };
         if name.is_null() {
             return Err("aclrtGetSocName returned null".into());
         }
@@ -112,22 +137,72 @@ fn inspect_library(path: &Path) -> Result<Inventory> {
         host_arch: std::env::consts::ARCH.into(),
         device_count: devices,
         soc: soc_name,
-        runtime_library: path.display().to_string(),
+        runtime_library: runtime.path.display().to_string(),
         api_symbols,
         model_execution_available: false,
     })
 }
 
-pub(super) fn inspect() -> Result<Inventory> {
+struct Active {
+    driver: Option<Arc<Driver>>,
+    users: usize,
+}
+static ACTIVE: Mutex<Active> = Mutex::new(Active {
+    driver: None,
+    users: 0,
+});
+struct DriverLease {
+    driver: Option<Arc<Driver>>,
+    registered: bool,
+}
+impl std::ops::Deref for DriverLease {
+    type Target = Driver;
+    fn deref(&self) -> &Driver {
+        self.driver.as_ref().unwrap()
+    }
+}
+impl Drop for DriverLease {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        if let Ok(mut active) = ACTIVE.lock() {
+            // Finalization and the next initialization share the same lock.
+            self.driver.take();
+            active.users -= 1;
+            if active.users == 0 {
+                active.driver.take();
+            }
+        }
+    }
+}
+
+fn acquire() -> Result<Arc<DriverLease>> {
+    // Serialize process initialization. Every session and inventory query holds
+    // a reference, so discovery cannot finalize a live model's ACL runtime.
+    let mut active = ACTIVE
+        .lock()
+        .map_err(|_| "ACL initialization lock poisoned")?;
+    if active.driver.is_none() {
+        active.driver = Some(Arc::new(load_driver()?));
+    }
+    active.users += 1;
+    Ok(Arc::new(DriverLease {
+        driver: active.driver.clone(),
+        registered: true,
+    }))
+}
+
+fn load_driver() -> Result<Driver> {
     if let Some(path) = std::env::var_os("ORINFER_ASCEND_LIBRARY") {
-        return inspect_library(Path::new(&path));
+        return open_library(Path::new(&path));
     }
     let mut errors = Vec::new();
     for path in [
         "libascendcl.so",
         "/usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so",
     ] {
-        match inspect_library(Path::new(path)) {
+        match open_library(Path::new(path)) {
             Ok(value) => return Ok(value),
             Err(error) => errors.push(error),
         }
@@ -138,8 +213,13 @@ pub(super) fn inspect() -> Result<Inventory> {
     ))
 }
 
+pub(super) fn inspect() -> Result<Inventory> {
+    let driver = acquire()?;
+    inventory(&driver)
+}
+
 #[cfg(test)]
-mod tests {
+mod discovery_tests {
     use super::*;
     fn fixture(init_status: i32, count_status: i32) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -180,7 +260,7 @@ mod tests {
             // SAFETY: The test builds this exact library and retains a second
             // reference so its counters remain accessible after probe cleanup.
             let library = unsafe { Library::new(&path) }.unwrap();
-            let result = inspect_library(&path);
+            let result = open_library(&path).and_then(|driver| inventory(&driver));
             if init_status == 0 && count_status == 0 {
                 let info = result.unwrap();
                 assert_eq!(info.device_count, 8);

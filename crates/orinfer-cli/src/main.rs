@@ -103,6 +103,45 @@ enum Command {
         #[arg(long)]
         backend: orinfer_engine::backend::Backend,
     },
+    /// Validate bounded native Ascend transfers and W4A8 arithmetic on one device.
+    ValidateAscend {
+        #[arg(long, default_value_t = 0)]
+        device: u32,
+    },
+    /// Validate TileLang A2 AOT operators and changed-input native Graph replay.
+    ValidateAscendKernels {
+        #[arg(long, default_value_t = 7)]
+        device: u32,
+        #[arg(long)]
+        fixtures: PathBuf,
+    },
+    /// Benchmark complete single-sequence native A2 model execution.
+    BenchAscend {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long)]
+        inputs: PathBuf,
+        #[arg(long, default_value_t = 128)]
+        output_tokens: usize,
+        #[arg(long, default_value_t = 3)]
+        repeats: usize,
+        #[arg(long)]
+        trace: Option<PathBuf>,
+    },
+    /// Validate native HCCL AllReduce and variable-count AlltoAllV on 2..8 devices.
+    ValidateHccl {
+        #[arg(long, value_delimiter = ',', required = true)]
+        devices: Vec<u32>,
+    },
+    /// Validate conditional-memory metadata and immutable host row staging on CPU.
+    ValidateEngram {
+        #[arg(long)]
+        metadata: PathBuf,
+        #[arg(long)]
+        model_dir: PathBuf,
+    },
     /// Print the benchmark specification as JSON.
     Plan,
     /// Check AOT fixture and file hashes without CUDA.
@@ -516,6 +555,36 @@ fn execute(command: Command, data_dir: &std::path::Path) -> Result<(), String> {
             Ok(())
         }
         Command::Devices { backend } => print_json(orinfer_engine::backend::inspect(backend)?),
+        Command::ValidateAscend { device } => {
+            print_json(orinfer_engine::backend::ascend::validation::run(device)?)
+        }
+        Command::ValidateAscendKernels { device, fixtures } => print_json(
+            orinfer_engine::backend::ascend::kernels::validation::run(device, &fixtures)?,
+        ),
+        Command::BenchAscend {
+            plan,
+            model_dir,
+            inputs,
+            output_tokens,
+            repeats,
+            trace,
+        } => print_json(&orinfer_engine::backend::ascend::model::run(
+            &plan,
+            &model_dir,
+            &inputs,
+            output_tokens,
+            repeats,
+            trace.as_deref(),
+        )?),
+        Command::ValidateHccl { devices } => print_json(
+            orinfer_engine::backend::ascend::hccl::validation::run(&devices)?,
+        ),
+        Command::ValidateEngram {
+            metadata,
+            model_dir,
+        } => print_json(orinfer_engine::host_rows::validation::run(
+            &metadata, &model_dir,
+        )?),
         Command::Plan => {
             println!("{}", orinfer_engine::BENCHMARK_PLAN);
             Ok(())

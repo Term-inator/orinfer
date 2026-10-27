@@ -76,7 +76,99 @@ orinfer devices --backend ascend
 ORINFER_ASCEND_LIBRARY=/path/to/libascendcl.so orinfer devices --backend ascend
 ```
 
-Ascend 探测只初始化 ACL、读取卡数与 SoC 并释放本次初始化，不分配设备内存或执行 kernel。输出中的 `api_symbols` 仅表示当前库存在对应入口，芯片能力需要实际验证。当前 `model_execution_available` 为 false；加载 Ascend 模型会明确报未注册执行器。A2 后续还需实现模型执行器、HCCL/rank 生命周期、DSV4.1 模型适配和量化算子，并完成真实设备数值、Graph、prefix 恢复和端到端验收。现有 CUDA 执行包 schema 1、C ABI v1、`--cuda-graph` 和统计字段保留；`--graph` 是相同参数的别名。
+Ascend 探测共享进程内 ACL 初始化，读取卡数与 SoC，不分配设备内存或执行 kernel。最后一个会话、buffer、图和完成事件释放后才结束本进程持有的初始化。输出中的 `api_symbols` 仅表示当前库存在对应入口，芯片能力需要实际验证。当前 `model_execution_available` 为 false，表示公共 `serve`/`batch` 执行器尚未注册；DSv4.1 单流实验入口见下文。现有 CUDA 执行包 schema 1、C ABI v1、`--cuda-graph` 和统计字段保留；`--graph` 是相同参数的别名。
+
+原生设备资源位于 `backend/ascend/runtime.rs`：每会话独占 context、compute/transfer stream，显存与 pinned 内存受独立预算约束；异步提交持有 buffer、主机副本和原生算子资源直到事件完成。跨流等待也持有源事件。完成确认失败时隔离仍可能被 DMA 使用的存储和 context，避免提前释放；释放资源只销毁所属 context，不重置整卡。Ascend 数字错误码进入统一错误分类，执行失败会使 worker 退出而非按普通请求错误继续服务。
+
+`backend/ascend/operators.rs` 直接调用 CANN 的 `aclnnGroupedMatmulV5`，使用 ND packed signed INT4、UINT64 channel scales、FP32 assist/token scales 及 BF16 输出，支持空专家分组。准备阶段查询 workspace 并显式启用 repeatable executor，执行阶段复用准备结果；同一 compute stream 上的串行计划可共享 workspace，分支并行需要独立存储。Graph 持有稳定地址和原生计划直至最后一次重放完成。运行时通过动态库加载 CANN，无 PyTorch/ATen 依赖。
+
+```bash
+orinfer validate-ascend --device 0
+```
+
+此命令有界验证异步上传/读回、W4A8 数值、改变输入后的 executor 复用和 Graph 重放；包含单行、16 行及空专家分组。测试显存预算为 512 MiB，workspace 额外检查至少保留 256 MiB 空闲 HBM。输出的 wall time 包含提交和完成等待，只作诊断，不代表模型性能。已在 910B3 上验证；完整模型、CSA2、prefix 恢复及通信与模型的集成仍需后续接入及验收。
+
+新增 A2 文本主干算子位于 `tools/operators/ascend`，由 TileLang-Ascend 离线编译。它们覆盖 RMSNorm、动态 A8、限幅 SwiGLU、W8/BF16 与 FP32 敏感投影、mHC、复数 RoPE、Engram 旋转与门控、MoE 路由和还原、KV 行搬运、稀疏索引与 attention、C2 池化及 32 行 FP32 ring 提交。索引 TopK 采用分块选择与分层归并，保留 FP32 分数；K 为 512 或 2048。FP32-sensitive 投影和稀疏 attention 当前采用 Vector 正确性基线。
+
+当前离线编译镜像面向 aarch64，使用调用者提供的 CANN 9.1 / Python 3.12 运行时基础镜像，固定 TileLang-Ascend wheel 的版本与 SHA256。基础镜像需包含匹配的 PyTorch、torch_npu 和 CANN 编译器。`run.sh` 将所选基础镜像解析为本地不可变镜像 ID；板上运行时串行取得 GPU 实验锁，无卡编译使用 `--without-devices`。运行前先结束占用同一批 NPU 的开发容器；驱动的容器设备归属可能持续到容器退出。编译产物、参考数据和缓存保存在 `artifacts`：
+
+```bash
+ORINFER_ASCEND_BASE_IMAGE='your-cann-runtime:9.1-py312' \
+  bash tools/operators/ascend/run.sh build
+# 先在不映射 NPU 的容器编译，再在相同 cache 中执行板上验收：
+bash tools/operators/ascend/run.sh --without-devices python3 -m tools.operators.ascend.validate \
+  --compile-only --output artifacts/ascend-runtime/attention-cpu \
+  --rows 16 --attention-selected 128 --only sparse_attention
+bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate \
+  --output artifacts/ascend-runtime/attention-cpu \
+  --rows 16 --attention-selected 128 --only sparse_attention
+bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate \
+  --output artifacts/ascend-runtime/aot --rows 16 --width 5120
+# BF16 尾数覆盖与动态 A8 舍入边界：
+bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate \
+  --output artifacts/ascend-runtime/a8-grid --rows 128 --width 512 --quant-grid --only quantize
+flock -w 5 artifacts/gpu-experiment.lock orinfer validate-ascend-kernels \
+  --device 7 --fixtures artifacts/ascend-runtime/aot/fixtures.json
+```
+
+`backend/ascend/kernels.rs` 验证 AOT 库 hash、主机 ELF、设备型号及库内的版本化算子描述；外部描述与编译库的 operand、dtype、shape、访问方式和参数必须一致。指针表只绑定同一会话的精确 buffer 范围，输出与其他 operand 分离。`Program` 按同一 stream 的依赖顺序连续提交算子，并用一个完成事件持有整段原生资源。Graph 同样保留库、工作区和稳定地址。在线执行不加载 Python 或 Torch。
+
+离线编译显式选择 NPU storage rewrite，编译器身份记录 `storage_rewrite=explicit-npu-v1`。固定版本编译器原本根据容器中的设备可见性选择存储复用，在无卡编译时可能让循环临时 KV 覆盖仍存活的 query/累积状态。显式目标配置使无卡编译和板上编译使用相同的 NPU 存储规则；无卡生成的产物需经过上述板上验收。
+
+AOT 算子描述是独立的验收/编译格式，现有模型包与模型 C ABI 保持原版本。验收比较四组改变输入的结果，其中两组使用 Rust 原生 Graph replay；INT8 输出、行搬运和 ring 提交逐字节对照。FP32 敏感投影与 mHC 点积使用独立的 FP64 参考，再舍入到 FP32，避免 CPU BLAS 的累加顺序影响判断。C2 先读取上次残余再单独提交最后 32 个已接受位置，metadata 明确传递请求页、前驱行、位置和提交边界。完整模型绑定与分布式单流由下述实验入口执行；prefix 快照恢复和 AgentX 并发性能仍需接入。
+
+`backend/ascend/hccl.rs` 提供原生 AllReduce SUM、变长 AlltoAllV 和异步错误检查。Bootstrap 在指定会话的 context 内生成，opaque root bytes 可传给其他 rank 进程。通信与计算使用同一 compute stream 顺序，完成事件持有 communicator、buffer 和 host count arrays；空 peer 计数和重复调用仍保持所有 rank 的共同 collective 顺序。调用者在 step 边界检查异步通信错误。
+
+```bash
+# 与现有服务共卡时，为本次验收选择独立的 NPU 通信端口：
+HCCL_NPU_SOCKET_PORT_RANGE=auto orinfer validate-hccl --devices 0,1,2,3,4,5,6,7
+```
+
+验证器在同一进程的独立线程/context 上检查 2–8 卡的 AllReduce 和含空 peer 的非均匀 AlltoAllV，并在全部 rank 完成显存预检查后统一准入。HCCL 自身的通信缓冲不计入会话显存预算，每卡验收前要求至少 512 MiB 空闲 HBM。已在 2 卡和 8 卡 910B3 上验证。实验入口使用同一进程的独立 worker/context；跨进程编排、设备侧 MoE dispatch 与 collective Graph 捕获仍需接入。A2 上加入 MC² 算子后需重新按对应端口约束验收；本命令只使用独立 collective。
+
+DSv4.1 Engram 的 CPU 路径使用离线导出的 tokenizer 压缩映射、确定的整数 hash 参数和显式 token 历史；prefill 分块、恢复和 speculative 回滚无需读取可变 KV 页镜像。`host_rows` 以稳定分组和去重生成 owner 计划，保留原查询顺序的恢复索引；只读映射 INT8 表与 FP32 group-32 scales，按预算打包选中行，整表不注册到 ACL。实验入口已连接 NPU 投影；NUMA worker 绑定和预取重叠仍需接入。
+
+在离线工具环境安装 NumPy 和模型 tokenizer 对应的 `tokenizers` 后导出元数据；导出器验证 compressed vocabulary 与桶数，元数据固定配置和 tokenizer 的 SHA256：
+
+```bash
+python -m tools.model.deepseek_v41.export_engram \
+  --model /path/to/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
+  --output artifacts/engram-metadata.json
+orinfer validate-engram --metadata artifacts/engram-metadata.json \
+  --model-dir /path/to/DeepSeek-V4.1-Flash-1017-w4a8-Ascend
+```
+
+CPU 验收读取真实表的小批量行，检查所有 token 分块边界的 hash 一致性、八路 owner 计划、去重和 staging 字节预算；不执行完整模型。
+
+### A2 单流模型实验入口
+
+`backend/ascend/model/` 提供 DSv4.1 Flash-1017 原始 W4A8 checkpoint 的实验性单流执行入口 `bench-ascend`。八个 Rust worker 各持有独立 ACL context，以 TP8 执行 attention、每卡 48 个专家执行 MoE，并通过 HCCL 合并结果。执行计划包含全部 40 层、Engram CPU 行查找、C2/C1 缓存、索引 TopK 与输出头。W4 grouped matmul 保留 ACLNN，其余设备计算从 TileLang AOT 库加载；连续 TileLang 片段复用 ACL Graph。
+
+该入口使用独立的实验计划描述，公共模型包 schema 1 和 C ABI v1 保持原样；`serve` 的 Ascend 执行器仍未注册。当前上下文容量限定为 128–16384，须为 32 的倍数；默认 8448，覆盖 8K 输入和 128 个输出。此范围内候选块覆盖完整历史。prefill 使用 16 行 packet，decode 使用单行 packet；请求间清空历史和残余压缩状态，通过因果索引隔离旧 KV。prefix 复用、并发调度及 MTP 需要后续接入。
+
+`ORINFER_ASCEND_IMAGE` 可选择编译镜像，`ORINFER_ASCEND_DRIVER_ROOT` 可选择主机驱动目录。编译 runner 将主机 `/data/models` 只读挂载到相同路径；其他模型根目录通过 `ORINFER_ASCEND_MODEL_ROOT` 指定绝对路径。在 CANN 和离线编译镜像准备完成后，先导出上述 Engram 元数据，再构建实验计划和固定 token 输入：
+
+```bash
+bash tools/operators/ascend/run.sh --without-devices python3 -m tools.model.deepseek_v41.build \
+  --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
+  --engram-metadata artifacts/engram-metadata.json \
+  --output artifacts/ascend-model --compile-workers 8
+python -m tools.model.deepseek_v41.prepare \
+  --plan artifacts/ascend-model/model.json \
+  --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
+  --output artifacts/ascend-model/model-prepared.json --workers 16
+bash tools/operators/ascend/run.sh python3 -m tools.bench.ascend_single \
+  --prepare artifacts/ascend-inputs.json \
+  --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend
+HCCL_NPU_SOCKET_PORT_RANGE=auto flock -w 5 artifacts/gpu-experiment.lock \
+  orinfer bench-ascend --plan artifacts/ascend-model/model-prepared.json \
+  --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
+  --inputs artifacts/ascend-inputs.json --output-tokens 128 --repeats 3
+```
+
+构建器引用原 checkpoint。离线 `prepare` 使用 NumPy、系统 C 编译器与 ARM NEON 8×8 转置，将 W4 bank、ND per-channel scale 和辅助 bias 写入物理布局文件。数值与尾部检查放在独立 CPU 测试，批量转换只执行 NEON 转置和顺序写盘。通过顺序 `pread` 读取单个专家，以有界 bank 缓冲写盘，避免对 ZFS 映射做逐字节转置。此转换保持原始 INT4 nibble，准备产物保留 W4，每卡在线仍只加载一份 W4；原 checkpoint 保留用于参考和其余张量。断点续转核对原文件的大小/mtime/inode、转换器身份、产物长度与完成标记；权重准备和在线加载均不扫描 payload 计算哈希。全部 bank 完成后原子发布准备计划，现有 AOT 与资产共享同一目录。加载前核对配置、tokenizer、Engram、AOT 库和绑定身份；设备分配使用大页优先策略及独立会话预算。
+
+测量排除权重加载和预热，输出固定输入的 token hash、全部生成 token ID、TTFT、decode 速度及端到端时延。TTFT 包含末位置输出头；由输入长度除以 TTFT 得到的值是 prefill 吞吐代理。Rust 计时包含 CPU 查找、提交、等待与 HCCL；`tools/bench/ascend_single.py` 对 vLLM 的测量还包含本机 HTTP 和调度开销。两端使用同一组原始 completion token，固定输出长度，关闭跨请求 prefix 复用和推测解码。输入 `cases` 可分别指定 `output_tokens`、`repeats` 和 `trace`，省略时沿用命令行设置。`--trace DIR` 下载每层输出用于排错；正式测量使用 `trace: false` 或省略 `--trace`。
 
 ### 源码入口
 

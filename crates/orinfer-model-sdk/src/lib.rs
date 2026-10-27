@@ -3,6 +3,7 @@ pub mod abi;
 pub mod architecture;
 pub mod artifact;
 pub mod catalog;
+pub mod conditional_memory;
 pub mod embedding;
 pub mod encoder_rows;
 pub mod execution;

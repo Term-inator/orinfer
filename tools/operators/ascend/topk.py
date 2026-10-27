@@ -1,0 +1,142 @@
+"""Bounded, exact A2 sparse-index TopK using local selection and merge levels.
+
+The first implementation preserves FP32 index scores. Every level retains only
+K candidates; no stage sorts the complete long-context row in UB.
+"""
+
+import tilelang.language as T
+
+
+def local(rows, length, selected=512):
+    block = 4096 if selected <= 512 else 2048
+    if selected not in (512, 2048) or length > 1 << 24:
+        raise ValueError("A2 select supports K=512/2048 and exact FP32 indices below 2^24")
+    chunks = (length + block - 1) // block
+
+    @T.prim_func
+    def main(
+        scores: T.Tensor((rows, length), "float32"),
+        lengths: T.Tensor((rows,), "int32"),
+        out: T.Tensor((rows, chunks, 2 * selected), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(rows * chunks, 2), is_npu=True) as (cid, vid):
+            x = T.alloc_ub((block,), "float32")
+            positions = T.alloc_ub((block,), "float32")
+            mask = T.alloc_ub((block // 8,), "uint8")
+            pairs = T.alloc_ub((2 * selected,), "float32")
+            lanes = T.alloc_ub((2 * selected,), "float32")
+            halves = T.alloc_ub((2 * selected,), "float32")
+            floor_int = T.alloc_ub((2 * selected,), "int32")
+            floor_float = T.alloc_ub((2 * selected,), "float32")
+            offsets = T.alloc_ub((2 * selected,), "float32")
+            gather_offsets = T.alloc_ub((2 * selected,), "uint32")
+            selected_indices = T.alloc_ub((selected,), "float32")
+            selected_values = T.alloc_ub((selected,), "float32")
+            selected_mask = T.alloc_ub((selected // 8,), "uint8")
+            index = cid * 2 + vid
+            row = index // chunks
+            chunk = index % chunks
+            if row < rows:
+                start = chunk * block
+                available = T.min(block, length - start)
+                valid = T.min(available, T.max(0, lengths[row] - start))
+                T.tile.fill(x, -T.infinity("float32"))
+                T.copy(scores[row, start : start + available], x[:available])
+                T.tile.createvecindex(positions, T.float32(0.0))
+                T.tile.compare(mask, positions, T.cast(valid, "float32"), "LT")
+                T.tile.select(x, mask, x, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
+                T.tile.topk(pairs, x, selected, block)
+                # Add the chunk origin only to index lanes, using vector math.
+                T.tile.createvecindex(lanes, T.float32(0.0))
+                T.tile.mul(halves, lanes, 0.5)
+                T.tile.cast(floor_int, halves, "CAST_FLOOR", 2 * selected)
+                T.tile.cast(floor_float, floor_int, "CAST_NONE", 2 * selected)
+                T.tile.mul(floor_float, floor_float, 2.0)
+                T.tile.sub(offsets, lanes, floor_float)
+                T.tile.mul(offsets, offsets, T.cast(start, "float32"))
+                T.tile.add(pairs, pairs, offsets)
+                # Reuse the vector work buffers to canonicalize masked lanes.
+                # Every padding candidate is (-inf, -1), including short tails.
+                T.reinterpretcast(selected_indices, halves, "float")
+                T.reinterpretcast(selected_values, floor_float, "float")
+                T.tile.gather_mask(selected_indices, pairs, "P1010")
+                T.tile.gather_mask(selected_values, pairs, "P0101")
+                T.tile.compare(selected_mask, selected_values, -T.infinity("float32"), "GT")
+                T.tile.select(
+                    selected_indices,
+                    selected_mask,
+                    selected_indices,
+                    -1.0,
+                    "VSEL_TENSOR_SCALAR_MODE",
+                )
+                T.copy(selected_values, lanes[:selected])
+                T.copy(selected_indices, lanes[selected:])
+                T.reinterpretcast(gather_offsets, floor_int, "uint32_t")
+                for i in T.Parallel(2 * selected):
+                    gather_offsets[i] = T.cast((i % 2 * selected + i // 2) * 4, "uint32")
+                T.tile.gather(pairs, lanes, gather_offsets, 0)
+                T.copy(pairs, out[row, chunk, :])
+
+    return main
+
+
+def merge(rows, sources, selected=512):
+    groups = (sources + 3) // 4
+
+    @T.prim_func
+    def main(
+        candidates: T.Tensor((rows, sources, 2 * selected), "float32"),
+        out: T.Tensor((rows, groups, 2 * selected), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(rows * groups, 2), is_npu=True) as (cid, vid):
+            a = T.alloc_ub((2 * selected,), "float32")
+            b = T.alloc_ub((2 * selected,), "float32")
+            c = T.alloc_ub((2 * selected,), "float32")
+            d = T.alloc_ub((2 * selected,), "float32")
+            merged = T.alloc_ub((8 * selected,), "float32")
+            index = cid * 2 + vid
+            row = index // groups
+            group = index % groups
+            if row < rows:
+                T.tile.fill(a, -T.infinity("float32"))
+                T.tile.fill(b, -T.infinity("float32"))
+                T.tile.fill(c, -T.infinity("float32"))
+                T.tile.fill(d, -T.infinity("float32"))
+                T.copy(candidates[row, group * 4, :], a)
+                if group * 4 + 1 < sources:
+                    T.copy(candidates[row, group * 4 + 1, :], b)
+                if group * 4 + 2 < sources:
+                    T.copy(candidates[row, group * 4 + 2, :], c)
+                if group * 4 + 3 < sources:
+                    T.copy(candidates[row, group * 4 + 3, :], d)
+                T.tile.merge_sort(merged, a, b, c, d)
+                T.copy(merged[: 2 * selected], out[row, group, :])
+
+    return main
+
+
+def finalize(rows, selected=512):
+    @T.prim_func
+    def main(
+        candidates: T.Tensor((rows, 2 * selected), "float32"),
+        indices: T.Tensor((rows, selected), "int32"),
+        values: T.Tensor((rows, selected), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+            pairs = T.alloc_ub((2 * selected,), "float32")
+            vi = T.alloc_ub((selected,), "float32")
+            vv = T.alloc_ub((selected,), "float32")
+            oi = T.alloc_ub((selected,), "int32")
+            mask = T.alloc_ub((selected // 8,), "uint8")
+            row = cid * 2 + vid
+            if row < rows:
+                T.copy(candidates[row, :], pairs)
+                T.tile.gather_mask(vi, pairs, "P1010")
+                T.tile.gather_mask(vv, pairs, "P0101")
+                T.tile.compare(mask, vv, -T.infinity("float32"), "GT")
+                T.tile.select(vi, mask, vi, -1.0, "VSEL_TENSOR_SCALAR_MODE")
+                T.tile.cast(oi, vi, "CAST_RINT", selected)
+                T.copy(oi, indices[row, :])
+                T.copy(vv, values[row, :])
+
+    return main
