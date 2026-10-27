@@ -57,8 +57,8 @@ fn parallel_regions(
     configured: &[[String; 4]],
     slots: &BTreeMap<String, String>,
 ) -> Result<Vec<[usize; 4]>> {
-    let mut positions = BTreeMap::new();
-    let mut ambiguous = std::collections::BTreeSet::new();
+    let mut positions = std::collections::HashMap::with_capacity(operations.len());
+    let mut ambiguous = std::collections::HashSet::new();
     for (i, operation) in operations.iter().enumerate() {
         if let Operation::Kernel { name } = &operation.operation {
             let slot = slots.get(name).unwrap_or(name).as_str();
