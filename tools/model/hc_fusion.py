@@ -81,7 +81,10 @@ def publish(data, package, manifest, compiler, output):
     write = output / "hc-combine-norm.json"
     write.write_text(
         json.dumps(
-            dict(fused=[dict(combine=a, norm=b) for a, b in pairs], symbol=replacements[pairs[0][0]]["symbol"]),
+            dict(
+                fused=[dict(combine=a, norm=b) for a, b in pairs],
+                symbol=replacements[pairs[0][0]]["symbol"],
+            ),
             indent=1,
         )
     )

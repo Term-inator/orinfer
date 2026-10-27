@@ -75,6 +75,7 @@ impl Driver {
             b"cuStreamBeginCapture_v2\0".as_slice(),
             b"cuStreamEndCapture\0".as_slice(),
             b"cuGraphInstantiateWithFlags\0".as_slice(),
+            b"cuGraphUpload\0".as_slice(),
             b"cuGraphLaunch\0".as_slice(),
             b"cuGraphDestroy\0".as_slice(),
             b"cuGraphExecDestroy\0".as_slice(),

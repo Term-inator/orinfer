@@ -1404,6 +1404,17 @@ impl Executor {
                 sys::cuGraphDestroy(graph);
                 return Err(error);
             }
+            // SM87 has no device-side graph launch: every replay would otherwise
+            // pay per-node command encoding. Upload once; replays then only
+            // trigger execution. Upload failure frees the local pair.
+            if let Err(error) = check(
+                sys::cuGraphUpload(exec, self.session.stream),
+                "upload request graph",
+            ) {
+                sys::cuGraphExecDestroy(exec);
+                sys::cuGraphDestroy(graph);
+                return Err(error);
+            }
         }
         self.session.graphs.borrow_mut().push((graph, exec));
         Ok(exec)
@@ -2405,6 +2416,14 @@ impl Executor {
                 sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0),
                 "profile instantiate",
             ) {
+                sys::cuGraphDestroy(graph);
+                return Err(error);
+            }
+            if let Err(error) = check(
+                sys::cuGraphUpload(exec, self.session.stream),
+                "profile graph upload",
+            ) {
+                sys::cuGraphExecDestroy(exec);
                 sys::cuGraphDestroy(graph);
                 return Err(error);
             }

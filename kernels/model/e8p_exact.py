@@ -52,13 +52,16 @@ def split_a8(rows, K, dynamic_rows=False):
         "tl.if_stmt_binding_inline_replayable_binds": False,
     }
 )
-def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, dynamic_rows=False):
+def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, stages=2, dynamic_rows=False):
     if (
         any(type(x) is not int or x <= 0 for x in (rows, E, tiles, N, K))
         or K % 128
         or K * 128 * 128 > 2**31 - 1
         or type(block_m) is not int
         or block_m not in (8, 16)
+        or type(stages) is not int
+        or stages not in (2, 3, 4)
+        or K // 64 < stages - 1
     ):
         raise ValueError("Invalid exact E8P geometry")
     BM, BN, BK = block_m, 128, 64
@@ -92,8 +95,8 @@ def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, dynamic_rows=False):
             tid = T.get_thread_binding()
             lane = tid % 32
             warp = tid // 32
-            packed = T.alloc_shared((2, BN, 8), T.uint16)
-            inputs = T.alloc_shared((2, 2, BM, input_stride), T.int8)
+            packed = T.alloc_shared((stages, BN, 8), T.uint16)
+            inputs = T.alloc_shared((stages, 2, BM, input_stride), T.int8)
             weights = T.alloc_shared((BN, 32), T.int8)
             book = T.alloc_shared((256,), T.uint32)
             lo = T.alloc_local((BM,), T.int32)
@@ -110,52 +113,85 @@ def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, dynamic_rows=False):
                     lo[i] = 0
                     hi[i] = 0
                 T.sync_threads()
-                T.ptx_cp_async(
-                    T.access_ptr(packed[0, tid, 0], "w", 8),
-                    T.access_ptr(P[expert, 0, T.min(bx * BN + tid, N - 1), 0], "r", 8),
-                    8,
-                    predicate=bx * BN + tid < N,
-                )
-                if tid < BM * 2:
+                for p in T.unroll(stages - 1):
                     T.ptx_cp_async(
-                        T.access_ptr(
-                            inputs[
-                                0, 0, tid // 2, ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask)
-                            ],
-                            "w",
-                            16,
-                        ),
-                        T.access_ptr(
-                            Low[T.min(offset + tid // 2, rows - 1), (tid % 2) * 16], "r", 16
-                        ),
-                        16,
-                        predicate=offset + tid // 2 < rows,
+                        T.access_ptr(packed[p, tid, 0], "w", 8),
+                        T.access_ptr(P[expert, p, T.min(bx * BN + tid, N - 1), 0], "r", 8),
+                        8,
+                        predicate=bx * BN + tid < N,
                     )
-                    T.ptx_cp_async(
-                        T.access_ptr(
-                            inputs[
-                                0, 1, tid // 2, ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask)
-                            ],
-                            "w",
+                    if tid < BM * 2:
+                        T.ptx_cp_async(
+                            T.access_ptr(
+                                inputs[
+                                    p,
+                                    0,
+                                    tid // 2,
+                                    ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
+                                ],
+                                "w",
+                                16,
+                            ),
+                            T.access_ptr(
+                                Low[T.min(offset + tid // 2, rows - 1), p * 32 + (tid % 2) * 16],
+                                "r",
+                                16,
+                            ),
                             16,
-                        ),
-                        T.access_ptr(
-                            High[T.min(offset + tid // 2, rows - 1), (tid % 2) * 16], "r", 16
-                        ),
-                        16,
-                        predicate=offset + tid // 2 < rows,
-                    )
-                T.ptx_commit_group()
+                            predicate=offset + tid // 2 < rows,
+                        )
+                        T.ptx_cp_async(
+                            T.access_ptr(
+                                inputs[
+                                    p,
+                                    1,
+                                    tid // 2,
+                                    ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
+                                ],
+                                "w",
+                                16,
+                            ),
+                            T.access_ptr(
+                                High[T.min(offset + tid // 2, rows - 1), p * 32 + (tid % 2) * 16],
+                                "r",
+                                16,
+                            ),
+                            16,
+                            predicate=offset + tid // 2 < rows,
+                        )
+                    T.ptx_commit_group()
                 for step in T.serial(K // BK):
-                    slot = step % 2
-                    T.ptx_wait_group(0)
+                    slot = step % stages
+                    # The drain tail has fewer groups in flight than stages-1;
+                    # wait_group must still force this step's group complete.
+                    if stages == 2:
+                        T.ptx_wait_group(0)
+                    elif stages == 3:
+                        if step + 1 < K // BK:
+                            T.ptx_wait_group(1)
+                        else:
+                            T.ptx_wait_group(0)
+                    else:
+                        if step + 2 < K // BK:
+                            T.ptx_wait_group(2)
+                        elif step + 1 < K // BK:
+                            T.ptx_wait_group(1)
+                        else:
+                            T.ptx_wait_group(0)
                     T.sync_threads()
-                    if step + 1 < K // BK:
-                        nxt = (step + 1) % 2
+                    if step + stages - 1 < K // BK:
+                        nxt = (step + stages - 1) % stages
                         T.ptx_cp_async(
                             T.access_ptr(packed[nxt, tid, 0], "w", 8),
                             T.access_ptr(
-                                P[expert, step + 1, T.min(bx * BN + tid, N - 1), 0], "r", 8
+                                P[
+                                    expert,
+                                    step + stages - 1,
+                                    T.min(bx * BN + tid, N - 1),
+                                    0,
+                                ],
+                                "r",
+                                8,
                             ),
                             8,
                             predicate=bx * BN + tid < N,
@@ -175,7 +211,7 @@ def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, dynamic_rows=False):
                                 T.access_ptr(
                                     Low[
                                         T.min(offset + tid // 2, rows - 1),
-                                        (step + 1) * 32 + (tid % 2) * 16,
+                                        (step + stages - 1) * 32 + (tid % 2) * 16,
                                     ],
                                     "r",
                                     16,
@@ -197,7 +233,7 @@ def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, dynamic_rows=False):
                                 T.access_ptr(
                                     High[
                                         T.min(offset + tid // 2, rows - 1),
-                                        (step + 1) * 32 + (tid % 2) * 16,
+                                        (step + stages - 1) * 32 + (tid % 2) * 16,
                                     ],
                                     "r",
                                     16,

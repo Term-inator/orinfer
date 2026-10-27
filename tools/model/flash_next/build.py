@@ -218,7 +218,7 @@ def rebuild(args):
             experts=count,
         )
         wc = weight_contract(operands, buffers)
-        for bm in (8, 16):
+        for bm, st in ((8, 2), (8, 4), (16, 2), (16, 4)):
             expert_contract = dict(
                 source=contract["source"],
                 toolchain=contract["toolchain"],
@@ -226,11 +226,12 @@ def rebuild(args):
                 spec=spec,
                 weights=wc,
                 block_m=bm,
+                stages=st,
             )
 
             def certify(folder):
                 actual = read_weights(args.model, operands, buffers)
-                config = dict(block_m=bm)
+                config = dict(block_m=bm, stages=st)
                 candidate = tilelang.compile(
                     make_prim(spec, config),
                     out_idx=[],
@@ -249,8 +250,10 @@ def rebuild(args):
                 torch.cuda.empty_cache()
 
             _, hit = cache.get(expert_contract, certify)
-            certificates.append(dict(spec=spec, block_m=bm, cache_hit=hit))
-            print("EXPERT CHECKED", count, n, k, bm, "cache" if hit else "validated", flush=True)
+            certificates.append(dict(spec=spec, block_m=bm, stages=st, cache_hit=hit))
+            print(
+                "EXPERT CHECKED", count, n, k, bm, st, "cache" if hit else "validated", flush=True
+            )
     with atomic_model(args.model_output) as staging:
         root = clone_model(args.model, staging, origin)
         compiler = Compiler(origin, root, args.output, buffers)
