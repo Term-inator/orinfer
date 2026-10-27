@@ -163,6 +163,8 @@ pub(crate) struct Executor {
     pub(crate) allocations: Allocations,
     workspace_dependencies: BTreeMap<String, Vec<String>>,
     text_workspaces: Vec<String>,
+    sequence_workspaces: BTreeMap<String, orinfer_model_sdk::operators::workspace::SequenceRows>,
+    sequence_workspace_kernels: BTreeMap<String, Vec<String>>,
     pub(crate) parallel_regions: RefCell<Vec<[String; 4]>>,
     pub(super) row_kernel_slots: BTreeMap<String, String>,
     #[cfg(test)]
@@ -901,6 +903,16 @@ impl Executor {
                 allocations,
                 workspace_dependencies,
                 text_workspaces: text_workspaces.into_iter().collect(),
+                sequence_workspaces: manifest.sequence_workspaces.clone(),
+                sequence_workspace_kernels: {
+                    let mut users: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                    for (name, rows) in &manifest.sequence_workspaces {
+                        for kernel in rows.kernels.keys() {
+                            users.entry(kernel.clone()).or_default().push(name.clone());
+                        }
+                    }
+                    users
+                },
                 peak_kv_bytes: std::cell::Cell::new(0),
                 peak_prefill_workspace_bytes: std::cell::Cell::new(0),
                 prefill_workspace: manifest
@@ -1284,7 +1296,9 @@ impl Executor {
             .ok_or_else(|| format!("Unknown kernel {name}"))?;
         if !kernel.workspaces_ready {
             for argument in &kernel.spec.args {
-                if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } = argument {
+                if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } = argument
+                    && !self.sequence_workspaces.contains_key(name)
+                {
                     self.ensure_workspace(name, self.sizes[name])?;
                 }
             }
@@ -1316,7 +1330,39 @@ impl Executor {
             .ok_or_else(|| format!("Unknown program {name}"))?;
         for operation in operations {
             if let crate::model::Operation::Kernel { name } = operation {
+                self.ensure_sequence_workspaces(
+                    &crate::execution::Invocation {
+                        operation: operation.clone(),
+                        sequence: None,
+                        launch: None,
+                        views: BTreeMap::new(),
+                    },
+                    name,
+                )?;
                 self.ensure_kernel(name)?;
+            }
+        }
+        Ok(())
+    }
+    fn ensure_sequence_workspaces(
+        &self,
+        invocation: &crate::execution::Invocation,
+        kernel: &str,
+    ) -> Result<()> {
+        let Some(names) = self.sequence_workspace_kernels.get(kernel) else {
+            return Ok(());
+        };
+        let bindings = self
+            .direct
+            .as_ref()
+            .ok_or("Missing direct bindings")?
+            .kernels
+            .borrow();
+        let spec = &bindings.get(kernel).ok_or("Unknown workspace kernel")?.spec;
+        for name in names {
+            let rows = &self.sequence_workspaces[name];
+            if let Some(bytes) = rows.invocation_bytes(name, spec, invocation, self.sizes[name])? {
+                self.ensure_workspace(name, bytes)?;
             }
         }
         Ok(())
@@ -1326,10 +1372,17 @@ impl Executor {
         operations: &[crate::execution::Invocation],
     ) -> Result<()> {
         for invocation in operations {
-            for view in invocation.views.values() {
-                self.ensure_workspace(&view.buffer, self.sizes[&view.buffer])?;
+            for (source, view) in &invocation.views {
+                if self.sequence_workspaces.contains_key(&view.buffer) {
+                    if source != &view.buffer || view.offset != 0 {
+                        return Err("Sequence scratch cannot be introduced through an alias".into());
+                    }
+                } else {
+                    self.ensure_workspace(&view.buffer, self.sizes[&view.buffer])?;
+                }
             }
             if let crate::model::Operation::Kernel { name } = &invocation.operation {
+                self.ensure_sequence_workspaces(invocation, name)?;
                 self.ensure_kernel(name)?;
             } else {
                 let names: Vec<&str> = match &invocation.operation {
@@ -1519,9 +1572,17 @@ impl Executor {
             })
     }
 
-    pub(crate) fn pending_text_workspace_bytes(&self) -> Result<usize> {
+    pub(crate) fn pending_text_workspace_bytes(&self, context: usize) -> Result<usize> {
         self.text_workspaces.iter().try_fold(0usize, |sum, name| {
-            sum.checked_add(self.pending_workspace_range(name, self.sizes[name])?)
+            let bytes = if let Some(rows) = self.sequence_workspaces.get(name) {
+                rows.bytes(
+                    context.max(1).min(self.sizes[name] / rows.bytes_per_row),
+                    self.sizes[name],
+                )?
+            } else {
+                self.sizes[name]
+            };
+            sum.checked_add(self.pending_workspace_range(name, bytes)?)
                 .ok_or_else(|| "Pending text workspace sum overflow".into())
         })
     }

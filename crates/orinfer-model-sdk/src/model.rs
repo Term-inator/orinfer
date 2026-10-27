@@ -60,6 +60,9 @@ pub struct Manifest {
     /// Derived by the model adapter: fork, side start/end, join operation names.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub graph_branches: BTreeMap<String, Vec<[String; 4]>>,
+    /// Shared scratch whose launches each belong to one sequence segment.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sequence_workspaces: BTreeMap<String, crate::operators::workspace::SequenceRows>,
     pub reset_buffers: Vec<String>,
     pub input: String,
     pub token: String,
@@ -562,6 +565,7 @@ impl Manifest {
                 }
             }
         }
+        crate::operators::workspace::validate(self)?;
         if let Some(audio) = &self.audio {
             audio.validate(self)?;
         }

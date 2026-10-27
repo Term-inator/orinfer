@@ -526,18 +526,17 @@ impl ModelRuntime {
         if self.reserved_requests.values().any(|r| r.audio) {
             programs.extend(["audio_stem", "audio_encoder"]);
         }
+        let context = context.max(
+            self.reserved_requests
+                .values()
+                .map(|r| r.context)
+                .max()
+                .unwrap_or(0),
+        );
         let mut bytes = self
             .execution
-            .pending_prefill_workspace_bytes(
-                context.max(
-                    self.reserved_requests
-                        .values()
-                        .map(|r| r.context)
-                        .max()
-                        .unwrap_or(0),
-                ),
-            )?
-            .checked_add(self.execution.pending_text_workspace_bytes()?)
+            .pending_prefill_workspace_bytes(context)?
+            .checked_add(self.execution.pending_text_workspace_bytes(context)?)
             .and_then(|n| n.checked_add(self.execution.pending_workspace_bytes(&programs).ok()?))
             .ok_or("Pending shared workspace overflow")?;
         let samplers = self

@@ -18,6 +18,7 @@ mod row_variants;
 mod rows;
 mod unified_decode;
 mod vision;
+mod workspace;
 use crate::{adapter::Adapter, artifact::Result, model::Manifest, policy::Policy};
 use orinfer_model_sdk::{
     abi::{self, CreateRequest, CreatedPlan},
@@ -334,6 +335,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     // after every alias exists so none can reintroduce replaced producers.
     auxiliary::build(&mut request.metadata, &request.kernel_contracts)?;
     parallel::build_rows(&mut request.metadata, &request.kernel_contracts)?;
+    workspace::configure(&mut request.metadata, &request.kernel_contracts)?;
     let expert_banks = experts::banks(&request.metadata, &request.kernel_contracts)?;
     let inputs = inputs::Inputs::open(
         &request.model_root,

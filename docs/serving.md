@@ -262,6 +262,9 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 
 模型包决定实际上下文容量，上限可配置为 262144 tokens。长提示分块计算，首次 dense attention 仍完整计算所需上下文。INT8 group-64 KV 包含 FP16 scale，CUDA VMM 按已执行位置映射物理页，同时保持 Graph 地址稳定；prefill 的单层 FP16 临时 KV workspace 可共享并按需增长。持续 GDN 状态保持 FP32。上下文扩展、KV 优化和验证见[模型构建](../tools/model/README.md)。
 
+Flash Next 原生包声明 QSA 的 Max、Den 和 Out 为逐请求片段串行使用的逐行临时区。执行器按 kernel 的真实行数映射物理页，保留最大容量和稳定虚拟地址；增长前等待已有计算完成，后续小片段复用已映射页。准入按最大请求上下文保守预留所需增长量，合并请求的共享计算行数由各自的 packet 契约约束。重建执行包后生效，权重与 cubin 保持原样；可用 `plan-model` 的 `sequence_workspaces` 和 `batch_execution.workspace_mapped_bytes` 核对契约与实际映射。长片段仍需要对应容量的显存，常驻专家数须与实际请求长度及内存余量共同选择。
+
+
 | 参数 | 默认值 | 行为 |
 | --- | --- | --- |
 | `--listen` | `0.0.0.0:8088` | HTTP 监听地址 |

@@ -218,6 +218,11 @@ fn validate_scopes(model: &Manifest, scopes: &BTreeMap<String, BufferScope>) -> 
             }
         }
     }
+    for name in model.sequence_workspaces.keys() {
+        if scopes.get(name) != Some(&BufferScope::Workspace) {
+            return Err(format!("{name}: sequence scratch must be workspace"));
+        }
+    }
     if let Some(kv) = &model.kv_cache {
         for name in kv.prefill_workspace.keys() {
             if scopes.get(name) != Some(&BufferScope::Workspace)

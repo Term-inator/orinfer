@@ -273,3 +273,107 @@ fn validate_flash_expert_parallel_read_failure() {
     )
     .unwrap();
 }
+
+#[test]
+#[ignore = "Requires real Flash weights and exclusive GPU experiment lock"]
+fn validate_flash_sequence_workspace_growth() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            resident_experts: crate::execution::ResidentExperts::Count(8),
+            host_weight_cache_bytes: 256usize << 20,
+            cuda_graph: crate::execution::CudaGraphMode::Full,
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (name, stride) = model
+        .manifest
+        .sequence_workspaces
+        .iter()
+        .max_by_key(|(_, r)| r.bytes_per_row)
+        .map(|(n, r)| (n.clone(), r.bytes_per_row))
+        .expect("QSA row contract");
+    let address = model.execution.pointers[&name];
+    let capacity = model.execution.sizes[&name];
+    assert_eq!(
+        model.execution.session.workspace_buffers.borrow()[&name].mapped,
+        0
+    );
+    let mut sources = vec![];
+    for (length, first) in [(31, 32), (1057, 33), (31, 34), (1057, 35)] {
+        let mut source = input(&fixture.cases[0], 1);
+        source.input_tokens = source
+            .input_tokens
+            .iter()
+            .copied()
+            .cycle()
+            .take(length)
+            .collect();
+        source.input_tokens[0] = first;
+        sources.push(source);
+    }
+    let capture = |model: &mut ModelRuntime, source: &GenerationInput| {
+        let mut request = model.start_request(input(source, 1), &|| false).unwrap();
+        model
+            .with_request(&mut request, |m, r| {
+                m.advance_prefill(r, source.input_tokens.len(), false)
+            })
+            .unwrap();
+        let scores = flash_batch::distribution(model, &mut request);
+        let state = model
+            .with_request(&mut request, |m, _| {
+                m.prefix_ranges(source.input_tokens.len())?
+                    .into_iter()
+                    .map(|(name, range)| {
+                        let raw = m
+                            .execution
+                            .download_bytes(&name, range.offset + range.bytes)?;
+                        Ok((name, crate::artifact::sha256(&raw[range.offset..])))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()
+            })
+            .unwrap();
+        model.finish_request(&mut request, false).unwrap();
+        (scores, state)
+    };
+    let mut reference = vec![];
+    let mut evidence = vec![];
+    let mut peak = 0;
+    for source in &sources {
+        reference.push(capture(&mut model, source));
+        let buffers = model.execution.session.workspace_buffers.borrow();
+        let r = &buffers[&name];
+        peak = peak.max(
+            r.required_extent(source.input_tokens.len() * stride)
+                .unwrap(),
+        );
+        // required_extent consumes rows when stride is one for ordinary workspace.
+        assert_eq!(r.mapped, peak);
+        assert!(r.mapped < capacity);
+        assert_eq!(model.execution.pointers[&name], address);
+        evidence.push(json!({"rows":source.input_tokens.len(),"mapped_bytes":r.mapped,"capacity_bytes":capacity}));
+    }
+    model.execution.ensure_workspace(&name, capacity).unwrap();
+    for (source, expected) in sources.iter().zip(reference) {
+        let actual = capture(&mut model, source);
+        assert_eq!(
+            actual.0, expected.0,
+            "Full logits changed after full mapping"
+        );
+        assert_eq!(
+            actual.1, expected.1,
+            "Request state changed after full mapping"
+        );
+    }
+    let statistics = model.execution.batch_statistics.get();
+    assert!(statistics.shared_graph_hits > 0 && statistics.shared_graph_captures > 0);
+    std::fs::write(fixture.output,serde_json::to_vec_pretty(&json!({"rows":evidence,"full_logits_equal":true,"all_state_equal":true,"stable_address":true,"shared_graph_hits":statistics.shared_graph_hits,"shared_graph_captures":statistics.shared_graph_captures})).unwrap()).unwrap();
+}
