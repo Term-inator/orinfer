@@ -200,25 +200,7 @@ pub(crate) struct Allocations {
     pub sequence: BufferArena,
     pub workspace: BufferArena,
 }
-pub(crate) struct LoadStats {
-    pub(crate) resident_experts: crate::execution::ResidentExperts,
-    pub(crate) manifest_sha256: String,
-    pub(crate) device: DeviceInfo,
-    pub(crate) load_to_ready_s: f64,
-    pub(crate) load_stages: crate::model::LoadStages,
-    pub(crate) verify_weights: bool,
-    pub(crate) load_workers: usize,
-    pub(crate) preloaded_modules: usize,
-    pub(crate) registered_modules: usize,
-    pub(crate) weight_io_hash_s: f64,
-    pub(crate) weight_upload_s: f64,
-    pub(crate) module_load_bind_s: f64,
-    pub(crate) graph_capture_s: f64,
-    pub(crate) cuda_graph: CudaGraphMode,
-    pub(crate) captured_programs: Vec<String>,
-    pub(crate) buffer_bytes: usize,
-    pub(crate) buffer_capacity_bytes: usize,
-}
+pub(crate) use crate::backend::report::LoadStats;
 
 fn deferred_workspace(
     buffer: &crate::artifact::Buffer<crate::weights::TensorIdentity>,
@@ -752,7 +734,7 @@ impl Executor {
             "LOAD STAGES {}",
             serde_json::to_string(&load_stages).map_err(|e| e.to_string())?
         );
-        let device = DeviceInfo {
+        let device = DeviceInfo::Cuda {
             name: String::from_utf8_lossy(&name)
                 .trim_end_matches('\0')
                 .to_string(),
@@ -951,6 +933,32 @@ impl Executor {
             check(
                 sys::cuMemcpyDtoH_v2(raw.as_mut_ptr().cast(), self.pointers[name], bytes),
                 "download tensor",
+            )?;
+        }
+        Ok(raw)
+    }
+    /// Diagnostic read after the caller has synchronized the producing step.
+    /// Uses the same synchronous copy as the original benchmark path.
+    pub(crate) fn read_ready_bytes(&self, name: &str, bytes: usize) -> Result<Vec<u8>> {
+        if bytes > *self.sizes.get(name).ok_or("Unknown download buffer")? {
+            return Err("Download exceeds buffer".into());
+        }
+        if self
+            .session
+            .virtual_buffers
+            .borrow()
+            .get(name)
+            .is_some_and(|b| bytes > b.mapped)
+        {
+            return Err("Download exceeds resident KV extent".into());
+        }
+        let mut raw = vec![0; bytes];
+        // SAFETY: The validated device and host spans cover bytes; this
+        // synchronous copy preserves the diagnostic caller's completed-step order.
+        unsafe {
+            check(
+                sys::cuMemcpyDtoH_v2(raw.as_mut_ptr().cast(), self.pointers[name], bytes),
+                "download completed tensor",
             )?;
         }
         Ok(raw)

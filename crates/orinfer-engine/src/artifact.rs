@@ -9,7 +9,7 @@ use std::{
 };
 
 pub type Result<T> = std::result::Result<T, String>;
-pub use crate::cuda::RunReport;
+pub use crate::backend::cuda::RunReport;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +58,7 @@ impl Manifest {
                 .ok_or("Total buffer size overflow")?;
         }
         for k in &self.kernels {
+            k.validate_launch(&orinfer_device::Target::from_package(&self.target)?)?;
             if k.name.is_empty()
                 || k.symbol.is_empty()
                 || k.symbol.contains('\0')
@@ -285,7 +286,7 @@ pub fn validate_artifact(path: &Path) -> Result<ValidationReport> {
     })
 }
 pub fn run_artifact(path: &Path) -> Result<RunReport> {
-    crate::cuda::run(load(path)?)
+    crate::backend::cuda::run(load(path)?)
 }
 
 #[cfg(test)]

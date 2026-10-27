@@ -4,7 +4,7 @@
 
 ## 范围
 
-- 硬件固定本机 Jetson AGX Orin 64GB，aarch64/CUDA SM87。
+- 推理基线为 Jetson AGX Orin 64GB，aarch64/CUDA SM87；共享运行时同时为 Altus A2 / Ascend 910B 保留独立后端。当前 Ascend 提供设备探测和 launch 契约，模型执行器尚未注册。CUDA 数值、Graph 和性能验收仍在 Orin 上执行。
 - 支持 Qwen3.8-27B、Qwen3.5-4B（Qwen3_5）、Qwen3.8-Flash-Next（qwen4_exp）和 Index-Translate-2B/9B/35B（Qwen3_5）的文本、图片和多图输入。
 - Qwen3-ASR-1.7B 使用 Qwen3 全注意力解码器、标准 RMSNorm、128 维全 RoPE 和无输出 gate；复用 Qwen 动态行执行流程。文本采用两级 E8P Q4A8，前 4 层 Q/K/V 与 FFN 保留同一 signed-block128 输入基下的 W8，attention 输出投影保留 W8；音频编码器和 projector 保留 FP16，KV 使用 group-64 INT8。Rust 负责音频解码、16 kHz 重采样和 128-bin log-mel，TileLang 执行有界 CNN 与 104-token 窗口编码器。音频特征、位置和输入身份属于请求私有状态及 prefix 缓存身份。
 - ASR 的 Q/K/V 与 gate/up 通过无损拼接权重输出行共享整数投影模板。音频 CNN 使用 NHWC；前处理按帧组并行，多个录音按 104-token 窗口边界打包编码，再写回各 owner 的特征。逐窗口有效长度保持录音边界；GPU 验收覆盖改变输入、反向准入、空闲 arena 复用、prefix 恢复及完整请求。

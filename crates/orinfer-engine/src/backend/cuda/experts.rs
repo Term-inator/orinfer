@@ -6,7 +6,6 @@ use crate::{
     weights::TensorSource,
 };
 use orinfer_model_sdk::abi::ExpertBank;
-use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 type Key = (usize, usize);
@@ -37,20 +36,7 @@ impl Queue {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct Statistics {
-    pub capacity_experts: usize,
-    pub resident_experts: usize,
-    pub transient_experts: usize,
-    pub peak_transient_experts: usize,
-    pub lookups: u64,
-    pub hits: u64,
-    pub evictions: u64,
-    pub loaded_bytes: u64,
-    /// Physical VMM pages include allocation-granule overhead and shared neighbors.
-    pub mapped_bytes: usize,
-    pub peak_mapped_bytes: usize,
-}
+pub use crate::backend::report::ExpertCacheStatistics as Statistics;
 
 pub(super) struct Plan {
     pub banks: Vec<ExpertBank>,

@@ -1219,7 +1219,7 @@ fn validate_flash_mixed_decoder_groups() {
         }
     }
     if shared_graphs {
-        let stats = model.execution.batch_statistics.get();
+        let stats = model.execution.batch_statistics();
         assert!(
             stats.shared_graph_captures > 0 && stats.shared_graph_hits > 0,
             "Shared pieces must replay across membership changes: {stats:?}"
@@ -1295,7 +1295,7 @@ fn validate_flash_mixed_segments() {
             .start_request(input(&fixture.cases[1], 4), &|| false)
             .unwrap();
         let mut output = vec![];
-        let before = model.execution.batch_statistics.get();
+        let before = model.execution.batch_statistics();
         let inputs_before = model.scheduler_statistics.batch_inputs_s;
         let plan_before = model.scheduler_statistics.batch_plan_s;
         let commit_before = model.scheduler_statistics.batch_commit_s;
@@ -1319,7 +1319,7 @@ fn validate_flash_mixed_segments() {
             .sum();
         let token = *anchor.history.last().unwrap();
         let delta = reference[token as usize] - actual[token as usize];
-        let after = model.execution.batch_statistics.get();
+        let after = model.execution.batch_statistics();
         let row = json!({"round":round,"chunk":chunk,"decode_tokens":1,"mixed_s":elapsed,
             "direct_s":after.direct_s-before.direct_s,"kernel_load_s":after.kernel_load_s-before.kernel_load_s,
             "inputs_s":model.scheduler_statistics.batch_inputs_s-inputs_before,

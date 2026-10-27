@@ -1,7 +1,7 @@
 //! Resume a large forward pass at model-registered layer boundaries. Tokens
 //! become committed only after its target body and shifted draft warm complete.
 use super::*;
-use crate::cuda::snapshot::{Range, Workspace};
+use crate::backend::snapshot::{Range, Workspace};
 use std::{cell::RefCell, rc::Rc};
 
 pub(super) struct Frame {
@@ -102,7 +102,7 @@ impl ModelRuntime {
         // forward pass, never to recomputing already-mutated recurrent layers.
         loop {
             let began = Instant::now();
-            let before = self.execution.batch_statistics.get();
+            let before = self.execution.batch_statistics();
             let stage = frame.next;
             self.scheduler_statistics.layered_prefill_iterations += 1;
             if stage < frame.plan.stages.len() {
@@ -110,7 +110,7 @@ impl ModelRuntime {
                 self.launch_rows(&frame.plan.stages[stage], chunk, ExecutionPhase::Prefill)?;
                 frame.next += 1;
                 frame.regular_s += began.elapsed().as_secs_f64()
-                    - (self.execution.batch_statistics.get().initialization_s()
+                    - (self.execution.batch_statistics().initialization_s()
                         - before.initialization_s());
                 if frame.next == frame.plan.stages.len() {
                     if let Some(spec) = &self.manifest.mtp {
@@ -144,7 +144,7 @@ impl ModelRuntime {
             if bounded {
                 self.scheduler_statistics.bounded_prefill_iterations += 1;
             }
-            let after = self.execution.batch_statistics.get();
+            let after = self.execution.batch_statistics();
             let cold = after.initialization_s() - before.initialization_s()
                 + after.sequence_capture_s
                 - before.sequence_capture_s;
@@ -180,7 +180,7 @@ impl ModelRuntime {
                                 name.clone(),
                                 Range {
                                     offset: 0,
-                                    bytes: self.execution.sizes[name],
+                                    bytes: self.execution.buffer_size(name),
                                 },
                             )
                         })

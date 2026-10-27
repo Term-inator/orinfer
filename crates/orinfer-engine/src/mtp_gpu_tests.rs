@@ -1,6 +1,6 @@
 //! Real autoregressive MTP acceptance, state recovery and committed-token timing.
 use super::*;
-use crate::cuda::sys;
+use crate::backend::cuda::sys;
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
@@ -209,7 +209,7 @@ pub(crate) fn complete_prefix_state(
     if let Some(spec) = &model.manifest.mtp {
         ranges.insert(
             spec.draft_logits.clone(),
-            crate::cuda::snapshot::Range {
+            crate::backend::snapshot::Range {
                 offset: 0,
                 bytes: model.execution.sizes[&spec.draft_logits],
             },

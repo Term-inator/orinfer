@@ -58,9 +58,32 @@ CUDA context、stream 和显存统一由引擎管理。包声明执行程序，�
 
 ## 构建与更新
 
+### 设备后端边界
+
+`orinfer-device` 定义后端、主机 ABI、设备架构、Graph 策略、逻辑内存区间及会话归属，不加载设备驱动。`orinfer-engine/src/backend/executor.rs` 是共享运行时的执行入口；CUDA 的 context、stream、VMM、Graph、kernel 和传输实现位于 `backend/cuda/`。生成、embedding 和 rerank 使用同一个入口，设备句柄留在后端内部。
+
+包的 `target` 决定后端和主机 ABI：原有 `sm_87` 对应 aarch64/CUDA，`ascend910b` 对应 aarch64/Ascend，`ascend910b-x86_64` 对应 x86_64/Ascend。安装时静态检查 ELF 与声明的主机匹配；加载原生模型库前检查当前主机。模型架构及 `compute_policy` 保持独立，Ascend 目标本身不表示已有 DeepSeek 或 W4A8 模型实现。
+
+现有 CUDA catalog 保留原字段和 JSON 形式。Ascend 定义使用 `launch: {"backend":"ascend","block_dim":24,"workspace_bytes":8192}`，tiling 数据沿显式参数 ABI 传递。Ascend 定义中 CUDA 的 grid/block/shared/cooperative 必须省略或为零/false；混用后端或几何字段会在校验阶段失败。动态行 launch 和 Graph 的具体实现仍由对应设备后端提供。
+
+prefix 的逻辑区间、状态片段、预算及统计由共享层管理；物理映射和复制由后端执行。快照记录后端、设备和会话代次，恢复、继承和共享映射前拒绝其他会话的 backing，防止同卡重建 worker 后复用失效地址。缓存持久化或跨 worker 迁移需要单独的复制/导入协议。
+
+```bash
+orinfer devices --backend cuda
+# 先按本机 CANN 安装配置运行库环境：
+orinfer devices --backend ascend
+# 可显式选择 ACL 库：
+ORINFER_ASCEND_LIBRARY=/path/to/libascendcl.so orinfer devices --backend ascend
+```
+
+Ascend 探测只初始化 ACL、读取卡数与 SoC 并释放本次初始化，不分配设备内存或执行 kernel。输出中的 `api_symbols` 仅表示当前库存在对应入口，芯片能力需要实际验证。当前 `model_execution_available` 为 false；加载 Ascend 模型会明确报未注册执行器。A2 后续还需实现模型执行器、HCCL/rank 生命周期、DSV4.1 模型适配和量化算子，并完成真实设备数值、Graph、prefix 恢复和端到端验收。现有 CUDA 执行包 schema 1、C ABI v1、`--cuda-graph` 和统计字段保留；`--graph` 是相同参数的别名。
+
+### 源码入口
+
 统一源码入口：
 
 - `crates/orinfer-engine`：通用运行设施。
+- `crates/orinfer-device`：无驱动依赖的设备及执行契约。
 - `crates/orinfer-model-sdk`：计划、状态和原生 C ABI 契约。
 - `crates/orinfer-models`：模型适配器、独立的精度策略选择和注册表。
 - `kernels/`：可复用的 TileLang 算子与融合实现。
@@ -100,7 +123,7 @@ orinfer plan-model /path/to/new-model
 orinfer validate-model /path/to/new-model
 ```
 
-安装器按文件内容识别 `.tar.xz` 和旧 `.tar.gz`，校验 package digest、schema/ABI、SM87 目标、aarch64 ELF 库和全部独立／safetensors 内嵌 kernel 资产的 SHA256；安装期间对库文件做静态校验。路径越界、链接和重复归档成员被拒绝，全部校验成功才原子写入缓存，失败清理临时目录，已安装的同 digest 包保持原样。解压与校验只发生在安装时，后续启动直接读取已安装的资产。
+安装器按文件内容识别 `.tar.xz` 和旧 `.tar.gz`，校验 package digest、schema/ABI、设备目标、目标主机的 ELF 库和全部独立／safetensors 内嵌 kernel 资产的 SHA256；安装期间对库文件做静态校验。路径越界、链接和重复归档成员被拒绝，全部校验成功才原子写入缓存，失败清理临时目录，已安装的同 digest 包保持原样。解压与校验只发生在安装时，后续启动直接读取已安装的资产。
 
 默认安装位置与运行时一致：优先 `ORINFER_EXECUTION_CACHE`，其次 `$XDG_CACHE_HOME/orinfer/packages`，最后 `~/.cache/orinfer/packages`。`--cache /path/to/packages` 只改变本次安装位置；自定义位置需要同时为后续运行设置 `ORINFER_EXECUTION_CACHE`。
 

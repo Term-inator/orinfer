@@ -8,71 +8,8 @@ use std::{
     time::Instant,
 };
 
-#[derive(Clone, Debug)]
-pub(crate) struct Range {
-    pub offset: usize,
-    pub bytes: usize,
-}
-#[derive(Debug)]
-pub(crate) struct Allocation {
-    pub(super) address: u64,
-    pub(super) bytes: usize,
-    pub(super) handle: Option<u64>,
-}
-#[derive(Clone)]
-pub(crate) struct Piece {
-    allocation: Rc<Allocation>,
-    name: String,
-    range: Range,
-    source: usize,
-}
-#[derive(Clone)]
-pub(crate) struct Snapshot {
-    pub bytes: usize,
-    state: Vec<Piece>,
-    pub kv: Vec<Piece>,
-}
-/// Private, reusable backing for a live shared-workspace continuation. It is
-/// never published to the immutable prefix cache or cloned as a Snapshot.
-pub(crate) struct Workspace {
-    snapshot: Snapshot,
-    resident: bool,
-    saved_s: f64,
-}
-impl Workspace {
-    pub(crate) fn bytes(&self) -> usize {
-        self.snapshot.bytes
-    }
-}
-pub(crate) struct Plan {
-    state: BTreeMap<String, Range>,
-    tail: BTreeMap<String, Range>,
-    kv: Vec<Piece>,
-    pub new_bytes: usize,
-}
-impl crate::prefix::Resident for Plan {
-    fn allocations(&self, out: &mut BTreeMap<u64, usize>) {
-        for p in &self.kv {
-            out.insert(p.allocation.address, p.allocation.bytes);
-        }
-    }
-}
-impl crate::prefix::Resident for Snapshot {
-    fn allocations(&self, out: &mut BTreeMap<u64, usize>) {
-        for p in self.state.iter().chain(&self.kv) {
-            out.insert(p.allocation.address, p.allocation.bytes);
-        }
-    }
-}
-fn size(ranges: &BTreeMap<String, Range>) -> Result<usize> {
-    ranges.values().try_fold(0usize, |offset, r| {
-        offset
-            .checked_add(r.bytes)
-            .and_then(|n| n.checked_add(255))
-            .map(|n| n & !255)
-            .ok_or("Snapshot size overflow".into())
-    })
-}
+use crate::backend::snapshot::size;
+pub(crate) use crate::backend::snapshot::{Allocation, Piece, Plan, Range, Snapshot, Workspace};
 impl Executor {
     #[cfg(test)]
     pub(crate) fn snapshot_resident_bytes(&self) -> usize {
@@ -84,6 +21,9 @@ impl Executor {
         kv_names: &BTreeSet<String>,
         base: &[Piece],
     ) -> Result<Plan> {
+        for piece in base {
+            self.session.owner.require(piece.allocation.owner)?;
+        }
         let (mut state_ranges, mut new_kv, mut kv) = (BTreeMap::new(), BTreeMap::new(), vec![]);
         for (name, range) in ranges {
             let end = range
@@ -143,6 +83,7 @@ impl Executor {
             .checked_add(self.kv_snapshot_size(&new_kv)?)
             .ok_or("Snapshot size overflow")?;
         Ok(Plan {
+            owner: self.session.owner,
             state: state_ranges,
             tail: new_kv,
             kv,
@@ -172,6 +113,7 @@ impl Executor {
         })
     }
     pub(crate) fn snapshot(&mut self, plan: &Plan) -> Result<Option<Snapshot>> {
+        self.session.owner.require(plan.owner)?;
         self.sync()?;
         self.collect_snapshots()?;
         let Some(state) = self.save_ranges(plan.state.clone())? else {
@@ -186,7 +128,12 @@ impl Executor {
         kv.extend(tail);
         let bytes = state.iter().chain(&kv).map(|p| p.range.bytes).sum();
         self.sync()?;
-        Ok(Some(Snapshot { bytes, state, kv }))
+        Ok(Some(Snapshot {
+            owner: self.session.owner,
+            bytes,
+            state,
+            kv,
+        }))
     }
     fn save_ranges(&mut self, ranges: BTreeMap<String, Range>) -> Result<Option<Vec<Piece>>> {
         self.allocate_ranges(ranges, true)
@@ -219,6 +166,7 @@ impl Executor {
         }
         self.session.buffers.push(address);
         let allocation = Rc::new(Allocation {
+            owner: self.session.owner,
             address,
             bytes,
             handle: None,
@@ -266,6 +214,7 @@ impl Executor {
         let bytes = state.iter().map(|p| p.range.bytes).sum();
         Ok(Some(Rc::new(RefCell::new(Workspace {
             snapshot: Snapshot {
+                owner: self.session.owner,
                 bytes,
                 state,
                 kv: vec![],
@@ -275,6 +224,10 @@ impl Executor {
         }))))
     }
     pub(crate) fn retain_workspace(&mut self, workspace: &Rc<RefCell<Workspace>>) -> Result<()> {
+        workspace
+            .borrow()
+            .snapshot
+            .require_owner(self.session.owner)?;
         if self
             .live_workspace
             .as_ref()
@@ -326,6 +279,10 @@ impl Executor {
         Ok(())
     }
     pub(crate) fn resume_workspace(&mut self, workspace: &Rc<RefCell<Workspace>>) -> Result<f64> {
+        workspace
+            .borrow()
+            .snapshot
+            .require_owner(self.session.owner)?;
         if let Some((_, live)) = &self.live_workspace
             && live
                 .upgrade()
@@ -406,6 +363,7 @@ impl Executor {
             }
             let handle = self.session.prefix_buffers.borrow()[&key].allocation_handle()?;
             let allocation = Rc::new(Allocation {
+                owner: self.session.owner,
                 address,
                 bytes,
                 handle: Some(handle),
@@ -457,6 +415,7 @@ impl Executor {
         Ok(Some(pieces))
     }
     pub(crate) fn restore_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+        snapshot.require_owner(self.session.owner)?;
         self.sync()?;
         // Map complete immutable KV allocations at fixed request VAs. Partial
         // allocation slices and endpoint state retain the byte-exact copy path.
@@ -695,6 +654,7 @@ mod tests {
         );
         let mut piece = Piece {
             allocation: Rc::new(Allocation {
+                owner: orinfer_device::DeviceOwner::new(orinfer_device::Backend::Cuda, 0),
                 address: 0,
                 bytes: 8192,
                 handle: Some(7),

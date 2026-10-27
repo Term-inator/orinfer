@@ -166,7 +166,7 @@ fn validate_mtp_packet_graph_reuse() {
                                 .into_iter()
                                 .filter(|(_, n)| *n > 0)
                                 .map(|(name, bytes)| {
-                                    (name, crate::cuda::snapshot::Range { offset: 0, bytes })
+                                    (name, crate::backend::snapshot::Range { offset: 0, bytes })
                                 })
                                 .collect();
                             let plan =

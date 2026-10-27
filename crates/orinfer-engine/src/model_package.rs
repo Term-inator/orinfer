@@ -1,4 +1,4 @@
-//! Hash-verified model libraries. The engine owns CUDA; packages own model plans.
+//! Hash-verified model libraries. The engine owns devices; packages own model plans.
 use crate::{
     artifact::{FileIdentity, Result, read_identity, resolve_file},
     execution::{BufferView, Invocation},
@@ -27,15 +27,26 @@ pub(crate) fn inspect_library(path: &Path) -> Result<abi::PackageInfo> {
     ModelPackage::open(path, &image)?.describe()
 }
 
-pub(crate) fn validate_library(image: &[u8]) -> Result<()> {
+pub(crate) fn validate_library(image: &[u8], host_arch: &str) -> Result<()> {
+    let machine = match host_arch {
+        "aarch64" => 183,
+        "x86_64" => 62,
+        _ => {
+            return Err(format!(
+                "Unsupported model-library host architecture {host_arch}"
+            ));
+        }
+    };
     if image.len() < 20
         || &image[..4] != b"\x7fELF"
         || image[4] != 2
         || image[5] != 1
         || u16::from_le_bytes([image[16], image[17]]) != 3
-        || u16::from_le_bytes([image[18], image[19]]) != 183
+        || u16::from_le_bytes([image[18], image[19]]) != machine
     {
-        return Err("Model library must be an aarch64 ELF shared object".into());
+        return Err(format!(
+            "Model library must be an {host_arch} ELF shared object"
+        ));
     }
     Ok(())
 }
@@ -73,7 +84,7 @@ pub(crate) struct ModelPackage {
 }
 impl ModelPackage {
     fn open(path: &Path, image: &[u8]) -> Result<Self> {
-        validate_library(image)?;
+        validate_library(image, std::env::consts::ARCH)?;
         // SAFETY: this explicitly selected native library implements the documented
         // C ABI. The model loader verifies its hash before calling open.
         let library = unsafe { Library::new(path) }.map_err(|e| format!("Model library: {e}"))?;
@@ -120,6 +131,8 @@ impl ModelPackage {
         spec: &ExecutionLibrary,
         request: CreateRequest,
     ) -> Result<(Self, CreatedPlan)> {
+        orinfer_device::Target::from_package(&request.metadata.target)?
+            .require_host(std::env::consts::ARCH)?;
         if spec.library.tensor.is_some() {
             return Err("Native execution library must be a standalone file".into());
         }
@@ -166,7 +179,7 @@ impl ModelPackage {
         let description = model.describe()?;
         if description.package != spec.package
             || description.version != spec.version
-            || description.target != "sm_87"
+            || description.target != request.metadata.target
             || description.runtime_abi != abi::RUNTIME_ABI
             || !description.architectures.contains(&request.architecture)
             || !description
@@ -1109,14 +1122,25 @@ mod tests {
 #[cfg(test)]
 mod portable_tests {
     #[test]
-    fn non_aarch64_execution_library_is_rejected_before_loading() {
+    fn execution_library_machine_matches_its_host_abi_before_loading() {
         let mut image = [0u8; 20];
         image[..6].copy_from_slice(b"\x7fELF\x02\x01");
         image[16..18].copy_from_slice(&3u16.to_le_bytes());
         image[18..20].copy_from_slice(&62u16.to_le_bytes());
+        assert!(super::validate_library(&image, "x86_64").is_ok());
+        assert!(super::validate_library(&image, "aarch64").is_err());
+        image[18..20].copy_from_slice(&183u16.to_le_bytes());
+        assert!(super::validate_library(&image, "aarch64").is_ok());
+        assert!(super::validate_library(&image, "x86_64").is_err());
+        let other = if std::env::consts::ARCH == "aarch64" {
+            62u16
+        } else {
+            183u16
+        };
+        image[18..20].copy_from_slice(&other.to_le_bytes());
         let error = super::ModelPackage::open(std::path::Path::new("unused.so"), &image)
             .err()
             .unwrap();
-        assert!(error.contains("aarch64 ELF shared object"));
+        assert!(error.contains("ELF shared object"));
     }
 }

@@ -226,7 +226,7 @@ fn validate_visual_capacity_and_compact_inputs() {
         }
         checked.push(kernel.name);
     }
-    let graph_hits = model.execution.batch_statistics.get().graph_hits;
+    let graph_hits = model.execution.batch_statistics().graph_hits;
     assert!(
         graph_hits > 0,
         "Changed features must execute through Graph replay"

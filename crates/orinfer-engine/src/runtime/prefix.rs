@@ -1,12 +1,12 @@
 use super::*;
-use crate::cuda::snapshot::Range;
+use crate::backend::snapshot::Range;
 use crate::prefix::{Entry, Media, Resident};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub(super) struct Context {
-    pub kv: Vec<crate::cuda::snapshot::Piece>,
+    pub kv: Vec<crate::backend::snapshot::Piece>,
     pub statistics: crate::prefix::Statistics,
 }
 

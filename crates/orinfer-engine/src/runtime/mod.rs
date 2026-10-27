@@ -1,12 +1,9 @@
 //! Generation orchestration, independent of API transport and CUDA graph binding.
-use crate::cuda::executor::{Executor, LoadStats};
 #[cfg(test)]
-use crate::cuda::sys;
+use crate::backend::cuda::{check, sys};
+use crate::backend::{Executor, LoadStats};
 use crate::execution::{ExecutionPhase, LoadOptions};
-use crate::{
-    artifact::Result,
-    cuda::{Session, check, floats},
-};
+use crate::{artifact::Result, backend::floats};
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -33,7 +30,7 @@ pub(crate) struct ModelRuntime {
     execution: Executor,
     stats: LoadStats,
     pub(crate) speculation_statistics: Option<crate::mtp::Statistics>,
-    prefix_cache: crate::prefix::Cache<crate::cuda::snapshot::Snapshot>,
+    prefix_cache: crate::prefix::Cache<crate::backend::snapshot::Snapshot>,
     pub(crate) prefix_statistics: crate::prefix::Statistics,
     pub(crate) prefix_hints: Vec<usize>,
     prefill_costs: prefill_cost::Costs,
@@ -63,9 +60,9 @@ impl ModelRuntime {
     }
     pub(crate) fn scheduling_statistics(&self) -> crate::scheduler::Statistics {
         let mut statistics = self.scheduler_statistics.clone();
-        statistics.batch_execution = self.execution.batch_statistics.get();
-        statistics.prefill_suspend_s = self.execution.workspace_save_s;
-        statistics.prefill_resume_s = self.execution.workspace_restore_s;
+        statistics.batch_execution = self.execution.batch_statistics();
+        statistics.prefill_suspend_s = self.execution.workspace_save_s();
+        statistics.prefill_resume_s = self.execution.workspace_restore_s();
         statistics
     }
     #[cfg(test)]

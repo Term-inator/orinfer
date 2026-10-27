@@ -100,13 +100,55 @@ pub(crate) fn check(code: sys::CUresult, operation: &str) -> Result<()> {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct DeviceInfo {
-    name: String,
-    sm: [i32; 2],
-    driver_version: i32,
-    total_bytes: usize,
+pub(super) fn inspect() -> Result<super::Inventory> {
+    let _driver = Driver::load()?;
+    let mut count = 0;
+    // SAFETY: Driver symbols are validated and retained. These calls query
+    // inventory without retaining contexts, allocating memory, or launching work.
+    unsafe {
+        check(sys::cuInit(0), "CUDA discovery")?;
+        check(sys::cuDeviceGetCount(&mut count), "CUDA device count")?;
+    }
+    let mut compatible = false;
+    if count > 0 && std::env::consts::ARCH == "aarch64" {
+        let (mut device, mut major, mut minor) = (0, 0, 0);
+        // SAFETY: Device zero is the current model provider's selected device.
+        // These calls only query attributes into live scalar outputs.
+        unsafe {
+            check(sys::cuDeviceGet(&mut device, 0), "CUDA discovery device")?;
+            check(
+                sys::cuDeviceGetAttribute(
+                    &mut major,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    device,
+                ),
+                "CUDA discovery SM major",
+            )?;
+            check(
+                sys::cuDeviceGetAttribute(
+                    &mut minor,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    device,
+                ),
+                "CUDA discovery SM minor",
+            )?;
+        }
+        compatible = [major, minor] == [8, 7];
+    }
+    Ok(super::Inventory {
+        backend: orinfer_device::Backend::Cuda,
+        host_arch: std::env::consts::ARCH.into(),
+        device_count: count.try_into().map_err(|_| "Negative CUDA device count")?,
+        soc: None,
+        runtime_library: "libcuda.so.1".into(),
+        api_symbols: vec![],
+        model_execution_available: compatible,
+    })
 }
+
+#[cfg(test)]
+use crate::backend::values::half_to_float;
+pub use orinfer_device::DeviceInfo;
 #[derive(Debug, Serialize)]
 pub struct RunReport {
     pub manifest_sha256: String,
@@ -129,6 +171,7 @@ pub struct RunReport {
 // Raw handles make this private owner !Send/!Sync. No CUDA context or allocation
 // is borrowed by outside code, and all resources belong to the retained context.
 pub(crate) struct Session {
+    pub(crate) owner: orinfer_device::DeviceOwner,
     pub(crate) driver: Driver,
     pub(crate) device: i32,
     pub(crate) previous: sys::CUcontext,
@@ -152,6 +195,7 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn new(driver: Driver) -> Self {
         Self {
+            owner: orinfer_device::DeviceOwner::new(orinfer_device::Backend::Cuda, 0),
             driver,
             device: 0,
             previous: ptr::null_mut(),
@@ -337,32 +381,7 @@ fn launch_kernel(
     }
 }
 
-pub(crate) fn floats(raw: &[u8], dtype: Dtype) -> Vec<f32> {
-    match dtype {
-        Dtype::F32 => raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect(),
-        Dtype::F16 => raw
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|b| half_to_float(u16::from_le_bytes(*b)))
-            .collect(),
-        Dtype::Bf16 => raw
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
-            .collect(),
-        _ => unreachable!("validated floating point output"),
-    }
-}
-fn half_to_float(bits: u16) -> f32 {
-    half::f16::from_bits(bits).to_f32()
-}
+pub(crate) use crate::backend::floats;
 fn errors(output: &[f32], reference: &[f32]) -> Result<(f64, f64)> {
     let (mut sum, mut norm, mut maximum) = (0f64, 0f64, 0f64);
     for (&a, &b) in output.iter().zip(reference) {
@@ -743,7 +762,7 @@ pub(crate) fn run(x: Loaded) -> Result<RunReport> {
         times.sort_by(f32::total_cmp);
         let report = RunReport {
             manifest_sha256: x.manifest_sha256,
-            device: DeviceInfo {
+            device: DeviceInfo::Cuda {
                 name: name
                     .iter()
                     .take_while(|c| **c != 0)

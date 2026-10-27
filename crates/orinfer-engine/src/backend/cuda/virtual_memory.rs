@@ -222,6 +222,7 @@ impl Reservation {
         offset: usize,
         allocation: Rc<super::snapshot::Allocation>,
     ) -> Result<()> {
+        s.owner.require(allocation.owner)?;
         let handle = allocation
             .handle
             .ok_or("Prefix allocation is not VMM backed")?;
@@ -448,6 +449,7 @@ mod tests {
     #[test]
     fn shared_mapping_cleanup_never_releases_snapshot_owned_handle() {
         let allocation = Rc::new(super::super::snapshot::Allocation {
+            owner: orinfer_device::DeviceOwner::new(orinfer_device::Backend::Cuda, 0),
             address: 0,
             bytes: 8192,
             handle: Some(7),
@@ -495,6 +497,7 @@ mod tests {
         source.grow_bytes(&s, bytes).unwrap();
         let source_address = source.address;
         let allocation = Rc::new(super::super::snapshot::Allocation {
+            owner: s.owner,
             address: source.address,
             bytes,
             handle: Some(source.allocation_handle().unwrap()),

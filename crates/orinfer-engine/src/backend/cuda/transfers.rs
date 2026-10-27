@@ -187,7 +187,7 @@ impl Transfers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cuda::{Driver, Session};
+    use crate::backend::cuda::{Driver, Session};
 
     #[test]
     fn invalid_transfer_extents_are_rejected_before_using_cuda() {

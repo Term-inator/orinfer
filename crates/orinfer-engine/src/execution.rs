@@ -3,38 +3,9 @@ use crate::artifact::Result;
 use serde::Serialize;
 use std::{fmt, str::FromStr};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CudaGraphMode {
-    #[default]
-    DecodeOnly,
-    Full,
-    Off,
-}
-
-impl fmt::Display for CudaGraphMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::DecodeOnly => "decode_only",
-            Self::Full => "full",
-            Self::Off => "off",
-        })
-    }
-}
-
-impl FromStr for CudaGraphMode {
-    type Err = String;
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "decode_only" => Ok(Self::DecodeOnly),
-            "full" => Ok(Self::Full),
-            "off" => Ok(Self::Off),
-            _ => Err(format!(
-                "Invalid CUDA Graph mode {value:?}; expected decode_only, full or off"
-            )),
-        }
-    }
-}
+pub use orinfer_device::GraphMode;
+/// Compatibility name for existing callers and serialized load options.
+pub type CudaGraphMode = GraphMode;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadOptions {
@@ -68,7 +39,7 @@ impl From<ResidentExperts> for serde_json::Value {
         }
     }
 }
-pub use crate::cuda::experts::Statistics as ExpertCacheStatistics;
+pub use crate::backend::report::ExpertCacheStatistics;
 impl fmt::Display for ResidentExperts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -262,24 +233,8 @@ pub fn parse_cache_mib(value: &str) -> Result<usize> {
         .ok_or_else(|| "Prefix cache MiB must be a nonnegative integer within usize".into())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ExecutionPhase {
-    Prefill,
-    Decode,
-    Vision,
-}
-
+pub(crate) use orinfer_device::ExecutionPhase;
 pub use orinfer_model_sdk::execution::{BufferView, Invocation};
-
-impl CudaGraphMode {
-    pub(crate) fn uses_graph(self, phase: ExecutionPhase) -> bool {
-        match self {
-            Self::DecodeOnly => phase == ExecutionPhase::Decode,
-            Self::Full => true,
-            Self::Off => false,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

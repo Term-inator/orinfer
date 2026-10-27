@@ -68,6 +68,7 @@ def source_identity():
         ("tools/build", "*.py"),
         ("crates/orinfer-models", "*.rs"),
         ("crates/orinfer-model-sdk", "*.rs"),
+        ("crates/orinfer-device", "*.rs"),
     ):
         paths.extend((ROOT / directory).rglob(suffix))
     return source_hash(ROOT, paths)

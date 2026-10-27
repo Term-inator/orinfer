@@ -6,6 +6,8 @@
 
 面向 **Jetson AGX Orin 64GB / CUDA SM87**。Rust 负责引擎与 API，TileLang 在部署前将 GPU 算子编译为执行包。支持 Qwen3.8-27B、Qwen3.8-Flash-Next、Qwen3.5-4B，以及 Index-Translate-2B/9B/35B-A3B-preview，以及语音转写模型 Qwen3-ASR-1.7B；各模型包声明输入能力。
 
+共享运行时已将设备执行与调度、模型语义、prefix 状态分离。Ascend 910B / A2 后端提供 CANN 设备探测和原生 launch 契约，A2 模型执行仍在开发。在已配置 CANN 环境的主机上运行 `orinfer devices --backend ascend` 可查看设备；现有 CUDA 执行包和模型 C ABI 保持兼容。详见[设备后端边界](docs/model-packages.md#设备后端边界)。
+
 ## 功能
 
 - OpenAI Chat Completions 和 Ollama 聊天/生成 API：流式输出、thinking、采样、函数调用、JSON Schema 约束及 token 概率。

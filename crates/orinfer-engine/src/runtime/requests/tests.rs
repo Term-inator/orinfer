@@ -599,7 +599,7 @@ fn validate_joint_prefill_requests() {
     std::fs::write(fixture.output, serde_json::to_vec_pretty(&json!({
         "seed":20261002,"scope":"Own-package serial 512-chunk path regression; independent BF16 acceptance is separate",
         "rows":rows,"scheduler":model.scheduler_statistics,
-        "execution":model.execution.batch_statistics.get()
+        "execution":model.execution.batch_statistics()
     })).unwrap()).unwrap();
 }
 
@@ -1107,7 +1107,7 @@ fn validate_flash_mtp() {
                     .unwrap_or(buffer.bytes().unwrap());
                 (
                     name.clone(),
-                    crate::cuda::snapshot::Range { offset: 0, bytes },
+                    crate::backend::snapshot::Range { offset: 0, bytes },
                 )
             })
             .collect();

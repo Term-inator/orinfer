@@ -6,6 +6,8 @@ Text, vision-language and speech inference on NVIDIA Jetson, powered by Rust and
 
 Built for **Jetson AGX Orin 64GB / CUDA SM87**. Rust runs the engine and APIs; TileLang compiles GPU kernels into execution packages ahead of deployment. Models include Qwen3.8-27B, Qwen3.8-Flash-Next, Qwen3.5-4B, and Index-Translate-2B/9B/35B-A3B-preview. Qwen3-ASR-1.7B provides speech transcription. Each model package declares its input capabilities.
 
+The shared runtime now separates device execution from scheduling, model semantics and prefix state. An Ascend 910B / A2 backend provides CANN discovery and native launch contracts; A2 model execution is still under development. Run `orinfer devices --backend ascend` in a configured CANN environment to inspect the devices. Existing CUDA packages and the model C ABI remain compatible. See [execution-package boundaries](docs/model-packages.md#设备后端边界).
+
 ## Features
 
 - OpenAI Chat Completions and Ollama chat/generate APIs: streaming, thinking, sampling, function calling, JSON Schema constraints and token probabilities.

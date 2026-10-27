@@ -16,7 +16,11 @@ impl std::str::FromStr for MtpDrafts {
 }
 
 #[derive(Parser)]
-#[command(name = "orinfer", version, about = "LLM inference on Jetson AGX Orin")]
+#[command(
+    name = "orinfer",
+    version,
+    about = "Native model inference and accelerator execution packages"
+)]
 struct Cli {
     #[arg(long, global = true, default_value_os_t = orinfer_api::manager::default_data_dir())]
     data_dir: PathBuf,
@@ -94,6 +98,11 @@ enum Command {
     },
     /// Show target and implementation status (default command).
     Info,
+    /// Inspect accelerator runtime availability without loading a model.
+    Devices {
+        #[arg(long)]
+        backend: orinfer_engine::backend::Backend,
+    },
     /// Print the benchmark specification as JSON.
     Plan,
     /// Check AOT fixture and file hashes without CUDA.
@@ -136,8 +145,8 @@ struct LoadArgs {
     /// Routed experts per layer equivalent, shared globally; full keeps all. MTP stays resident.
     #[arg(long, value_name = "full|N", default_value_t = ResidentExperts::default())]
     resident_experts: ResidentExperts,
-    /// CUDA graph capture: decode_only, full or off.
-    #[arg(long, value_name = "MODE", default_value_t = CudaGraphMode::default())]
+    /// Graph capture: decode_only, full or off. --graph is the backend-neutral alias.
+    #[arg(long, visible_alias = "graph", value_name = "MODE", default_value_t = CudaGraphMode::default())]
     cuda_graph: CudaGraphMode,
     /// Hash loaded GPU weights and CPU row tables at startup (slower).
     #[arg(long)]
@@ -506,6 +515,7 @@ fn execute(command: Command, data_dir: &std::path::Path) -> Result<(), String> {
             println!("Status: {}", orinfer_engine::STATUS);
             Ok(())
         }
+        Command::Devices { backend } => print_json(orinfer_engine::backend::inspect(backend)?),
         Command::Plan => {
             println!("{}", orinfer_engine::BENCHMARK_PLAN);
             Ok(())
@@ -675,6 +685,32 @@ fn main() -> ExitCode {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backend_inventory_and_graph_alias_are_typed() {
+        let Some(Command::Devices { backend }) =
+            Cli::try_parse_from(["orinfer", "devices", "--backend", "ascend"])
+                .unwrap()
+                .command
+        else {
+            unreachable!()
+        };
+        assert_eq!(backend, orinfer_engine::backend::Backend::Ascend);
+        assert!(Cli::try_parse_from(["orinfer", "devices", "--backend", "unknown"]).is_err());
+        let Some(Command::RunModel(args)) = Cli::try_parse_from([
+            "orinfer",
+            "run-model",
+            "model",
+            "requests.json",
+            "--graph",
+            "full",
+        ])
+        .unwrap()
+        .command
+        else {
+            unreachable!()
+        };
+        assert_eq!(args.load.cuda_graph, CudaGraphMode::Full);
+    }
     use super::*;
     #[test]
     fn managed_batch_only_overrides_explicit_model_options() {

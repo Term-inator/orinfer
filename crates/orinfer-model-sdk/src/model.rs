@@ -408,12 +408,11 @@ impl Manifest {
             return Err("Duplicate packet operand tables".into());
         }
 
-        if self.schema_version != 2
-            || self.target != "sm_87"
-            || self.model.is_empty()
-            || self.toolchain.is_empty()
-        {
-            return Err("Expected safetensors model schema 2 for SM87; prepare the AOT model directory first".into());
+        let target = orinfer_device::Target::from_package(&self.target)?;
+        if self.schema_version != 2 || self.model.is_empty() || self.toolchain.is_empty() {
+            return Err(
+                "Expected safetensors model schema 2; prepare the AOT model directory first".into(),
+            );
         }
         if self.chunk_tokens == 0
             || self.chunk_tokens > self.max_context
@@ -629,6 +628,7 @@ impl Manifest {
         }
         let mut names = BTreeSet::new();
         for k in &self.kernels {
+            k.validate_launch(&target)?;
             if !k.readonly_arguments.is_empty() && k.readonly_arguments.len() != k.args.len() {
                 return Err("Mismatched kernel argument access contract".into());
             }
@@ -641,12 +641,6 @@ impl Manifest {
                 || k.symbol.contains('\0')
                 || k.args.is_empty()
                 || k.cooperative
-                || k.grid.contains(&0)
-                || k.block.contains(&0)
-                || k.block
-                    .iter()
-                    .try_fold(1u32, |n, d| n.checked_mul(*d))
-                    .is_none_or(|n| n > 1024)
             {
                 return Err(format!("Invalid model kernel {}", k.name));
             }

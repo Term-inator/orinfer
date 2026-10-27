@@ -2,7 +2,7 @@
 pub use crate::embedding::Statistics;
 use crate::{
     artifact::Result,
-    cuda::executor::Executor,
+    backend::Executor,
     execution::{ExecutionPhase, LoadOptions},
 };
 pub use orinfer_model_sdk::reranking::Spec;

@@ -59,7 +59,7 @@ fn profile_native_ncu(model: &mut ModelRuntime, plan: &[Invocation]) {
         let pop = library
             .get::<unsafe extern "C" fn() -> i32>(b"nvtxRangePop\0")
             .unwrap();
-        crate::cuda::check(
+        crate::backend::cuda::check(
             cudarc::driver::sys::cuProfilerStart(),
             "profile decode chain",
         )
@@ -82,7 +82,7 @@ fn profile_native_ncu(model: &mut ModelRuntime, plan: &[Invocation]) {
             launched.unwrap();
         }
         model.execution.sync().unwrap();
-        crate::cuda::check(
+        crate::backend::cuda::check(
             cudarc::driver::sys::cuProfilerStop(),
             "stop decode chain profile",
         )
@@ -242,7 +242,7 @@ fn profile_cached_generation() {
             if tracing {
                 // SAFETY: Current CUDA context; Nsight owns collection for this diagnostic.
                 unsafe {
-                    crate::cuda::check(
+                    crate::backend::cuda::check(
                         cudarc::driver::sys::cuProfilerStart(),
                         "start diagnostic trace",
                     )
@@ -313,7 +313,7 @@ fn profile_cached_generation() {
             if tracing {
                 // SAFETY: The timed request completed; stop diagnostic collection.
                 unsafe {
-                    crate::cuda::check(
+                    crate::backend::cuda::check(
                         cudarc::driver::sys::cuProfilerStop(),
                         "stop diagnostic trace",
                     )

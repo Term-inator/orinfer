@@ -52,7 +52,7 @@ pub struct Report {
     pub expert_cache: Option<crate::execution::ExpertCacheStatistics>,
     pub manifest_sha256: String,
     pub model: String,
-    pub device: crate::cuda::DeviceInfo,
+    pub device: crate::backend::DeviceInfo,
     pub load_to_ready_s: f64,
     pub load_stages: LoadStages,
     pub verify_weights: bool,

@@ -1,10 +1,11 @@
-//! Orin-only AOT model execution.
+//! Shared model runtime with device-owned execution backends.
 //!
-//! AOT fixtures and explicit text-model programs execute through the CUDA Driver.
+//! CUDA executes Orin model packages. Ascend provides CANN discovery and native
+//! launch contracts; its model executor is not registered yet.
 
 pub mod architecture;
 pub mod artifact;
-mod cuda;
+pub mod backend;
 pub mod embedding;
 pub mod error;
 pub mod execution;
@@ -21,7 +22,7 @@ pub mod scheduler;
 pub mod vision;
 mod weights;
 
-/// Build target; runtime device discovery must validate it before inference.
+/// Legacy CUDA inference target. Package targets select execution backends.
 pub const TARGET_DEVICE: &str = "Jetson AGX Orin 64GB";
 pub const TARGET_ARCH: &str = "aarch64";
 pub const CUDA_ARCH: &str = "sm_87";
