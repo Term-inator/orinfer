@@ -111,7 +111,16 @@ pub fn run(
                             timeout_ms: 30000,
                         },
                     )?;
-                    Worker::load(session, &root, rank, model_ref, model_dir, package, layout)
+                    Worker::load(
+                        session,
+                        &root,
+                        rank,
+                        model_ref,
+                        model_dir,
+                        package,
+                        layout,
+                        trace.is_some(),
+                    )
                 })();
                 let mut worker = match loaded {
                     Ok(worker) => worker,

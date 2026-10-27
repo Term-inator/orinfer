@@ -227,7 +227,11 @@ impl Completion {
         match state {
             0 => {
                 self.complete.set(true);
-                self.retained.borrow_mut().take();
+                // Retained resources — pinned DMA sources in particular — are
+                // released only by the hard event wait in wait()/Drop: a query
+                // completion does not prove an async memcpy finished reading
+                // host memory, and freeing on query let the host allocator
+                // recycle a buffer that an in-flight DMA was still reading.
                 Ok(true)
             }
             1 => Ok(false),
@@ -235,20 +239,23 @@ impl Completion {
         }
     }
     fn wait(&self) -> Result<()> {
-        if self.complete.get() {
-            return Ok(());
+        if !self.complete.get() {
+            let _current = self.context.enter()?;
+            // SAFETY: Recorded event remains live; timeout is validated at creation.
+            let result = check(
+                unsafe {
+                    (self.context.api.sync_event)(self.event, self.context.limits.timeout_ms)
+                },
+                "wait for ACL completion",
+            );
+            if result.is_err() {
+                self.context.poisoned.set(true);
+            }
+            result?;
+            self.complete.set(true);
         }
-        let _current = self.context.enter()?;
-        // SAFETY: Recorded event remains live; timeout is validated at creation.
-        let result = check(
-            unsafe { (self.context.api.sync_event)(self.event, self.context.limits.timeout_ms) },
-            "wait for ACL completion",
-        );
-        if result.is_err() {
-            self.context.poisoned.set(true);
-        }
-        result?;
-        self.complete.set(true);
+        // Release retained resources only after the event really completed;
+        // a failed fence leaves them quarantined through Drop instead.
         self.retained.borrow_mut().take();
         Ok(())
     }

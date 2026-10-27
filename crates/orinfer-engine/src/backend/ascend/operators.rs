@@ -6,7 +6,13 @@ use super::{
 };
 use crate::artifact::Result;
 use libloading::Library;
-use std::{cell::RefCell, path::Path, ptr, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    ptr,
+    rc::Rc,
+};
 
 type CreateTensor = unsafe extern "C" fn(
     *const i64,
@@ -68,7 +74,21 @@ impl Api {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| root.join("lib64/libopapi.so"));
         let meta_path = root.join("lib64/libnnopbase.so");
-        Self::from_paths(&op_path, &meta_path)
+        // CANN operator libraries are process-wide; load each pair once per
+        // thread. Sessions are thread-affine, so no cross-thread sharing.
+        thread_local! {
+            static CACHE: RefCell<BTreeMap<(PathBuf, PathBuf), Rc<Api>>> =
+                const { RefCell::new(BTreeMap::new()) };
+        }
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(api) = cache.get(&(op_path.clone(), meta_path.clone())) {
+                return Ok(Rc::clone(api));
+            }
+            let api = Self::from_paths(&op_path, &meta_path)?;
+            cache.insert((op_path, meta_path), Rc::clone(&api));
+            Ok(api)
+        })
     }
     fn from_paths(op: &Path, meta: &Path) -> Result<Rc<Self>> {
         // SAFETY: Explicitly selected CANN libraries; the owner retains them for

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{CStr, c_char},
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
 };
 
@@ -108,13 +108,78 @@ impl Spec {
 }
 
 type Entry = unsafe extern "C" fn(*const Handle, u64, Handle) -> i32;
-struct Bound {
-    context: Rc<Context>,
+
+/// One hash-verified AOT library with its validated manifest. Loading, hash
+/// and ABI checks happen once per unique manifest; instances only bind
+/// operand tables against this shared code.
+pub struct Template {
+    path: PathBuf,
     _library: Library,
     spec: Spec,
+    entry: Entry,
+}
+impl Template {
+    pub fn load(session: &Session, manifest: &Path) -> Result<Rc<Self>> {
+        let manifest = manifest.canonicalize().map_err(|e| e.to_string())?;
+        let base = manifest.parent().ok_or("AOT manifest has no parent")?;
+        let spec: Spec = crate::model::read(&manifest)?;
+        spec.validate()?;
+        spec.target.require_host(std::env::consts::ARCH)?;
+        let image = read_identity(base, &spec.library)?;
+        crate::model_package::validate_library(&image, &spec.target.host_arch)?;
+        let path = resolve_file(base, &spec.library.file)?;
+        let _current = session.context.enter()?;
+        let soc = super::inventory(&session.context.driver)?
+            .soc
+            .ok_or("Ascend SoC unavailable")?;
+        if !soc.starts_with("Ascend910B") {
+            return Err(format!("A2 kernel cannot execute on {soc}"));
+        }
+        // SAFETY: Explicitly selected, hash/host-verified AOT code. Loading occurs
+        // in the owning context; the library remains live until its last fence.
+        let library =
+            unsafe { Library::new(path) }.map_err(|e| format!("A2 kernel library: {e}"))?;
+        // SAFETY: The versioned entry returns a static NUL-terminated descriptor
+        // in this hash-verified library. Metadata is checked before any launch.
+        let descriptor = unsafe {
+            let entry = library
+                .get::<unsafe extern "C" fn() -> *const c_char>(b"orinfer_ascend_kernel_spec_v1\0")
+                .map_err(|e| e.to_string())?;
+            let pointer = entry();
+            if pointer.is_null() {
+                return Err("AOT library returned null contract".into());
+            }
+            CStr::from_ptr(pointer)
+                .to_str()
+                .map_err(|e| e.to_string())?
+        };
+        let compiled: serde_json::Value =
+            serde_json::from_str(descriptor).map_err(|e| e.to_string())?;
+        if compiled != spec.identity() {
+            return Err("AOT operand/shape contract differs from the compiled library".into());
+        }
+        // SAFETY: Versioned C signature emitted by the offline compiler wrapper.
+        let entry = unsafe {
+            *library
+                .get::<Entry>(b"orinfer_ascend_kernel_v1\0")
+                .map_err(|e| e.to_string())?
+        };
+        Ok(Rc::new(Self {
+            path: manifest,
+            _library: library,
+            spec,
+            entry,
+        }))
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+struct Bound {
+    context: Rc<Context>,
+    template: Rc<Template>,
     buffers: Vec<Buffer>,
     pointers: Vec<Handle>,
-    entry: Entry,
 }
 impl Bound {
     fn launch(&self, stream: Handle) -> Result<()> {
@@ -122,7 +187,9 @@ impl Bound {
         // Metadata, extents, session ownership and aliases were checked on bind;
         // Bound retains every allocation, native code and context to the fence.
         check(
-            unsafe { (self.entry)(self.pointers.as_ptr(), self.pointers.len() as u64, stream) },
+            unsafe {
+                (self.template.entry)(self.pointers.as_ptr(), self.pointers.len() as u64, stream)
+            },
             "launch TileLang Ascend kernel",
         )
     }
@@ -182,11 +249,13 @@ impl Program {
 }
 impl Kernel {
     pub fn load(session: &Session, manifest: &Path, buffers: &[Buffer]) -> Result<Self> {
-        let manifest = manifest.canonicalize().map_err(|e| e.to_string())?;
-        let base = manifest.parent().ok_or("AOT manifest has no parent")?;
-        let spec: Spec = crate::model::read(&manifest)?;
-        spec.validate()?;
-        spec.target.require_host(std::env::consts::ARCH)?;
+        let template = Template::load(session, manifest)?;
+        Self::bind(session, &template, buffers)
+    }
+    /// Binds an operand table to an already verified AOT template. The
+    /// manifest is not re-read here; cache owners keep the template alive.
+    pub fn bind(session: &Session, template: &Rc<Template>, buffers: &[Buffer]) -> Result<Self> {
+        let spec = &template.spec;
         if buffers.len() != spec.operands.len() {
             return Err("AOT operand count differs from the compiled ABI".into());
         }
@@ -203,58 +272,20 @@ impl Kernel {
                 }
             }
         }
-        let image = read_identity(base, &spec.library)?;
-        crate::model_package::validate_library(&image, &spec.target.host_arch)?;
-        let path = resolve_file(base, &spec.library.file)?;
-        let _current = session.context.enter()?;
-        let soc = super::inventory(&session.context.driver)?
-            .soc
-            .ok_or("Ascend SoC unavailable")?;
-        if !soc.starts_with("Ascend910B") {
-            return Err(format!("A2 kernel cannot execute on {soc}"));
-        }
-        // SAFETY: Explicitly selected, hash/host-verified AOT code. Loading occurs
-        // in the owning context; the library remains live until its last fence.
-        let library =
-            unsafe { Library::new(path) }.map_err(|e| format!("A2 kernel library: {e}"))?;
-        // SAFETY: The versioned entry returns a static NUL-terminated descriptor
-        // in this hash-verified library. Metadata is checked before any launch.
-        let descriptor = unsafe {
-            let entry = library
-                .get::<unsafe extern "C" fn() -> *const c_char>(b"orinfer_ascend_kernel_spec_v1\0")
-                .map_err(|e| e.to_string())?;
-            let pointer = entry();
-            if pointer.is_null() {
-                return Err("AOT library returned null contract".into());
-            }
-            CStr::from_ptr(pointer)
-                .to_str()
-                .map_err(|e| e.to_string())?
-        };
-        let compiled: serde_json::Value =
-            serde_json::from_str(descriptor).map_err(|e| e.to_string())?;
-        if compiled != spec.identity() {
-            return Err("AOT operand/shape contract differs from the compiled library".into());
-        }
-        // SAFETY: Versioned C signature emitted by the offline compiler wrapper.
-        let entry = unsafe {
-            *library
-                .get::<Entry>(b"orinfer_ascend_kernel_v1\0")
-                .map_err(|e| e.to_string())?
-        };
         Ok(Self {
             bound: Rc::new(Bound {
                 context: Rc::clone(&session.context),
-                _library: library,
-                spec,
+                template: Rc::clone(template),
                 buffers: buffers.to_vec(),
                 pointers: buffers.iter().map(Buffer::pointer).collect(),
-                entry,
             }),
         })
     }
     pub fn spec(&self) -> &Spec {
-        &self.bound.spec
+        &self.bound.template.spec
+    }
+    pub fn template(&self) -> &Rc<Template> {
+        &self.bound.template
     }
     pub fn enqueue(&self, session: &Session) -> Result<Ticket> {
         session.same_context(&self.bound.context)?;

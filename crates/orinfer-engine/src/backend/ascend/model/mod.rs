@@ -5,9 +5,9 @@ mod weights;
 
 use super::{
     hccl::{Communicator, Element, RootInfo},
-    kernels::{Kernel, Program},
+    kernels::{Kernel, Program, Template},
     operators::{GroupedInputs, GroupedShape, GroupedW4A8},
-    runtime::{Buffer, Limits, Session},
+    runtime::{Buffer, Limits, Session, Ticket},
 };
 use crate::{
     artifact::{FileIdentity, Result, read_identity, resolve_file},
@@ -17,8 +17,10 @@ use crate::{
 use orinfer_model_sdk::conditional_memory::{HashLayout, Hasher};
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
+    rc::Rc,
+    time::Instant,
 };
 
 pub use benchmark::{Report, run};
@@ -158,16 +160,168 @@ struct Worker {
     rope: BTreeMap<String, Vec<u8>>,
     capacity: usize,
     rank: u32,
+    templates: BTreeMap<PathBuf, Rc<Template>>,
+    phases: LoadPhases,
 }
 
+/// Host-to-device chunk and pipeline depth; in-flight pinned memory stays
+/// within the session budget while DMA overlaps the next host copy.
+const CHUNK: usize = 8 << 20;
+const DEPTH: usize = 6;
+
+/// Per-phase cold-start accounting for one rank; every phase is wall time
+/// spent on that rank's load thread.
+#[derive(Default)]
+struct Phase {
+    bytes: usize,
+    seconds: f64,
+}
+impl Phase {
+    fn add(&mut self, bytes: usize, seconds: f64) {
+        self.bytes += bytes;
+        self.seconds += seconds;
+    }
+    fn report(&self) -> String {
+        if self.seconds <= 0.0 {
+            return format!("{:.2}GiB/instant", self.bytes as f64 / (1 << 30) as f64);
+        }
+        format!(
+            "{:.2}GiB/{:.1}s({:.2}GiB/s)",
+            self.bytes as f64 / (1 << 30) as f64,
+            self.seconds,
+            self.bytes as f64 / (1 << 30) as f64 / self.seconds
+        )
+    }
+}
+#[derive(Default)]
+struct LoadPhases {
+    hccl_s: f64,
+    alloc_s: f64,
+    prepared: Phase,
+    matrix: Phase,
+    data: Phase,
+    zero: Phase,
+    tables_s: f64,
+    templates: (usize, f64),
+    binds: (usize, f64),
+    aclnn: (usize, f64),
+    warmups: (usize, f64),
+    captures: (usize, f64),
+}
+
+fn wait_in_flight(tickets: &mut VecDeque<Ticket>) -> Result<()> {
+    while let Some(ticket) = tickets.pop_front() {
+        ticket.wait()?;
+    }
+    Ok(())
+}
+
+/// Pipelined upload: submitted chunks overlap host copies with in-flight DMA.
 fn upload(session: &Session, buffer: &Buffer, data: &[u8]) -> Result<()> {
     if data.len() != buffer.bytes() {
         return Err("Model upload byte extent differs".into());
     }
-    for (chunk, bytes) in data.chunks(8 << 20).enumerate() {
-        session.upload(buffer, chunk * (8 << 20), bytes)?.wait()?;
+    let mut tickets = VecDeque::new();
+    for (chunk, bytes) in data.chunks(CHUNK).enumerate() {
+        tickets.push_back(session.upload(buffer, chunk * CHUNK, bytes)?);
+        if tickets.len() > DEPTH {
+            tickets.pop_front().unwrap().wait()?;
+        }
     }
+    wait_in_flight(&mut tickets)
+}
+
+/// Streams a prepared weight file without materializing it in host memory;
+/// storage reads overlap device DMA instead of preceding it.
+fn upload_file(session: &Session, buffer: &Buffer, path: &Path, bytes: usize) -> Result<()> {
+    use std::io::Read;
+    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() != bytes as u64 {
+        return Err("Prepared weight metadata differs".into());
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut staging = vec![0u8; CHUNK];
+    let mut tickets = VecDeque::new();
+    let mut offset = 0;
+    while offset < bytes {
+        let want = CHUNK.min(bytes - offset);
+        file.read_exact(&mut staging[..want])
+            .map_err(|e| e.to_string())?;
+        // The session copies staging into pinned storage before returning.
+        tickets.push_back(session.upload(buffer, offset, &staging[..want])?);
+        offset += want;
+        if tickets.len() > DEPTH {
+            tickets.pop_front().unwrap().wait()?;
+        }
+    }
+    wait_in_flight(&mut tickets)
+}
+
+/// Debug-only integrity check: chunked download and comparison against the
+/// exact bytes that were uploaded. On mismatch, maps nearby device chunks
+/// back to source chunk indices to reveal duplication, swaps or loss.
+fn verify_upload(
+    session: &Session,
+    buffer: &Buffer,
+    name: &str,
+    mut source: impl FnMut(usize, &mut [u8]) -> Result<()>,
+) -> Result<()> {
+    let chunks = buffer.bytes().div_ceil(CHUNK);
+    let mut expected = vec![0u8; CHUNK];
+    for index in 0..chunks {
+        let want = CHUNK.min(buffer.bytes() - index * CHUNK);
+        source(index, &mut expected[..want])?;
+        let actual = session.download(buffer, index * CHUNK, want)?;
+        if actual != expected[..want] {
+            let mut first = 0;
+            while first < want && actual[first] == expected[first] {
+                first += 1;
+            }
+            let mut mapping = vec![];
+            for probe in index..(index + 4).min(chunks) {
+                let chunk = session.download(
+                    buffer,
+                    probe * CHUNK,
+                    CHUNK.min(buffer.bytes() - probe * CHUNK),
+                )?;
+                let mut matches = vec![];
+                for candidate in 0..(chunks.min(8)) {
+                    let mut candidate_data = vec![0u8; CHUNK];
+                    let candidate_want = CHUNK.min(buffer.bytes() - candidate * CHUNK);
+                    source(candidate, &mut candidate_data[..candidate_want])?;
+                    if chunk == candidate_data[..candidate_want] {
+                        matches.push(candidate);
+                    }
+                }
+                mapping.push((probe, matches));
+            }
+            return Err(format!(
+                "{name}: upload verification differs at chunk {index} byte {first}, expected {:02x?}, actual {:02x?}, chunk map {mapping:?}",
+                &expected[first..(first + 16).min(want)],
+                &actual[first..(first + 16).min(want)]
+            ));
+        }
+    }
+    eprintln!("A2 verified {name}");
     Ok(())
+}
+
+fn verify_file_upload(session: &Session, buffer: &Buffer, path: &Path, name: &str) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    verify_upload(session, buffer, name, |index, out| {
+        file.seek(SeekFrom::Start((index * CHUNK) as u64))
+            .and_then(|_| file.read_exact(out))
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn verify_data_upload(session: &Session, buffer: &Buffer, data: &[u8], name: &str) -> Result<()> {
+    verify_upload(session, buffer, name, |index, out| {
+        let begin = index * CHUNK;
+        out.copy_from_slice(&data[begin..begin + out.len()]);
+        Ok(())
+    })
 }
 fn get(buffers: &BTreeMap<String, Buffer>, name: &str) -> Result<Buffer> {
     buffers
@@ -176,6 +330,7 @@ fn get(buffers: &BTreeMap<String, Buffer>, name: &str) -> Result<Buffer> {
         .ok_or_else(|| format!("Model buffer is not defined: {name}"))
 }
 impl Worker {
+    #[allow(clippy::too_many_arguments)]
     fn load(
         session: Session,
         root: &RootInfo,
@@ -184,8 +339,13 @@ impl Worker {
         model_dir: &Path,
         package: &Path,
         layout: HashLayout,
+        snapshots: bool,
     ) -> Result<Self> {
+        let start = Instant::now();
+        let mut phases = LoadPhases::default();
+        let t = Instant::now();
         let comm = Communicator::join(&session, root, rank.rank)?;
+        phases.hccl_s = t.elapsed().as_secs_f64();
         let mut checkpoint = Checkpoint::open(model_dir, &model.index.file)?;
         let mut buffers = BTreeMap::new();
         let needed = rank
@@ -201,6 +361,7 @@ impl Worker {
                 rank.rank
             ));
         }
+        let mut fills: Vec<Ticket> = Vec::new();
         for definition in rank.buffers {
             if buffers.contains_key(&definition.name) || definition.bytes == 0 {
                 return Err("Duplicate/empty model buffer".into());
@@ -214,30 +375,55 @@ impl Worker {
                 }
                 get(&buffers, &view.parent)?.slice(view.offset, definition.bytes)?
             } else {
+                let t = Instant::now();
                 let buffer = session.allocate(definition.bytes)?;
-                let data = if let Some(file) = definition.prepared_weight {
+                phases.alloc_s += t.elapsed().as_secs_f64();
+                let verify = std::env::var_os("ORINFER_A2_VERIFY_UPLOAD").is_some();
+                if let Some(file) = definition.prepared_weight {
                     let path = resolve_file(package, &file)?;
-                    let data = std::fs::read(path).map_err(|e| e.to_string())?;
-                    if data.len() != definition.bytes {
-                        return Err("Prepared weight byte extent differs".into());
+                    let t = Instant::now();
+                    upload_file(&session, &buffer, &path, definition.bytes)?;
+                    phases
+                        .prepared
+                        .add(definition.bytes, t.elapsed().as_secs_f64());
+                    if verify {
+                        verify_file_upload(&session, &buffer, &path, &definition.name)?;
                     }
-                    Some(data)
                 } else if let Some(weight) = definition.weight {
-                    Some(weights::load(&mut checkpoint, &weight)?)
-                } else if let Some(identity) = definition.data {
-                    Some(read_identity(package, &identity)?)
-                } else {
-                    None
-                };
-                if let Some(data) = data {
+                    let t = Instant::now();
+                    let data = weights::load(&mut checkpoint, &weight)?;
                     upload(&session, &buffer, &data)?;
+                    phases
+                        .matrix
+                        .add(definition.bytes, t.elapsed().as_secs_f64());
+                    if verify {
+                        verify_data_upload(&session, &buffer, &data, &definition.name)?;
+                    }
+                } else if let Some(identity) = definition.data {
+                    let t = Instant::now();
+                    let data = read_identity(package, &identity)?;
+                    upload(&session, &buffer, &data)?;
+                    phases.data.add(definition.bytes, t.elapsed().as_secs_f64());
+                    if verify {
+                        verify_data_upload(&session, &buffer, &data, &definition.name)?;
+                    }
                 } else {
-                    session.fill(&buffer, 0)?.wait()?;
+                    // Fills are compute-stream ordered before every later use;
+                    // deferring their waits keeps the transfer stream busy.
+                    let t = Instant::now();
+                    fills.push(session.fill(&buffer, 0)?);
+                    phases.zero.add(definition.bytes, t.elapsed().as_secs_f64());
                 }
                 buffer
             };
             buffers.insert(definition.name, buffer);
         }
+        let t = Instant::now();
+        for ticket in &fills {
+            ticket.wait()?;
+        }
+        phases.zero.seconds += t.elapsed().as_secs_f64();
+        let t = Instant::now();
         let mut tables = BTreeMap::new();
         for layer in &layout.layers {
             let prefix = format!("layers.{}.engram.embed", layer.layer);
@@ -260,6 +446,7 @@ impl Worker {
             .iter()
             .map(|(name, id)| Ok((name.clone(), read_identity(package, id)?)))
             .collect::<Result<_>>()?;
+        phases.tables_s = t.elapsed().as_secs_f64();
         let mut worker = Self {
             session,
             comm,
@@ -272,10 +459,12 @@ impl Worker {
             rope,
             capacity: model.capacity,
             rank: rank.rank,
+            templates: BTreeMap::new(),
+            phases,
         };
         for packet in rank.packets {
-            let body = worker.compile(&packet.body, package)?;
-            let head = worker.compile(&packet.head, package)?;
+            let body = worker.compile(&packet.body, package, snapshots)?;
+            let head = worker.compile(&packet.head, package, snapshots)?;
             if worker
                 .packets
                 .insert(packet.rows, Execution { packet, body, head })
@@ -284,29 +473,77 @@ impl Worker {
                 return Err("Duplicate packet row count".into());
             }
         }
+        let phases = &worker.phases;
+        eprintln!(
+            "A2 rank {} load {:.1}s: hccl={:.1}s alloc={:.1}s prepared={} matrix={} data={} zero={} tables={:.1}s templates={}/{:.1}s binds={}/{:.1}s aclnn={}/{:.1}s warmup={}/{:.1}s captures={}/{:.1}s",
+            rank.rank,
+            start.elapsed().as_secs_f64(),
+            phases.hccl_s,
+            phases.alloc_s,
+            phases.prepared.report(),
+            phases.matrix.report(),
+            phases.data.report(),
+            phases.zero.report(),
+            phases.tables_s,
+            phases.templates.0,
+            phases.templates.1,
+            phases.binds.0,
+            phases.binds.1,
+            phases.aclnn.0,
+            phases.aclnn.1,
+            phases.warmups.0,
+            phases.warmups.1,
+            phases.captures.0,
+            phases.captures.1,
+        );
         Ok(worker)
     }
-    fn compile(&mut self, instructions: &[Instruction], base: &Path) -> Result<Vec<Step>> {
+    fn compile(
+        &mut self,
+        instructions: &[Instruction],
+        base: &Path,
+        snapshots: bool,
+    ) -> Result<Vec<Step>> {
         let mut steps = vec![];
         let mut pending = vec![];
         for instruction in instructions {
+            if let Instruction::Snapshot { name, buffer } = instruction {
+                // Snapshots only observe device state for tracing; without
+                // tracing the step is inert and kernels merge across it.
+                if snapshots {
+                    self.capture_pending(&mut pending, &mut steps)?;
+                    steps.push(Step::Snapshot {
+                        name: name.clone(),
+                        buffer: get(&self.buffers, buffer)?,
+                    });
+                }
+                continue;
+            }
             if let Instruction::Kernel { manifest, buffers } = instruction {
                 let operands = buffers
                     .iter()
                     .map(|n| get(&self.buffers, n))
                     .collect::<Result<Vec<_>>>()?;
-                pending.push(Kernel::load(
-                    &self.session,
-                    &resolve_file(base, manifest)?,
-                    &operands,
-                )?);
+                let path = resolve_file(base, manifest)?;
+                let template = match self.templates.get(&path) {
+                    Some(template) => Rc::clone(template),
+                    None => {
+                        let t = Instant::now();
+                        let template = Template::load(&self.session, &path)?;
+                        self.phases.templates.0 += 1;
+                        self.phases.templates.1 += t.elapsed().as_secs_f64();
+                        self.templates.insert(path, Rc::clone(&template));
+                        template
+                    }
+                };
+                let t = Instant::now();
+                pending.push(Kernel::bind(&self.session, &template, &operands)?);
+                self.phases.binds.0 += 1;
+                self.phases.binds.1 += t.elapsed().as_secs_f64();
                 continue;
             }
             if !pending.is_empty() {
-                let program = Program::new(&self.session, &pending.iter().collect::<Vec<_>>())?;
-                program.enqueue(&self.session)?.wait()?;
-                steps.push(Step::Graph(program.capture(&self.session)?));
-                pending.clear();
+                self.capture_pending(&mut pending, &mut steps)?;
             }
             steps.push(match instruction {
                 Instruction::Reduce {
@@ -339,6 +576,7 @@ impl Worker {
                         .collect::<Result<Vec<_>>>()?;
                     let mut ends = vec![0; *experts];
                     *ends.last_mut().ok_or("Empty W4 expert bank")? = *rows as i64;
+                    let t = Instant::now();
                     let plan = GroupedW4A8::prepare_with_workspace(
                         &self.session,
                         GroupedShape {
@@ -358,6 +596,8 @@ impl Worker {
                         },
                         Some(&get(&self.buffers, workspace)?),
                     )?;
+                    self.phases.aclnn.0 += 1;
+                    self.phases.aclnn.1 += t.elapsed().as_secs_f64();
                     if self.w4.insert(name.clone(), plan).is_some() {
                         return Err("Duplicate W4 binding".into());
                     }
@@ -388,19 +628,32 @@ impl Worker {
                     scales: get(&self.buffers, scales)?,
                     mask: get(&self.buffers, mask)?,
                 },
-                Instruction::Snapshot { name, buffer } => Step::Snapshot {
-                    name: name.clone(),
-                    buffer: get(&self.buffers, buffer)?,
-                },
-                Instruction::Kernel { .. } => unreachable!(),
+                Instruction::Snapshot { .. } | Instruction::Kernel { .. } => unreachable!(),
             });
         }
         if !pending.is_empty() {
-            let program = Program::new(&self.session, &pending.iter().collect::<Vec<_>>())?;
-            program.enqueue(&self.session)?.wait()?;
-            steps.push(Step::Graph(program.capture(&self.session)?));
+            self.capture_pending(&mut pending, &mut steps)?;
         }
         Ok(steps)
+    }
+
+    /// Captures one contiguous kernel run. Every segment executes once before
+    /// capture: CANN's first-use lazy state must exist before the capture
+    /// region records the launches, and skipping repeats of already-executed
+    /// templates produced invalid replay output.
+    fn capture_pending(&mut self, pending: &mut Vec<Kernel>, steps: &mut Vec<Step>) -> Result<()> {
+        let program = Program::new(&self.session, &pending.iter().collect::<Vec<_>>())?;
+        let t = Instant::now();
+        program.enqueue(&self.session)?.wait()?;
+        self.phases.warmups.0 += 1;
+        self.phases.warmups.1 += t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let graph = program.capture(&self.session)?;
+        self.phases.captures.0 += 1;
+        self.phases.captures.1 += t.elapsed().as_secs_f64();
+        steps.push(Step::Graph(graph));
+        pending.clear();
+        Ok(())
     }
     fn reset(&self) -> Result<()> {
         for execution in self.packets.values() {
