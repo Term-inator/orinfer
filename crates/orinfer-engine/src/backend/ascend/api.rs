@@ -43,7 +43,7 @@ functions! {
     create_event: aclrtCreateEventWithFlag(*mut Handle, u32) -> i32;
     destroy_event: aclrtDestroyEvent(Handle) -> i32;
     record_event: aclrtRecordEvent(Handle, Handle) -> i32;
-    query_event: aclrtQueryEventWaitStatus(Handle, *mut i32) -> i32;
+    query_event: aclrtQueryEventStatus(Handle, *mut i32) -> i32;
     sync_event: aclrtSynchronizeEventWithTimeout(Handle, i32) -> i32;
     wait_event: aclrtStreamWaitEventWithTimeout(Handle, Handle, i32) -> i32;
     malloc: aclrtMalloc(*mut Handle, usize, i32) -> i32;

@@ -238,30 +238,13 @@ impl Worker {
         } else {
             &[]
         };
-        let mut inputs = vec![];
+        let mut embeddings = vec![];
         for step in execution.body.iter().chain(head) {
-            match step {
-                Step::Embed(destination) => {
-                    inputs.push(vec![(destination.clone(), self.embedding(tokens)?)])
-                }
-                Step::Lookup {
-                    layer,
-                    values,
-                    scales,
-                    mask,
-                } => inputs.push(self.lookup_inputs(
-                    *layer,
-                    tokens.len(),
-                    hashes,
-                    valid,
-                    values,
-                    scales,
-                    mask,
-                )?),
-                _ => {}
+            if let Step::Embed(destination) = step {
+                embeddings.push(vec![(destination.clone(), self.embedding(tokens)?)])
             }
         }
-        let mut inputs = inputs.into_iter();
+        let mut embeddings = embeddings.into_iter();
         // SAFETY: Execution owns the stable graphs and W4 plans; each graph
         // retains its kernels/collectives, and W4 retains tensors/workspace.
         // submit_compute fences partial submission on failure. Each forward
@@ -278,10 +261,30 @@ impl Worker {
                         match step {
                             Step::Graph(graph) => graph.execute_on_stream(stream)?,
                             Step::W4(plan) => plan.execute_on_stream(stream)?,
-                            Step::Embed(_) | Step::Lookup { .. } => {
+                            Step::Embed(_) => {
                                 self.session.upload_inputs(
-                                    &inputs.next().ok_or("Packet inputs missing")?,
+                                    &embeddings.next().ok_or("Packet embedding missing")?,
                                 )?;
+                            }
+                            Step::Lookup {
+                                layer,
+                                values,
+                                scales,
+                                mask,
+                            } => {
+                                // Earlier graph segments are already queued.
+                                // Prepare CPU rows while they execute, then
+                                // update reused inputs at this stream boundary.
+                                let inputs = self.lookup_inputs(
+                                    *layer,
+                                    tokens.len(),
+                                    hashes,
+                                    valid,
+                                    values,
+                                    scales,
+                                    mask,
+                                )?;
+                                self.session.upload_inputs(&inputs)?;
                             }
                             Step::Snapshot { .. } => {}
                             Step::Route { .. } => {

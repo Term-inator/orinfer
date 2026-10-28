@@ -326,6 +326,26 @@ fn packet_completion_retains_graphs_and_fences_partial_submission_errors() {
 }
 
 #[test]
+fn pending_record_is_not_completed_by_an_empty_waiter_set() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let buffer = session.allocate(4).unwrap();
+    let ticket = session
+        .upload_inputs(&[(buffer.clone(), vec![9, 8, 7, 6])])
+        .unwrap();
+    assert!(!ticket.is_ready().unwrap());
+    // Polling must leave work queued rather than turn reap into a stream wait.
+    session.reap().unwrap();
+    assert!(!ticket.is_ready().unwrap());
+    assert_eq!(session.pinned_bytes(), 4);
+    ticket.wait().unwrap();
+    assert!(ticket.is_ready().unwrap());
+    assert_eq!(session.download(&buffer, 0, 4).unwrap(), [9, 8, 7, 6]);
+    drop((ticket, buffer, session));
+    fixture.assert_clean();
+}
+
+#[test]
 fn ready_query_keeps_dma_backing_until_a_hard_completion_fence() {
     let mut fixture = Fixture::new();
     let session = fixture.session();

@@ -60,7 +60,9 @@ int aclrtRecordEvent(void *p,void *s) {
     ((Event*)p)->stream=s;
     jobs[count++]=(Job){.kind=3,.stream=s,.event=p};return 0;
 }
-int aclrtQueryEventWaitStatus(void *p,int *state) { *state=(failure==11 || ((Event*)p)->ready)?0:1;return 0; }
+/* With no waiters, wait-status can complete while the record is pending. */
+int aclrtQueryEventWaitStatus(void *p,int *state) { (void)p;*state=0;return 0; }
+int aclrtQueryEventStatus(void *p,int *state) { *state=(failure==11 || ((Event*)p)->ready)?1:0;return 0; }
 int aclrtSynchronizeEventWithTimeout(void *p,int timeout) { (void)timeout;return flush(((Event*)p)->stream); }
 int aclrtStreamWaitEventWithTimeout(void *s,void *p,int timeout) {
     (void)timeout;jobs[count++]=(Job){.kind=4,.stream=s,.event=p};return 0;

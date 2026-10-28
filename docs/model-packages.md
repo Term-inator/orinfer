@@ -149,7 +149,7 @@ CPU 验收读取真实表的小批量行，检查所有 token 分块边界的 ha
 
 该入口使用独立的实验计划描述，公共模型包 schema 1 和 C ABI v1 保持原样；`serve` 的 Ascend 执行器仍未注册。当前上下文容量限定为 128–16384，须为 32 的倍数；默认 8448，覆盖 8K 输入和 128 个输出。此范围内候选块覆盖完整历史。prefill 使用 16 行 packet，decode 使用单行 packet；请求间清空历史和残余压缩状态，通过因果索引隔离旧 KV。prefix 复用、并发调度及 MTP 需要后续接入。
 
-普通 packet 用一次完成事件保留图、W4 executor、通信组及其设备资源。坐标、embedding 和 Engram 输入通过 compute stream 有序上传，复用的输入地址在原层边界更新；完成查询后仍通过硬完成栅栏回收 pinned 内存。各 rank 共用只读 Engram 行包，缓存身份包含有序行 ID，掩码保持本次请求私有。ACLNN W4A8 会原地变换激活字节，每次调用前均由上游整数投影准备新的 A8 输入；离线复用 executor 的数值检查也需重新上传原始激活。
+普通 packet 用一次完成事件保留图、W4 executor、通信组及其设备资源。坐标、embedding 和 Engram 输入通过 compute stream 有序上传，复用的输入地址在原层边界更新。Engram 行包在对应层边界准备，使 CPU 查找与此前已提交的设备计算重叠。完成查询使用 `aclrtQueryEventStatus` 的 recorded 状态，pinned 内存统一通过硬完成栅栏回收。各 rank 共用只读 Engram 行包，缓存身份包含有序行 ID，掩码保持本次请求私有。ACLNN W4A8 会原地变换激活字节，每次调用前均由上游整数投影准备新的 A8 输入；离线复用 executor 的数值检查也需重新上传原始激活。
 
 专家张量的行数表示容量，group counts 总和等于本卡的有效路由数，可以小于容量或为零。空闲 gather 槽保持 `-1`，W4 只计算有效行。路由错误标记和扫描计数器由同一个标量核心更新；算子验收覆盖异常索引、反向行序、空路由和改变输入后的 Graph 重放。
 

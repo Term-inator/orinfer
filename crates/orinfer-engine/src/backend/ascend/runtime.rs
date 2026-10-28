@@ -218,23 +218,23 @@ impl Completion {
             return Ok(true);
         }
         let _current = self.context.enter()?;
-        let mut state = 1;
+        // aclrtEventRecordedStatus: NOT_READY=0, COMPLETE=1. Wait-status is
+        // different: no pending stream waiters does not complete the record.
+        let mut state = 0;
         check(
             // SAFETY: Recorded event belongs to the retained context; state is live.
             unsafe { (self.context.api.query_event)(self.event, &mut state) },
             "query ACL completion",
         )?;
         match state {
-            0 => {
-                // Retained resources — pinned DMA sources in particular — are
-                // released only by the hard event wait in wait()/Drop: a query
-                // completion does not prove an async memcpy finished reading
-                // host memory, and freeing on query let the host allocator
-                // recycle a buffer that an in-flight DMA was still reading.
+            1 => {
+                // Keep retirement through wait()/Drop even after a completed
+                // record query, so retained DMA storage has one hard-fence
+                // release path shared with explicit waits and teardown.
                 Ok(true)
             }
-            1 => Ok(false),
-            _ => Err("Unknown ACL event wait status".into()),
+            0 => Ok(false),
+            _ => Err("Unknown ACL recorded-event status".into()),
         }
     }
     fn wait(&self) -> Result<()> {
