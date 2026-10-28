@@ -51,7 +51,8 @@ fn target_state(model: &mut ModelRuntime, request: &mut RequestState) -> BTreeMa
                 // Draft state has a different cursor during lazy catch-up.
                 // Compare live target state and the hidden row needed by the next bridge.
                 .filter(|(name, _)| {
-                    (name.starts_with('L')
+                    ((name.starts_with('L')
+                        || (name.starts_with("State_") && !name.starts_with("State_48_")))
                         && m.manifest.reset_buffers.contains(name)
                         && (!deferred || !name.contains("_GdnLog")))
                         || name == &m.manifest.position
@@ -95,6 +96,10 @@ fn validate_mtp_same_history_consistency() {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 0,
             mtp_drafts: Some(probe.widths.iter().max().unwrap() - 1),
+            resident_experts: fixture
+                .resident_experts
+                .map_or(Default::default(), crate::execution::ResidentExperts::Count),
+            host_weight_cache_bytes: 16usize << 30,
             ..Default::default()
         },
     )

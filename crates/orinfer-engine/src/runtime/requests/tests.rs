@@ -1059,6 +1059,7 @@ fn validate_flash_mtp() {
                 .resident_experts
                 .map(crate::execution::ResidentExperts::Count)
                 .unwrap_or_default(),
+            host_weight_cache_bytes: 16usize << 30,
             ..Default::default()
         },
     )
@@ -1213,6 +1214,7 @@ fn validate_flash_mtp() {
     for source in &fixture.cases {
         let mut outputs = vec![];
         for drafts in [0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7] {
+            model.dynamic_speculation.fixed_width = Some(drafts + 1);
             model.manifest.mtp = Some(spec.clone());
             LoadOptions {
                 mtp_drafts: Some(drafts),
@@ -1241,6 +1243,9 @@ fn validate_flash_mtp() {
                 )
                 .unwrap();
             let stats = model.speculation_statistics.clone();
+            if drafts > 0 {
+                assert!(stats.as_ref().unwrap().rounds > 0, "MTP did not execute");
+            }
             outputs.push((
                 tokens,
                 at.elapsed().as_secs_f64(),
