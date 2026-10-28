@@ -116,6 +116,8 @@ def recurrent(
         raise ValueError("Invalid chunkwise GDN warp geometry")
     if state_dtype not in ("float32", "float16"):
         raise ValueError("Invalid GDN state storage dtype")
+    if state_dtype != "float32":
+        raise ValueError("Chunkwise GDN state requires the per-token rounding contract")
     storage = T.float32 if state_dtype == "float32" else T.float16
     m = row_count(M, dynamic_rows)
     nc = T.ceildiv(m, C)

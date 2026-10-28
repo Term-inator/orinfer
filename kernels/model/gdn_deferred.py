@@ -60,6 +60,8 @@ def recurrent(
     validate_geometry(capacity, HK, HV, vt, threads)
     if state_dtype not in ("float32", "float16"):
         raise ValueError("Invalid GDN state storage dtype")
+    if state_dtype != "float32":
+        raise ValueError("Deferred GDN state requires the per-token rounding contract")
     storage = T.float32 if state_dtype == "float32" else T.float16
     replay = pending_updates(capacity, HK, HV, vt, threads)
     prediction = predict(vt)
@@ -133,6 +135,8 @@ def materialize(
     validate_geometry(capacity, HK, HV, vt, threads)
     if state_dtype not in ("float32", "float16"):
         raise ValueError("Invalid GDN state storage dtype")
+    if state_dtype != "float32":
+        raise ValueError("Deferred GDN state requires the per-token rounding contract")
     storage = T.float32 if state_dtype == "float32" else T.float16
 
     replay = pending_updates(capacity, HK, HV, vt, threads)
@@ -227,6 +231,8 @@ def commit(
     validate_geometry(capacity, hk, hv, vt, threads)
     if state_dtype not in ("float32", "float16"):
         raise ValueError("Invalid GDN state storage dtype")
+    if state_dtype != "float32":
+        raise ValueError("Deferred GDN state requires the per-token rounding contract")
     storage = T.float32 if state_dtype == "float32" else T.float16
     pending = pending_updates(capacity, hk, hv, vt, threads)
     advance = rank_one(vt, staged=True)

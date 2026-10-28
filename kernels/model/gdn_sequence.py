@@ -198,6 +198,12 @@ def _gdn_sequence(
                             h,
                             bv,
                         )
+                        # Narrow storage rounds the trajectory once per token so
+                        # single-token, chunked and speculative advance paths
+                        # share one state history; compute stays FP32.
+                        if state_dtype != "float32":
+                            for i, j in T.Parallel(DK, value_tile):
+                                state[i, j] = T.cast(T.cast(state[i, j], T.float16), T.float32)
                         for i, j in T.Parallel(DK, value_tile):
                             if in_place:
                                 if t == count - 1:
@@ -311,6 +317,9 @@ def gdn_commit(
             for t in T.serial(tokens):
                 if t < Accepted[0]:
                     replay(state, K, Update, T.exp(G[t, h]), h // (HV // HK), t, h, bv)
+                    if state_dtype != "float32":
+                        for i, j in T.Parallel(DK, value_tile):
+                            state[i, j] = T.cast(T.cast(state[i, j], T.float16), T.float32)
             for i, j in T.Parallel(DK, value_tile):
                 State[h, i, bv * value_tile + j] = (
                     state[i, j] if state_dtype == "float32" else T.cast(state[i, j], T.float16)
@@ -365,6 +374,9 @@ def gdn_commit_controlled(
                     for j in T.Parallel(value_tile):
                         delta[j] = Update[t, h, bv * value_tile + j]
                     replay(state, keys, delta, T.exp(G[t, h]), 0, t, h, bv)
+                    if state_dtype != "float32":
+                        for i, j in T.Parallel(DK, value_tile):
+                            state[i, j] = T.cast(T.cast(state[i, j], T.float16), T.float32)
             for i, j in T.Parallel(DK, value_tile):
                 State[h, i, bv * value_tile + j] = (
                     state[i, j] if state_dtype == "float32" else T.cast(state[i, j], T.float16)
