@@ -422,11 +422,6 @@ def main():
     p.add_argument("--cache", type=Path, default=ROOT / "artifacts/build-cache/flash-next")
     p.add_argument("--plan-only", action="store_true")
     p.add_argument(
-        "--workspace-only",
-        action="store_true",
-        help="Share certified serial QSA/expert staging without changing kernel arithmetic",
-    )
-    p.add_argument(
         "--expert-storage-only",
         action="store_true",
         help="Rebuild compressed expert address tables with unchanged row/arithmetic contracts",
@@ -476,23 +471,6 @@ def main():
         p.error("mtp-checkpoint requires initial construction with --checkpoint")
     if args.vision_checkpoint and not args.checkpoint:
         p.error("vision-checkpoint requires initial construction with --checkpoint")
-    if args.workspace_only:
-        if (
-            args.model is None
-            or args.checkpoint
-            or args.expert_storage_only
-            or args.hc_only
-            or args.plan_only
-            or args.prefill_only
-            or args.projection_kinds
-            or args.projection_shape
-            or args.auxiliary_only
-        ):
-            p.error("workspace-only requires --model and an independent workspace rebuild")
-        from tools.model.flash_next.workspace import rebuild as rebuild_workspace
-
-        rebuild_workspace(args)
-        return
     if args.auxiliary_only:
         if (
             args.model is None

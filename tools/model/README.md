@@ -70,15 +70,9 @@ bash tools/operators/run.sh tools/model/sampling.py artifacts/sampling-build \
 
 Rust 执行器为大块共享工作区保留 CUDA 虚拟地址，在首次上传或执行依赖程序前映射并清零物理内存，保留映射供 Graph replay 使用。文本启动可延后视觉、音频和采样 scratch 的物理分配；请求准入预留尚未映射的计算工作区与采样行。`LOAD STAGES.deferred_workspace_bytes` 记录启动时延后的逻辑字节，scheduler 的 `batch_execution` 记录映射次数、物理字节、耗时及实际采样 packet／行数。该运行时优化可加载已有匹配执行包；批量采样需重建采样包并配合当前引擎使用。
 
-Flash Next 行程序保留形状规划器已有的共享 prefill 临时存储身份。已有 target-only 包可通过正式构建入口合并 QSA 的 `Out/Max/Den` 及专家 dispatch、gate/up 输出、down 输出暂存区：
+Flash Next 的原生形状规划器直接为 QSA 的 `Out/Max/Den`、专家 dispatch、gate/up 输出和 down 输出分配共享的目标模型临时存储。动态 prefill 和行程序的串行片段使用同一底层存储的紧凑视图，容量覆盖 4096 行；固定单行参考 kernel 使用独立临时区；行程序导出时保留该存储身份。上述临时量在一层内部完成生产和消费，跨层暂停时只保留声明的存活状态；独立 shared FFN 分支使用自己的工作区。MTP 保持独立存储，完整状态与请求接口沿用各自的生命周期。
 
-```bash
-bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/workspace-build \
-  --model artifacts/models/source-model \
-  --model-output artifacts/models/model-with-shared-workspace --workspace-only
-```
-
-该步骤匹配相同 kernel 代码、参数顺序和完整存储几何，检查生产／消费算子的全部用途及互斥生命周期；专家 down 输出可跨过独立 shared FFN 计算后再合并。动态行变体须保留同一槽位的全部指针角色与参数顺序，各绑定沿用自己的行数和 launch 参数。候选中的跨层存活、请求状态、侧 stream、额外用途或重叠生命周期会返回错误。构建器移除重复 buffer，重新生成 Rust 绑定库并原子发布，权重与算子算术保持一致。本机已测 target-only 包的 QSA 合并减少 774 MiB 逻辑工作区、776 MiB 物理映射，专家暂存再减少 400 MiB；累计减少 1174 MiB 逻辑工作区、1176 MiB 长 prefill 物理映射（CUDA 映射粒度为 2 MiB）；QSA 合并在已测短请求中减少准入预留，专家合并同时减少实际映射；准入仍为后续工作区保留预算。重建后应验证完整 logits、分层 prefill 暂停期间执行混合 packet、请求隔离、取消复用和 prefix 恢复，再按实际请求选择专家常驻容量。
+共享在原生初始构建时完成，重建模型包后生效。构建器直接导出共享 buffer 和参数绑定。重建后应验证完整 logits、分层 prefill 暂停期间执行混合 packet、请求隔离、取消复用和 prefix 恢复，再按实际请求选择专家常驻容量。
 
 Qwen3_5 的 `gdn_execution` 明确声明 prefill 的 sequential/chunked 策略，以及 decode 的 dense/deferred 策略和日志容量；构建、验证、恢复与提交消费同一契约。原生适配器依据显式契约校验策略及其全部状态和工作区。Attention 的 INT8 读取与临时 FP16 KV 暂存候选按完整流水线实测选择，以小行数、非对齐尾部和大 prefill 的实测结果决定选择区间。
 

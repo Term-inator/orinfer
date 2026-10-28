@@ -348,21 +348,31 @@ class Model:
         workspace = self.workspaces.setdefault(workspace_key, {})
         allocation = 0
 
-        def empty(shape, dtype=torch.float16, *, index=False, reserve=0):
+        def empty(shape, dtype=torch.float16, *, index=False, reserve=0, serial=None):
             nonlocal allocation
             import math
 
             slot = (allocation, index_cap if index else None, dtype)
             allocation += 1
             size = math.prod(shape)
-            if slot not in workspace:
+            storage = workspace
+            if serial is not None and not self.is_mtp and m >= 256:
+                # QSA partials and routed-expert staging die within one layer.
+                # Prefill pauses only at layer boundaries; row packets and their
+                # serial private segments reuse this same target-only arena.
+                # Fixed one-row kernels keep their own scratch: they have no
+                # dynamic row scalar for the sequence workspace contract.
+                storage = self.workspaces.setdefault(("serial", False), {})
+                slot = (serial, dtype)
+                reserve = max(reserve, 4096 * size // m)
+            if slot not in storage:
                 reserve = max(
                     reserve, self.prefill_workspace_rows * size // m if index and m >= 256 else size
                 )
-                workspace[slot] = torch.empty(reserve, device="cuda", dtype=dtype)
-            if workspace[slot].numel() < size:
-                raise RuntimeError("Prefill scratch changed without invalidating captured graphs")
-            return workspace[slot][:size].view(shape)
+                storage[slot] = torch.empty(reserve, device="cuda", dtype=dtype)
+            if storage[slot].numel() < size:
+                raise RuntimeError("Scratch changed without invalidating captured graphs")
+            return storage[slot][:size].view(shape)
 
         def call(label, build, *args):
             kernel = self.kernel(label, build)
@@ -616,8 +626,11 @@ class Model:
         qsa_splits = 8
         qsa_block = 32
         qsa_threads = 128
-        sparse_max, sparse_den = (empty((m, 24, qsa_splits), torch.float32) for _ in range(2))
-        sparse_out = empty((m, 24, qsa_splits, 256), torch.float32)
+        sparse_max, sparse_den = (
+            empty((m, 24, qsa_splits), torch.float32, serial=name)
+            for name in ("qsa_max", "qsa_den")
+        )
+        sparse_out = empty((m, 24, qsa_splits, 256), torch.float32, serial="qsa_out")
         ple_rows = 1 if self.is_mtp else m
         # PLE finishes before the layer's HC mixer. Reuse the two HC scratch
         # arrays, then recycle the query scratch after the gate has read it.
@@ -670,11 +683,12 @@ class Model:
         )
         tile_count = empty((1,), torch.int32)
         aq, sa = empty((m, h), torch.int8), empty((m, 1))
-        dispatch, ds = empty((assignments, h), torch.int8), empty((assignments, 1))
-        gu = empty((assignments, 2 * f))
+        dispatch = empty((assignments, h), torch.int8, serial="expert_dispatch")
+        ds = empty((assignments, 1))
+        gu = empty((assignments, 2 * f), serial="expert_up")
         fq, fs = empty((assignments, f), torch.int8), empty((assignments, 1))
         patch = torch.zeros(1, device="cuda", dtype=torch.uint16)
-        expert_out = empty((assignments, h))
+        expert_out = empty((assignments, h), serial="expert_down")
         shared_gate, shared_up, shared_act = (empty((m, f)) for _ in range(3))
         shared_out, shared_logit = empty((m, h)), empty((m, 1))
         gates = self.kernel("gdn-gates", lambda: gdn_gates(parameter_mode="a_log"))

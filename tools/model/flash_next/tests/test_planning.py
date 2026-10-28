@@ -93,6 +93,67 @@ class PlanningTests(unittest.TestCase):
 
             self.stack.enter_context(patch("torch." + name, cpu))
 
+    def test_target_serial_staging_is_shared_across_row_programs_only(self):
+        target = Planner(assembly("text"), 4096, None)
+        draft = Planner(assembly("mtp"), 4096, None, target=target)
+        target.weights.update(
+            {name.replace("blk.48.", "blk.3."): value for name, value in draft.weights.items()}
+        )
+        target.layer_ids = (3,)
+        expected = {
+            "qsa_max": (torch.float32, 24 * 8),
+            "qsa_den": (torch.float32, 24 * 8),
+            "qsa_out": (torch.float32, 24 * 8 * 256),
+            "expert_dispatch": (torch.int8, 10 * 2560),
+            "expert_up": (torch.float16, 10 * 1280),
+            "expert_down": (torch.float16, 10 * 2560),
+        }
+        identities, retained = {}, []
+        for rows, all_logits, verify in [
+            (4096, False, False),
+            (1, False, False),
+            (1024, False, False),
+            (128, True, False),
+            (512, False, False),
+            (7, False, True),
+        ]:
+            plan = target.trace(rows, all_logits=all_logits, verify=verify)
+            retained.append(plan)
+            storage = target.workspaces["serial", False]
+            self.assertEqual({name for name, _ in storage}, set(expected))
+            for name, (dtype, stride) in expected.items():
+                tensor = storage[name, dtype]
+                identity = tensor.untyped_storage()._cdata
+                self.assertEqual(identity, identities.setdefault(name, identity))
+                self.assertEqual(tensor.numel(), 4096 * stride)
+            self.assertEqual(len(set(identities.values())), 6)
+            if rows < 256:
+                self.assertTrue(
+                    all(
+                        t.untyped_storage()._cdata not in identities.values()
+                        for _, args in plan["ops"]
+                        for t in args
+                    )
+                )
+            # Cross-layer hidden/residual and owner state cannot enter this arena.
+            self.assertNotIn(plan["residual"].untyped_storage()._cdata, identities.values())
+            self.assertTrue(
+                all(
+                    t.untyped_storage()._cdata not in identities.values()
+                    for t in target.states.values()
+                )
+            )
+        draft.trace(1)
+        draft.trace(7)
+        self.assertNotIn(("serial", False), draft.workspaces)
+        self.assertTrue(
+            all(
+                t.untyped_storage()._cdata not in identities.values()
+                for workspace in draft.workspaces.values()
+                for t in workspace.values()
+            )
+        )
+
     def test_visual_draft_shares_owner_coordinates_in_all_qsa_rotations(self):
         target = Planner(assembly("text"), 4096, None, vision=True)
         draft = Planner(assembly("mtp"), 4096, None, target=target)

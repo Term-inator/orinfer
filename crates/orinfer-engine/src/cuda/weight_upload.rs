@@ -204,42 +204,10 @@ struct Chunk {
     offset: usize,
     bytes: usize,
     destination: u64,
-    read_bytes: usize,
-}
-struct Group {
-    chunks: Vec<Chunk>,
-    bytes: usize,
-    destination: u64,
-}
-fn next_group(
-    pending: &mut std::iter::Peekable<impl Iterator<Item = Chunk>>,
-    gather: bool,
-) -> Option<Group> {
-    let first = pending.next()?;
-    let mut group = Group {
-        bytes: first.bytes,
-        destination: first.destination,
-        chunks: vec![first],
-    };
-    while gather && group.chunks.len() < 2 {
-        let Some(next) = pending.peek() else { break };
-        // Both a sector prefix and rounding, plus destination alignment, can
-        // extend a cold bank read into the as-yet-unfilled tail of this slot.
-        if group.destination + group.bytes as u64 != next.destination
-            || group.bytes + next.bytes > PAYLOAD_BYTES
-            || group.bytes + next.read_bytes + 3 * ALIGNMENT > SLOT_BYTES
-        {
-            break;
-        }
-        let next = pending.next().unwrap();
-        group.bytes += next.bytes;
-        group.chunks.push(next);
-    }
-    Some(group)
 }
 struct Job {
     slot: usize,
-    group: Group,
+    chunk: Chunk,
     // A slot is exclusively borrowed by exactly one job. The coordinator only
     // dispatches it after its previous DMA event completes; all readers join
     // before the CUDA owner frees this allocation. Integers carry no CUDA API.
@@ -284,8 +252,13 @@ impl Readers {
                             let at = Instant::now();
                             let file_before = reader.file_read_s;
                             let copy_before = reader.cache_copy_s;
-                            let result =
-                                reader.read_group(&job.group, target, job.cache.as_deref());
+                            let result = reader.read(
+                                &job.chunk.source,
+                                job.chunk.offset,
+                                job.chunk.bytes,
+                                target,
+                                job.cache.as_deref(),
+                            );
                             let report = ReadReport {
                                 result,
                                 service_s: at.elapsed().as_secs_f64(),
@@ -356,32 +329,6 @@ impl Drop for CacheFill<'_> {
 }
 
 impl Reader {
-    fn read_group(
-        &mut self,
-        group: &Group,
-        target: &mut [u8],
-        cache: Option<&Mutex<host_weights::Cache>>,
-    ) -> Result<usize> {
-        if group.chunks.len() == 1 {
-            let part = &group.chunks[0];
-            return self.read(&part.source, part.offset, part.bytes, target, cache);
-        }
-        let mut first = 0;
-        for part in &group.chunks {
-            let skip = self.read(
-                &part.source,
-                part.offset,
-                part.bytes,
-                &mut target[first..],
-                cache,
-            )?;
-            if skip != 0 {
-                target.copy_within(first + skip..first + skip + part.bytes, first);
-            }
-            first += part.bytes;
-        }
-        Ok(0)
-    }
     /// Reuse shard descriptors and accept EOF tails on sector-aligned direct reads.
     fn read(
         &mut self,
@@ -471,13 +418,6 @@ impl Reader {
                 return Ok(0);
             }
         }
-        // Cache hits copy directly to the packed position. Cold reads use the
-        // next aligned address in its unfilled tail; the group normalizes skip.
-        let padding = target.as_ptr().align_offset(ALIGNMENT);
-        if padding > target.len() {
-            return Err("Weight staging alignment exceeds slot".into());
-        }
-        let target = &mut target[padding..];
         let aligned = read_absolute / ALIGNMENT * ALIGNMENT;
         let skip = read_absolute - aligned;
         let extent = (skip + read_bytes).next_multiple_of(ALIGNMENT);
@@ -498,7 +438,7 @@ impl Reader {
                 data.copy_from_slice(&target[skip..skip + read_bytes]);
                 fill.commit(data, at.elapsed().as_secs_f64())?;
             }
-            Ok(padding + skip + absolute - read_absolute)
+            Ok(skip + absolute - read_absolute)
         };
         let file = match self.files.entry(source.path.clone()) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -618,25 +558,8 @@ fn upload_with_cache(
             .checked_add(upload.source.bytes as u64)
             .ok_or("Weight upload address overflow")?;
     }
-    if cache.is_some() {
-        uploads.sort_by_key(|upload| upload.destination);
-    } else {
-        uploads.sort_by(|a, b| {
-            (&a.source.path, a.source.offset).cmp(&(&b.source.path, b.source.offset))
-        });
-    }
-    let uploads: Vec<_> = {
-        let guard = cache.map(|cache| cache.lock().unwrap());
-        uploads
-            .into_iter()
-            .map(|upload| {
-                let bank_bytes = guard
-                    .as_ref()
-                    .and_then(|cache| cache.bank_bytes(&upload.source));
-                (upload, bank_bytes)
-            })
-            .collect()
-    };
+    uploads
+        .sort_by(|a, b| (&a.source.path, a.source.offset).cmp(&(&b.source.path, b.source.offset)));
     let staging_at = Instant::now();
     let mut staging = session.weight_staging.borrow_mut();
     let count = (workers * 2).min(32);
@@ -670,7 +593,7 @@ fn upload_with_cache(
     }
     let mut pending = uploads
         .into_iter()
-        .flat_map(|(upload, bank_bytes)| {
+        .flat_map(|upload| {
             let source = Arc::new(upload.source);
             let destination = upload.destination;
             (0..source.bytes).step_by(PAYLOAD_BYTES).map(move |offset| {
@@ -680,7 +603,6 @@ fn upload_with_cache(
                     offset,
                     bytes,
                     destination: destination + offset as u64,
-                    read_bytes: bank_bytes.unwrap_or(bytes),
                 }
             })
         })
@@ -702,13 +624,13 @@ fn upload_with_cache(
         let jobs_tx = readers.jobs.as_ref().unwrap();
         let done_rx = &readers.completed;
         let enqueue = |slot: usize, pending: &mut std::iter::Peekable<_>| -> Result<bool> {
-            let Some(group) = next_group(pending, cache.is_some()) else {
+            let Some(chunk) = pending.next() else {
                 return Ok(false);
             };
             jobs_tx
                 .send(Job {
                     slot,
-                    group,
+                    chunk,
                     pointer: pool.slots[slot].pointer as usize,
                     cache: cache.cloned(),
                 })
@@ -759,9 +681,9 @@ fn upload_with_cache(
                 unsafe {
                     check(
                         sys::cuMemcpyHtoDAsync_v2(
-                            job.group.destination,
+                            job.chunk.destination,
                             slot.pointer.add(skip),
-                            job.group.bytes,
+                            job.chunk.bytes,
                             session.stream,
                         ),
                         "stream weight chunk",
@@ -805,40 +727,6 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-
-    #[test]
-    fn gathered_chunks_respect_cold_bank_extent_gaps_and_part_limit() {
-        let source = Arc::new(TensorSource {
-            path: "unused".into(),
-            offset: 0,
-            bytes: 100,
-        });
-        let chunk = |destination, read_bytes| Chunk {
-            source: Arc::clone(&source),
-            offset: 0,
-            bytes: 100,
-            destination,
-            read_bytes,
-        };
-        let mut pending = vec![
-            chunk(1000, 100),
-            chunk(1100, SLOT_BYTES - 100),
-            chunk(1200, 100),
-        ]
-        .into_iter()
-        .peekable();
-        assert_eq!(next_group(&mut pending, true).unwrap().chunks.len(), 1);
-        assert_eq!(next_group(&mut pending, true).unwrap().chunks.len(), 2);
-        let mut pending = (0..6).map(|i| chunk(1000 + i * 100, 100)).peekable();
-        assert_eq!(next_group(&mut pending, true).unwrap().chunks.len(), 2);
-        assert_eq!(next_group(&mut pending, true).unwrap().chunks.len(), 2);
-        assert_eq!(next_group(&mut pending, true).unwrap().chunks.len(), 2);
-        let mut pending = vec![chunk(1000, 100), chunk(1101, 100)]
-            .into_iter()
-            .peekable();
-        assert_eq!(next_group(&mut pending, true).unwrap().chunks.len(), 1);
-        assert_eq!(next_group(&mut pending, false).unwrap().chunks.len(), 1);
-    }
 
     #[test]
     fn cached_shards_detect_replacement_truncation_and_removal() {
@@ -1264,18 +1152,19 @@ mod tests {
                 .collect();
             broken.last_mut().unwrap().source.offset = data.len();
             let stats = upload_experts(&session, uploads, 2, &cache).unwrap();
-            assert_eq!(
-                stats.chunks, 2,
-                "Adjacent expert payloads should share paired DMA"
-            );
+            assert_eq!(stats.chunks, 4, "Each source chunk submits its own DMA");
             let mut actual = vec![0u8; expected.len()];
             // SAFETY: The stream owns all source staging until completion, and
             // the complete destination is retained by this test session.
             unsafe {
-                check(sys::cuStreamSynchronize(session.stream), "gather ready").unwrap();
+                check(
+                    sys::cuStreamSynchronize(session.stream),
+                    "expert upload ready",
+                )
+                .unwrap();
                 check(
                     sys::cuMemcpyDtoH_v2(actual.as_mut_ptr().cast(), destination, actual.len()),
-                    "gather readback",
+                    "expert upload readback",
                 )
                 .unwrap();
             }

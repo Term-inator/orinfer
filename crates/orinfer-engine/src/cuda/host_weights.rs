@@ -203,12 +203,6 @@ impl Cache {
                 .is_some_and(|end| end <= first + len))
         .then_some((*first, *len))
     }
-    /// Conservative read bound for a gathered staging part, including a cold
-    /// complete-bank fill. Payload identity is still checked by each reader.
-    pub fn bank_bytes(&self, source: &crate::weights::TensorSource) -> Option<usize> {
-        self.bank_extent(&source.path, source.offset, source.bytes)
-            .map(|(_, bytes)| bytes)
-    }
     pub fn resolve(&self, key: Key) -> Key {
         if let Some((offset, bytes)) = self.bank_extent(&key.path, key.offset, key.bytes) {
             let bank = Key {
