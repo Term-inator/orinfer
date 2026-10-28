@@ -186,7 +186,10 @@ fn validate_joint_target_verification() {
                                         .map(|(name, bytes)| {
                                             (
                                                 name,
-                                                crate::cuda::snapshot::Range { offset: 0, bytes },
+                                                crate::backend::snapshot::Range {
+                                                    offset: 0,
+                                                    bytes,
+                                                },
                                             )
                                         })
                                         .collect();

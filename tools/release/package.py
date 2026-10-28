@@ -78,7 +78,8 @@ def execution_asset_identity(package, tag):
     architecture, policy, target = fields
     families = json.loads((ROOT / "configs/architecture-contract.json").read_text())["families"]
     variants = families.get(architecture, {}).get("release_variants", {})
-    text = package.get("config_signature", {}).get("text", {})
+    signature = package.get("config_signature", {})
+    text = signature.get("text", signature.get("text_config", signature))
     matches = [
         name
         for name, selector in variants.items()

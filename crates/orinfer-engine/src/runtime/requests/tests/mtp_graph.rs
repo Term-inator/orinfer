@@ -33,7 +33,7 @@ fn validate_mtp_packet_graph_reuse() {
     let mut model = ModelRuntime::load_with_options(
         &f.model,
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::Full,
+            cuda_graph: crate::execution::GraphMode::Full,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(1),
             ..Default::default()
@@ -41,7 +41,7 @@ fn validate_mtp_packet_graph_reuse() {
     )
     .unwrap();
     let spec = model.manifest.mtp.clone().unwrap();
-    assert!(spec.packet_table.is_some());
+    assert!(model.manifest.packet_table().is_some());
     let source = &f.cases[0];
     let mut retained = vec![];
     let mut evidence = vec![];
@@ -166,7 +166,7 @@ fn validate_mtp_packet_graph_reuse() {
                                 .into_iter()
                                 .filter(|(_, n)| *n > 0)
                                 .map(|(name, bytes)| {
-                                    (name, crate::cuda::snapshot::Range { offset: 0, bytes })
+                                    (name, crate::backend::snapshot::Range { offset: 0, bytes })
                                 })
                                 .collect();
                             let plan =
@@ -185,7 +185,7 @@ fn validate_mtp_packet_graph_reuse() {
                 .collect();
             let mode = model
                 .execution
-                .set_graph_mode_for_test(crate::execution::CudaGraphMode::Off);
+                .set_graph_mode_for_test(crate::execution::GraphMode::Off);
             if phase == BatchOperation::Commit {
                 model.commit_spec_packet(&segments).unwrap();
             } else {

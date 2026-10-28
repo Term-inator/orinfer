@@ -20,7 +20,7 @@ class Aot:
         self.kernels, self.dynamic = [], []
         self.objects = {}
         self.recipes = {}
-        sources = []
+        sources = [ROOT / "tools/build/compiler-requirements.txt"]
         for directory in [
             ROOT / "kernels",
             ROOT / "tools/model/qwen35",
@@ -44,6 +44,8 @@ class Aot:
                 ROOT / "tools/model/tuning.py",
                 ROOT / "tools/model/attention_reference.py",
                 ROOT / "tools/model/private_rows.py",
+                ROOT / "tools/model/packet_graph.py",
+                ROOT / "tools/model/native_packets.py",
                 ROOT / "tools/model/expert_tuning.py",
                 ROOT / "tools/model/gdn_tuning.py",
                 ROOT / "tools/model/row_selection.py",

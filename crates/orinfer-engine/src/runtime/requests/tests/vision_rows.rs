@@ -26,7 +26,7 @@ fn validate_flash_dynamic_vision() {
         let mut model = ModelRuntime::load_with_options(
             root,
             LoadOptions {
-                cuda_graph: crate::execution::CudaGraphMode::Full,
+                cuda_graph: crate::execution::GraphMode::Full,
                 ..Default::default()
             },
         )
@@ -115,7 +115,7 @@ fn validate_visual_capacity_and_compact_inputs() {
     let mut model = ModelRuntime::load_with_options(
         &f.model,
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::Full,
+            cuda_graph: crate::execution::GraphMode::Full,
             ..Default::default()
         },
     )
@@ -226,7 +226,7 @@ fn validate_visual_capacity_and_compact_inputs() {
         }
         checked.push(kernel.name);
     }
-    let graph_hits = model.execution.batch_statistics.get().graph_hits;
+    let graph_hits = model.execution.batch_statistics().graph_hits;
     assert!(
         graph_hits > 0,
         "Changed features must execute through Graph replay"

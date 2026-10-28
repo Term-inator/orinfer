@@ -221,7 +221,7 @@ def hc_combine_norm(
     combine = combine_fragment(H, streams, dtype)
 
     @T.prim_func
-    def main(
+    def hc_combine_norm(
         Block: T.Tensor((M, H), dtype),
         Residual: T.Tensor((M, streams, H), dtype),
         Inject: T.Tensor((M, streams), dtype),
@@ -240,7 +240,7 @@ def hc_combine_norm(
                     values[j] * T.rsqrt(total[0] / H + eps) * (1.0 + Weight[branch, j])
                 )
 
-    return main
+    return hc_combine_norm
 
 
 @orin_jit

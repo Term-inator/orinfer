@@ -154,5 +154,6 @@ def environment():
         "device": str(torch.cuda.get_device_properties(0)),
         "sm": list(torch.cuda.get_device_capability()),
         "seed": SEED,
+        "python_dependencies_sha256": file_hash(ROOT / "tools/build/compiler-requirements.txt"),
         "output_root": os.environ.get("ORINFER_OPERATOR_OUTPUT"),
     }

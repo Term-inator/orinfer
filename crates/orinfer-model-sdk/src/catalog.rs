@@ -32,12 +32,17 @@ impl ParameterKind {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Definition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<crate::artifact::Launch>,
     pub module: usize,
     pub source: usize,
     pub host_abi: usize,
     pub symbol: String,
+    #[serde(default)]
     pub block: [u32; 3],
+    #[serde(default)]
     pub shared_memory_bytes: u32,
+    #[serde(default)]
     pub cooperative: bool,
     pub parameters: Vec<ParameterKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -85,12 +90,32 @@ impl Catalog {
                 .iter()
                 .any(|&i| i >= self.assets.len())
                 || d.symbol.is_empty()
-                || d.block.contains(&0)
                 || d.parameters.len() > 256
                 || (!d.readonly_arguments.is_empty()
                     && d.readonly_arguments.len() != d.parameters.len())
             {
                 return Err("Invalid compiled kernel definition".into());
+            }
+            crate::artifact::validate_geometry(
+                d.launch.as_ref(),
+                None,
+                d.block,
+                d.shared_memory_bytes,
+                d.cooperative,
+            )?;
+        }
+        Ok(())
+    }
+    pub fn validate_target(&self, target: &orinfer_device::Target) -> Result<()> {
+        self.validate()?;
+        target.validate()?;
+        for definition in &self.definitions {
+            let backend = definition.launch.as_ref().map_or(
+                orinfer_device::Backend::Cuda,
+                crate::artifact::Launch::backend,
+            );
+            if backend != target.backend {
+                return Err("Kernel catalog backend differs from package target".into());
             }
         }
         Ok(())
@@ -106,8 +131,14 @@ impl Catalog {
             .definitions
             .get(definition)
             .ok_or("Unknown compiled kernel definition")?;
-        if grid.contains(&0)
-            || d.parameters.len() != args.len()
+        crate::artifact::validate_geometry(
+            d.launch.as_ref(),
+            Some(grid),
+            d.block,
+            d.shared_memory_bytes,
+            d.cooperative,
+        )?;
+        if d.parameters.len() != args.len()
             || d.parameters
                 .iter()
                 .zip(&args)
@@ -124,6 +155,7 @@ impl Catalog {
                 .ok_or_else(|| "Unknown kernel asset".to_owned())
         };
         Ok(Kernel {
+            launch: d.launch.clone(),
             name,
             grid,
             args,
@@ -312,6 +344,80 @@ impl BindingRegistry {
 #[cfg(test)]
 mod binding_tests {
     use super::*;
+
+    #[test]
+    fn native_ascend_binding_retains_launch_and_checks_package_target() {
+        let asset = FileIdentity {
+            file: "kernel.bin".into(),
+            sha256: "0".repeat(64),
+            tensor: None,
+        };
+        let catalog = Catalog {
+            assets: vec![asset],
+            binding_signature: "0".repeat(64),
+            dynamic: vec![],
+            definitions: vec![Definition {
+                launch: Some(crate::artifact::Launch::Ascend {
+                    block_dim: 24,
+                    workspace_bytes: 8192,
+                }),
+                module: 0,
+                source: 0,
+                host_abi: 0,
+                symbol: "projection".into(),
+                block: [0; 3],
+                shared_memory_bytes: 0,
+                cooperative: false,
+                parameters: vec![ParameterKind::U32],
+                readonly_arguments: vec![],
+            }],
+        };
+        let target = orinfer_device::Target::from_package("ascend910b").unwrap();
+        catalog.validate_target(&target).unwrap();
+        assert!(
+            catalog
+                .validate_target(
+                    &orinfer_device::Target::from_package(crate::target::CUDA_ARCH).unwrap()
+                )
+                .is_err()
+        );
+        let kernel = catalog
+            .bind(
+                0,
+                "projection".into(),
+                [0; 3],
+                vec![Argument::U32 { value: 16 }],
+            )
+            .unwrap();
+        kernel.validate_launch(&target).unwrap();
+        assert!(matches!(
+            kernel.launch,
+            Some(crate::artifact::Launch::Ascend {
+                block_dim: 24,
+                workspace_bytes: 8192
+            })
+        ));
+        assert!(
+            catalog
+                .bind(
+                    0,
+                    "projection".into(),
+                    [1; 3],
+                    vec![Argument::U32 { value: 16 }]
+                )
+                .is_err()
+        );
+        assert!(
+            catalog
+                .bind(
+                    0,
+                    "projection".into(),
+                    [0; 3],
+                    vec![Argument::I32 { value: 16 }]
+                )
+                .is_err()
+        );
+    }
 
     static REGISTRY: BindingRegistry = BindingRegistry {
         roles: &["Weight0", "Weight1", "State0", "State1"],

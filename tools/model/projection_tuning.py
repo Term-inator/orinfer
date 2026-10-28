@@ -281,6 +281,7 @@ class ProjectionTuner:
         sources.extend((root / "kernels").rglob("*.py"))
         sources.extend((root / "tools/build").glob("*.py"))
         sources.append(root / "configs/deployment-target.json")
+        sources.append(root / "tools/build/compiler-requirements.txt")
         identity = dict(
             spec=spec,
             configs=configs,

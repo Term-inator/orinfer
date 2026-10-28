@@ -38,6 +38,8 @@ def main():
         (64, [65, 64], 160, 640),
         (16, [3, 0], 129, 128),
         (16, [5, 9], 257, 2560),
+        (8, [9, 17], 1280, 2560),
+        (16, [17, 33], 2560, 640),
     ]
     for bm, counts, n, k in shapes:
         rows, e = sum(counts), 2
@@ -92,8 +94,13 @@ def main():
             hi = torch.empty_like(lo)
             total = torch.empty(rows, dtype=torch.int32, device="cuda")
             pack = split_a8(rows, k)
-            exact = e8p_exact_grouped(rows, e, tiles, n, k, block_m=bm)
-            candidates.append(("k64-exact-int4", exact, nibble, p, book, baseline))
+            for stages in (2, 3, 4):
+                if k // 64 < stages - 1:
+                    continue
+                exact = e8p_exact_grouped(rows, e, tiles, n, k, block_m=bm, stages=stages)
+                candidates.append(
+                    (f"k64-exact-int4-stages{stages}", exact, nibble, p, book, baseline)
+                )
         # All table forms read the identical code bank. Zero-valued bases use
         # the ordinary INT8 fallback, never the nonzero-basis nibble decoder.
         if bm == 16:
@@ -134,7 +141,7 @@ def main():
         for label, kernel, bk, original_p, original_b, reference in candidates:
 
             def run():
-                if label in ("k64-exact-int4", "k64-prefill-int4"):
+                if label.startswith("k64-exact-int4") or label == "k64-prefill-int4":
                     planes = (lp, hp) if label == "k64-prefill-int4" else (lo, hi)
                     splitter = streamed_pack if label == "k64-prefill-int4" else pack
                     splitter(a, *planes, total)
@@ -159,7 +166,7 @@ def main():
             run()
             torch.cuda.synchronize()
             assert torch.equal(ref, out), (bm, label, "initial")
-            if label in ("k64-exact-int4", "k64-prefill-int4"):
+            if label.startswith("k64-exact-int4") or label == "k64-prefill-int4":
                 assert torch.equal(total, a.to(torch.int32).sum(1).to(torch.int32))
                 shifts = torch.arange(0, 32, 4, device="cuda", dtype=torch.int64)
                 lplane, hplane = lo, hi

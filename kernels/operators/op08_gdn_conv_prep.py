@@ -277,13 +277,3 @@ def gdn_conv_prep(
         body(X, W, HI, lengths, positions, Q, K, V, HO, positions_out)
 
     return kernel
-
-
-def launch(kernel, X, W, HI, lengths, positions, Q, K, V, HO, positions_out, stream=None):
-    """Explicit-buffer launch. Resolve the current capture stream at every call."""
-    return kernel(X, W, HI, lengths, positions, Q, K, V, HO, positions_out, stream=stream)
-
-
-def gdn_conv_decode(B: int | None = None, **rounding_and_scale):
-    """One token per request, one-time-row tile, same explicit tensor API."""
-    return gdn_conv_prep(B=B, tile_tokens=1, **rounding_and_scale)

@@ -13,7 +13,7 @@ fn validate_decode_owner_order() {
     let mut model = ModelRuntime::load_with_options(
         &fixture.model,
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            cuda_graph: crate::execution::GraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..LoadOptions::default()
@@ -115,7 +115,7 @@ fn score_batched_decode_histories() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            cuda_graph: crate::execution::GraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..LoadOptions::default()
@@ -276,7 +276,7 @@ fn compare_decode_package_quality() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            cuda_graph: crate::execution::GraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..LoadOptions::default()

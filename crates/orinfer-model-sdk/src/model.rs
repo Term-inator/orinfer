@@ -82,6 +82,9 @@ pub struct Manifest {
     pub reranking: Option<crate::reranking::Spec>,
     #[serde(default)]
     pub mtp: Option<crate::mtp::Spec>,
+    /// Shared row operand bindings, independent of speculative decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_table: Option<std::sync::Arc<crate::packet::PacketTable>>,
     #[serde(default)]
     pub batch_profiles: Vec<usize>,
     #[serde(default)]
@@ -382,6 +385,12 @@ pub fn validate_graph_branches(manifest: &Manifest, kernels: &[Kernel]) -> Resul
 }
 
 impl Manifest {
+    pub fn packet_table(&self) -> Option<&std::sync::Arc<crate::packet::PacketTable>> {
+        self.packet_table
+            .as_ref()
+            .or_else(|| self.mtp.as_ref().and_then(|s| s.packet_table.as_ref()))
+    }
+
     pub fn independent(&self) -> bool {
         self.embedding.is_some() || self.reranking.is_some()
     }
@@ -393,12 +402,20 @@ impl Manifest {
             .min_by_key(|p| p.chunk_tokens)
     }
     pub fn validate<'a>(&'a self) -> Result<usize> {
-        if self.schema_version != 2
-            || self.target != crate::target::CUDA_ARCH
-            || self.model.is_empty()
-            || self.toolchain.is_empty()
+        if let Some(table) = self.packet_table() {
+            table.validate(self)?;
+        }
+        if self.packet_table.is_some()
+            && self.mtp.as_ref().is_some_and(|s| s.packet_table.is_some())
         {
-            return Err("Expected safetensors model schema 2 for SM120; prepare the AOT model directory first".into());
+            return Err("Duplicate packet operand tables".into());
+        }
+
+        let target = orinfer_device::Target::from_package(&self.target)?;
+        if self.schema_version != 2 || self.model.is_empty() || self.toolchain.is_empty() {
+            return Err(
+                "Expected safetensors model schema 2; prepare the AOT model directory first".into(),
+            );
         }
         if self.chunk_tokens == 0
             || self.chunk_tokens > self.max_context
@@ -615,6 +632,7 @@ impl Manifest {
         }
         let mut names = BTreeSet::new();
         for k in &self.kernels {
+            k.validate_launch(&target)?;
             if !k.readonly_arguments.is_empty() && k.readonly_arguments.len() != k.args.len() {
                 return Err("Mismatched kernel argument access contract".into());
             }
@@ -627,12 +645,6 @@ impl Manifest {
                 || k.symbol.contains('\0')
                 || k.args.is_empty()
                 || k.cooperative
-                || k.grid.contains(&0)
-                || k.block.contains(&0)
-                || k.block
-                    .iter()
-                    .try_fold(1u32, |n, d| n.checked_mul(*d))
-                    .is_none_or(|n| n > 1024)
             {
                 return Err(format!("Invalid model kernel {}", k.name));
             }

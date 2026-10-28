@@ -78,18 +78,3 @@ def _compile_gated_norm(
                     )
 
     return main
-
-
-def gdn_gated_norm(M=None, x_dtype="float16", heads_per_block=4, threads=128):
-    """Build dynamic-M or fixed-M code; launch with explicit caller stream.
-
-    No workspace; ordinary W is shared across heads. Inputs/output distinct.
-    """
-    kernel = _compile_gated_norm(M, x_dtype, heads_per_block, threads)
-    kernel.adapter.kernels = dict(kernel.adapter.kernels)
-    return kernel
-
-
-def launch(kernel, X, Z, W, Y, *, stream):
-    """Explicit host API; resolve current capture stream at every invocation."""
-    return kernel.adapter.func(X, Z, W, Y, stream=stream)

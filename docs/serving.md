@@ -12,6 +12,8 @@
 
 权重加载采用并行读取和有界的 pinned 缓冲区，并与异步 GPU 上传重叠。`--load-workers N` 可设置 1–32 个读取线程；默认按可用 CPU 核心选择，最多 4 个。Session 复用读取线程和暂存缓冲，暂存内存最多 256 MiB。源字节读取完成后，末尾 DMA 保留在 Session 的 stream 中，后续同 stream 计算按序消费；缓冲复用前等待对应事件，跨 stream 的 dense 权重交接保留显式同步。模型销毁前等待读取及 DMA 完成后释放暂存缓冲。开启 `--verify-weights` 时使用完整校验路径，启动较慢。
 
+模型就绪后、API 对外前，worker 会预热执行一次单 token 请求并输出 `WARMUP READY`。预热把序列租用映射、packet 计划和模块加载移入启动阶段（Flash Next 实测约 0.9s），避免首个用户请求多付同等的首 token 延迟。
+
 执行包中的全部 kernel 资产仍校验 hash；普通文本、配置的 MTP、视觉及小 batch 计划预加载 CUDA 模块，其余计划在首次使用时加载，并在 CUDA Graph 捕获前完成绑定。延迟加载的形状会在首次执行时承担模块加载开销。
 
 模型准备时封存上述前端文件的 SHA256。需要有意修改时，先确认它们与 checkpoint 的 token 映射和语义一致，再执行 `python3 tools/model/package.py pin-assets MODEL_DIR` 重新封存前端身份；权重保持原样。加载期间应保持模型文件内容稳定。

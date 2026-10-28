@@ -996,7 +996,7 @@ impl ModelRuntime {
             })
             .unwrap_or((1, "decode".into(), None));
         let at = Instant::now();
-        let load_before = self.execution.batch_statistics.get().initialization_s();
+        let load_before = self.execution.batch_statistics().initialization_s();
         self.upload_ids(
             if head.is_none() {
                 &self.manifest.token
@@ -1016,7 +1016,7 @@ impl ModelRuntime {
             self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
         }
         let regular_s = at.elapsed().as_secs_f64()
-            - (self.execution.batch_statistics.get().initialization_s() - load_before);
+            - (self.execution.batch_statistics().initialization_s() - load_before);
         if (req.offset + chunk == req.input.len()
             || req.checkpoints.contains(&(req.offset + chunk)))
             && let Some(head) = head
@@ -1096,16 +1096,27 @@ impl ModelRuntime {
         {
             return upper;
         }
-        if selected.iter().any(|(_, n)| *n > 1) {
+        if selected
+            .iter()
+            .any(|(i, n)| *n > 1 && requests[*i].prefilling)
+        {
             // Joined projections/expert tiles pay one weight pass. A cold
             // linear rows*context prior greatly overestimates prompt work and
             // can permanently prevent the scheduler from trying useful tiles.
             let prompt_s: f64 = selected
                 .iter()
-                .filter(|(_, n)| *n > 1)
+                .filter(|(i, n)| *n > 1 && requests[*i].prefilling)
                 .map(|(i, n)| self.prefill_costs.chunk_upper(*n, requests[*i].offset + n))
                 .sum();
-            let decode_rows = selected.iter().filter(|(_, n)| *n == 1).count();
+            // Decoding requests wider than one row are verification segments of
+            // the same joined packet: they extend the decode row count instead
+            // of each paying a separate prefill weight pass. Summing their
+            // chunk costs froze batched speculation out of every probe.
+            let decode_rows = selected
+                .iter()
+                .filter(|(i, n)| *n == 1 || !requests[*i].prefilling)
+                .map(|(_, n)| *n)
+                .sum::<usize>();
             // The window covers complete execution, including shifted MTP warm
             // and endpoint/cache work; these costs do not vanish in a joint body.
             let endpoints = (key.3 >> 8) & 255;
@@ -1322,7 +1333,7 @@ impl ModelRuntime {
             self.decode_until = None;
         }
         let feedback_at = Instant::now();
-        let feedback_stats = self.execution.batch_statistics.get();
+        let feedback_stats = self.execution.batch_statistics();
         self.maintain_lazy_drafts(requests)?;
         let prefill_work = self.select_work(requests, options, &initialized)?;
         let media_at = Instant::now();
@@ -1418,11 +1429,11 @@ impl ModelRuntime {
             }
             Work::Prefill(i, chunk, bounded, budget_s) => {
                 let key = Self::iteration_key(requests, &[(i, chunk)]);
-                let before = self.execution.batch_statistics.get();
+                let before = self.execution.batch_statistics();
                 let (_, tokens) = self.with_request(requests[i], |model, req| {
                     model.advance_prefill_step(req, chunk, bounded, budget_s)
                 })?;
-                let after = self.execution.batch_statistics.get();
+                let after = self.execution.batch_statistics();
                 let cold_s = after.initialization_s() - before.initialization_s()
                     + after.sequence_capture_s
                     - before.sequence_capture_s;
@@ -1481,7 +1492,7 @@ impl ModelRuntime {
             }
         }
         if let Some(feedback) = feedback {
-            let stats = self.execution.batch_statistics.get();
+            let stats = self.execution.batch_statistics();
             let cold = stats.initialization_s() - feedback_stats.initialization_s()
                 + stats.capture_s
                 - feedback_stats.capture_s
@@ -1845,8 +1856,8 @@ impl ModelRuntime {
             self.prepare_selected_audio(requests, selected)?;
             let at = Instant::now();
             let key = Self::iteration_key(requests, selected);
-            let capture_before = self.execution.batch_statistics.get().sequence_capture_s;
-            let load_before = self.execution.batch_statistics.get().initialization_s();
+            let capture_before = self.execution.batch_statistics().sequence_capture_s;
+            let load_before = self.execution.batch_statistics().initialization_s();
             let i = selected[0].0;
             let tokens = self.with_request(requests[i], |model, req| {
                 if req.prefilling && model.manifest.prefill_plan(1).is_some() {
@@ -1906,9 +1917,8 @@ impl ModelRuntime {
                 .batch_histogram
                 .entry(1)
                 .or_default() += 1;
-            let capture_s =
-                self.execution.batch_statistics.get().sequence_capture_s - capture_before;
-            let load_s = self.execution.batch_statistics.get().initialization_s() - load_before;
+            let capture_s = self.execution.batch_statistics().sequence_capture_s - capture_before;
+            let load_s = self.execution.batch_statistics().initialization_s() - load_before;
             self.iteration_costs
                 .entry(key)
                 .or_default()
@@ -1928,7 +1938,7 @@ impl ModelRuntime {
         #[cfg(test)]
         profile::mark("policy");
         let inputs_at = Instant::now();
-        let load_before = self.execution.batch_statistics.get().initialization_s();
+        let load_before = self.execution.batch_statistics().initialization_s();
         let segments = self.prepare_batch_inputs(requests, selected)?;
         #[cfg(test)]
         profile::mark("inputs");
@@ -1947,7 +1957,7 @@ impl ModelRuntime {
         profile::mark("plan");
         self.scheduler_statistics.batch_plan_s += plan_at.elapsed().as_secs_f64();
         let key = Self::iteration_key(requests, selected);
-        let capture_before = self.execution.batch_statistics.get().capture_s;
+        let capture_before = self.execution.batch_statistics().capture_s;
         self.execution.execute_batch_operation_with(
             orinfer_model_sdk::abi::BatchOperation::Ordinary,
             graph_key,
@@ -1982,8 +1992,8 @@ impl ModelRuntime {
         let commit_s = commit_at.elapsed().as_secs_f64();
         self.scheduler_statistics.batch_commit_s += commit_s;
         let seconds = inputs_at.elapsed().as_secs_f64();
-        let load_s = self.execution.batch_statistics.get().initialization_s() - load_before;
-        let capture_s = self.execution.batch_statistics.get().capture_s - capture_before;
+        let load_s = self.execution.batch_statistics().initialization_s() - load_before;
+        let capture_s = self.execution.batch_statistics().capture_s - capture_before;
         self.iteration_costs
             .entry(key)
             .or_default()
@@ -2105,13 +2115,41 @@ impl ModelRuntime {
             };
             self.prepare_batch_target_inputs(req.slot, tokens, history)?;
         }
-        if let Some(table) = self.manifest.state_pointer_table.as_ref().filter(|table| {
+        let table = self.manifest.state_pointer_table.as_ref().filter(|table| {
             segments.len() <= table.max_rows && segments.iter().any(|s| s.tokens == 1)
-        }) {
+        });
+        let packet = self.manifest.packet_table();
+        if let (Some(table), None) = (table, packet) {
             self.execution.upload_sequence_addresses(
                 &table.buffer,
                 self.model_package.state_bindings(&segments)?,
             )?;
+        } else if packet.is_some() {
+            let bindings = self.model_package.state_bindings(&segments)?;
+            let suffix = packet
+                .map_or(Some(0), |p| segments.len().checked_mul(p.columns.len()))
+                .ok_or("Packet operand table size overflow")?;
+            let prefix = bindings
+                .len()
+                .checked_sub(suffix)
+                .ok_or("Truncated packet operand table")?;
+            let mut ranges = vec![];
+            if prefix != 0 {
+                ranges.push((
+                    self.manifest
+                        .state_pointer_table
+                        .as_ref()
+                        .ok_or("Missing ordinary state table")?
+                        .buffer
+                        .as_str(),
+                    0..prefix,
+                ));
+            }
+            if let Some(packet) = packet {
+                ranges.push((packet.buffer.as_str(), prefix..bindings.len()));
+            }
+            self.execution
+                .upload_sequence_address_ranges(bindings, &ranges)?;
         }
         Ok(segments)
     }

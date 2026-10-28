@@ -3,18 +3,18 @@ pub mod abi;
 pub mod architecture;
 pub mod artifact;
 pub mod catalog;
+pub mod conditional_memory;
 pub mod embedding;
 pub mod encoder_rows;
 pub mod execution;
 pub mod model;
 pub mod mtp;
 pub mod operators;
+pub mod packet;
 pub mod reranking;
 pub mod vision;
 
 pub mod audio;
 
 /// Fixed deployment identity, generated from the workspace machine contract.
-pub mod target {
-    include!(concat!(env!("OUT_DIR"), "/target.rs"));
-}
+pub use orinfer_device::target;

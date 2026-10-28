@@ -123,7 +123,7 @@ fn validate_lazy_workspace_requests() {
             "Lazy mapping changed graph VA"
         );
     }
-    let stats = model.execution.batch_statistics.get();
+    let stats = model.execution.batch_statistics();
     assert!(stats.workspace_mappings > 0 && stats.workspace_mapped_bytes > 0);
     std::fs::write(
         f.output,

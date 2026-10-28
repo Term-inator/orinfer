@@ -59,7 +59,7 @@ fn profile_native_ncu(model: &mut ModelRuntime, plan: &[Invocation]) {
         let pop = library
             .get::<unsafe extern "C" fn() -> i32>(b"nvtxRangePop\0")
             .unwrap();
-        crate::cuda::check(
+        crate::backend::cuda::check(
             cudarc::driver::sys::cuProfilerStart(),
             "profile decode chain",
         )
@@ -82,7 +82,7 @@ fn profile_native_ncu(model: &mut ModelRuntime, plan: &[Invocation]) {
             launched.unwrap();
         }
         model.execution.sync().unwrap();
-        crate::cuda::check(
+        crate::backend::cuda::check(
             cudarc::driver::sys::cuProfilerStop(),
             "stop decode chain profile",
         )
@@ -104,7 +104,7 @@ fn capture_kernel_arguments() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::Off,
+            cuda_graph: crate::execution::GraphMode::Off,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..LoadOptions::default()
@@ -213,7 +213,7 @@ fn profile_cached_generation() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            cuda_graph: crate::execution::GraphMode::DecodeOnly,
             prefix_cache_bytes,
             mtp_drafts: Some(fixture["mtp_drafts"].as_u64().unwrap_or(3) as usize),
             ..LoadOptions::default()
@@ -242,7 +242,7 @@ fn profile_cached_generation() {
             if tracing {
                 // SAFETY: Current CUDA context; Nsight owns collection for this diagnostic.
                 unsafe {
-                    crate::cuda::check(
+                    crate::backend::cuda::check(
                         cudarc::driver::sys::cuProfilerStart(),
                         "start diagnostic trace",
                     )
@@ -313,7 +313,7 @@ fn profile_cached_generation() {
             if tracing {
                 // SAFETY: The timed request completed; stop diagnostic collection.
                 unsafe {
-                    crate::cuda::check(
+                    crate::backend::cuda::check(
                         cudarc::driver::sys::cuProfilerStop(),
                         "stop diagnostic trace",
                     )
@@ -365,7 +365,7 @@ fn profile_speculative_verification() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            cuda_graph: crate::execution::GraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
             ..LoadOptions::default()
         },
@@ -514,7 +514,7 @@ fn capture_prefill_ffn_inputs() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::Off,
+            cuda_graph: crate::execution::GraphMode::Off,
             prefix_cache_bytes: 0,
             ..LoadOptions::default()
         },
@@ -626,7 +626,7 @@ fn capture_prefill_attention_inputs() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::Off,
+            cuda_graph: crate::execution::GraphMode::Off,
             prefix_cache_bytes: 0,
             ..LoadOptions::default()
         },
@@ -725,7 +725,7 @@ fn profile_prefill_stages() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            cuda_graph: crate::execution::GraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
             ..LoadOptions::default()
         },
@@ -837,7 +837,7 @@ fn capture_decode_projections() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::Off,
+            cuda_graph: crate::execution::GraphMode::Off,
             prefix_cache_bytes: 0,
             ..LoadOptions::default()
         },
@@ -914,7 +914,7 @@ fn profile_vision_stages() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            cuda_graph: crate::execution::GraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..LoadOptions::default()
@@ -985,7 +985,7 @@ fn profile_joint_prefill_stages() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            cuda_graph: crate::execution::GraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..LoadOptions::default()
@@ -1069,7 +1069,7 @@ fn profile_audio_stages() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            cuda_graph: crate::execution::GraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..LoadOptions::default()
@@ -1148,7 +1148,7 @@ fn profile_decode_chain() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(fixture["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            cuda_graph: crate::execution::GraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             resident_experts: fixture["resident_experts"]
@@ -1477,7 +1477,7 @@ fn capture_prefill_partitions() {
     let mut model = ModelRuntime::load_with_options(
         std::path::Path::new(spec["model"].as_str().unwrap()),
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::Off,
+            cuda_graph: crate::execution::GraphMode::Off,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             resident_experts: spec["resident_experts"]
@@ -1635,7 +1635,7 @@ fn profile_adaptive_mtp_decode() {
     let mut model = ModelRuntime::load_with_options(
         &fixture.model,
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            cuda_graph: crate::execution::GraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(fixture.mtp_drafts),
             ..LoadOptions::default()

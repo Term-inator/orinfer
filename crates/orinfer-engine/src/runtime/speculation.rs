@@ -67,9 +67,9 @@ impl ModelRuntime {
         phase: ExecutionPhase,
         produce_head: bool,
     ) -> Result<()> {
-        let owner = spec
-            .packet_table
-            .as_ref()
+        let owner = self
+            .manifest
+            .packet_table()
             .and_then(|_| self.execution.active_request_slot());
         let capacity = spec
             .batch_warm_capacity

@@ -84,9 +84,9 @@ impl ExecutionPackage {
     }
 
     fn validate_metadata(&self) -> Result<()> {
+        let target = orinfer_device::Target::from_package(&self.target)?;
         if self.schema_version != 1
             || self.runtime_abi != RUNTIME_ABI
-            || self.target != orinfer_model_sdk::target::CUDA_ARCH
             || self.architecture.is_empty()
             || self.compute_policy.is_empty()
         {
@@ -102,7 +102,7 @@ impl ExecutionPackage {
         {
             return Err("Invalid or duplicate batch profile".into());
         }
-        self.catalog.validate()?;
+        self.catalog.validate_target(&target)?;
         seen.clear();
         if self
             .prefill_batch_profiles

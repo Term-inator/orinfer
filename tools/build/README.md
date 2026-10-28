@@ -4,6 +4,8 @@
 
 ## 编译环境
 
+CPU 依赖由根目录 `pyproject.toml` 和 `uv.lock` 管理，使用 `make python-env` 同步，通过 `uv run --locked` 执行。GPU 离线依赖继续由固定 SM120 编译镜像内的 `compiler-requirements.txt` 管理。
+
 ```bash
 make compiler-image
 make build
@@ -39,7 +41,7 @@ bash tools/operators/run.sh tools/build/smoke.py artifacts/build/compiler-smoke
 
 ## 自动检查
 
-`make check` 包含 Rust/Ruff 格式、Python 静态检查、编译、clippy、Rust/CPU Python 测试和验收配置校验；GitHub Actions 在 x86_64 runner 执行同一入口；原生 C ABI 加载测试在本机 x86_64 执行，读取 `rust-toolchain.toml`。`make fmt` 统一格式，`make lint` 执行格式和静态检查；Rust 编译将死代码视为错误，clippy 以零警告为通过条件。使用 `uv` 隔离 CPU 依赖：`make python-env` 创建 Python3.12 的 `.venv` 并同步固定版本；检查默认使用 `.venv/bin/python`，CPU 依赖隔离在虚拟环境中，可通过 `PYTHON` 覆盖解释器；CI 和编译镜像固定 uv0.13.1，Rust 版本由 `rust-toolchain.toml` 固定。GPU 编译镜像使用 Python 3.10，新增离线模块按该解释器验证。
+`make check` 包含 Rust/Ruff 格式、Python 静态检查、编译、clippy、Rust/CPU Python 测试和验收配置校验；GitHub Actions 在 x86_64 runner 执行同一入口；原生 C ABI 加载测试在本机 x86_64 执行，读取 `rust-toolchain.toml`。`make fmt` 统一格式，`make lint` 执行格式和静态检查；Rust 编译将死代码视为错误，clippy 以零警告为通过条件。CPU 依赖和解释器使用项目 uv 环境；GPU 编译镜像使用 Python 3.10，新增离线模块按该解释器验证。
 
 `make check-offline` 在编译镜像中检查全部离线模块引用，并在 CPU 上执行需要 Torch 的参考数学及动态行数 ABI 测试。
 

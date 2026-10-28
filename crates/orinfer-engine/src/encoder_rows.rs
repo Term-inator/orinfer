@@ -1,5 +1,5 @@
 //! Upload independently owned encoder rows before capturing or replaying a packet.
-use crate::{artifact::Result, cuda::executor::Executor};
+use crate::{artifact::Result, backend::Executor};
 use orinfer_model_sdk::encoder_rows::{Packet, Spec};
 
 pub(crate) fn upload(e: &Executor, spec: &Spec, packet: &Packet) -> Result<()> {

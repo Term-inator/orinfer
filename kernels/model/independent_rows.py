@@ -118,8 +118,9 @@ def indirect_parameters(function, columns, operands, offsets=None):
             annotations = dict(node.annotations)
             body = node.body
             if node.name_hint == "tilelang_root":
+                imported = str(annotations.get("pragma_import_c", ""))
                 annotations["pragma_import_c"] = (
-                    str(annotations.get("pragma_import_c", "")) + POINTER_SOURCE
+                    imported if "void* orin_row_pointer(" in imported else imported + POINTER_SOURCE
                 )
                 body = tir.SeqStmt(bindings + [body])
             return tir.SBlock(

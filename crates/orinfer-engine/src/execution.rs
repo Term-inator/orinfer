@@ -3,38 +3,7 @@ use crate::artifact::Result;
 use serde::Serialize;
 use std::{fmt, str::FromStr};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CudaGraphMode {
-    #[default]
-    DecodeOnly,
-    Full,
-    Off,
-}
-
-impl fmt::Display for CudaGraphMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::DecodeOnly => "decode_only",
-            Self::Full => "full",
-            Self::Off => "off",
-        })
-    }
-}
-
-impl FromStr for CudaGraphMode {
-    type Err = String;
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "decode_only" => Ok(Self::DecodeOnly),
-            "full" => Ok(Self::Full),
-            "off" => Ok(Self::Off),
-            _ => Err(format!(
-                "Invalid CUDA Graph mode {value:?}; expected decode_only, full or off"
-            )),
-        }
-    }
-}
+pub use orinfer_device::GraphMode;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadOptions {
@@ -42,7 +11,7 @@ pub struct LoadOptions {
     pub resident_experts: ResidentExperts,
     /// CPU compressed-expert cache budget; zero reads directly from storage.
     pub host_weight_cache_bytes: usize,
-    pub cuda_graph: CudaGraphMode,
+    pub cuda_graph: GraphMode,
     /// Hash loaded weight payloads and CPU row tables in addition to structural checks.
     pub verify_weights: bool,
     /// None selects a bounded number of available CPU cores for weight I/O.
@@ -70,8 +39,8 @@ impl From<ResidentExperts> for serde_json::Value {
         }
     }
 }
-pub use crate::cuda::experts::Statistics as ExpertCacheStatistics;
-pub use crate::cuda::host_weights::Statistics as HostWeightCacheStatistics;
+pub use crate::backend::cuda::host_weights::Statistics as HostWeightCacheStatistics;
+pub use crate::backend::report::ExpertCacheStatistics;
 impl fmt::Display for ResidentExperts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -220,6 +189,18 @@ fn disable_mtp(manifest: &mut crate::model::Manifest) {
             dead.remove(name);
         }
     }
+    // The common operand table also serves ordinary decode. Its registration
+    // program may have belonged to the MTP program set, but its indirect
+    // bindings remain live when speculation is disabled.
+    if let Some(table) = manifest.packet_table() {
+        for name in table
+            .kernels
+            .values()
+            .chain(table.copies.iter().map(|copy| &copy.kernel))
+        {
+            dead.remove(name);
+        }
+    }
     if let Some(rows) = &mut manifest.row_execution {
         rows.programs
             .retain(|name| manifest.programs.contains_key(name));
@@ -265,43 +246,87 @@ pub fn parse_cache_mib(value: &str) -> Result<usize> {
         .ok_or_else(|| "Prefix cache MiB must be a nonnegative integer within usize".into())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ExecutionPhase {
-    Prefill,
-    Decode,
-    Vision,
-}
-
+pub(crate) use orinfer_device::ExecutionPhase;
 pub use orinfer_model_sdk::execution::{BufferView, Invocation};
-
-impl CudaGraphMode {
-    pub(crate) fn uses_graph(self, phase: ExecutionPhase) -> bool {
-        match self {
-            Self::DecodeOnly => phase == ExecutionPhase::Decode,
-            Self::Full => true,
-            Self::Off => false,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn ordinary_packet_bindings_survive_disabling_mtp() {
+        use serde_json::json;
+        let mut manifest: crate::model::Manifest = serde_json::from_value(json!({
+            "schema_version":2,"target":orinfer_model_sdk::target::CUDA_ARCH,"model":"test","chunk_tokens":1,
+            "max_context":64,"vocab":32,"toolchain":{},"reset_buffers":[],
+            "input":"i","token":"t","status":"s","logits":"l","position":"p",
+            "weight_bytes":0,"weight_parameters":1,"weight_scope":"test",
+            "buffers":[
+                {"name":"State","dtype":"f32","shape":[1],"layout":"native_contiguous",
+                 "alignment":256,"access":"read_write","data":null},
+                {"name":"Pointers","dtype":"u64","shape":[128],"layout":"native_contiguous",
+                 "alignment":256,"access":"read_write","data":null}
+            ],
+            "programs":{
+                "decode":[{"kind":"kernel","name":"target"}],
+                "draft":[{"kind":"kernel","name":"draft"}],
+                "indirect":[{"kind":"kernel","name":"packet_target"}]
+            },
+            "packet_table":{"buffer":"Pointers","columns":["State"],
+                            "kernels":{"target":"packet_target"},"copies":[]},
+            "mtp":{
+                "position":"p","input":"i","token":"t","status":"s",
+                "verification_tokens":"v","verification_status":"vs",
+                "draft_logits":"d","verification_logits":"vl","accepted_inputs":"a",
+                "target_length":"tl","draft_program":"draft","default_verification_tokens":2,
+                "warm_plans":[],"capture_plans":[],"verification_plans":[],
+                "batch_programs":["indirect"]
+            }
+        }))
+        .unwrap();
+        for name in ["target", "draft", "packet_target"] {
+            manifest.kernels.push(
+                serde_json::from_value(json!({
+                    "name":name,"symbol":"test","args":[],
+                    "module":{"file":"kernel.cubin","sha256":"0".repeat(64)},
+                    "source":{"file":"kernel.cu","sha256":"0".repeat(64)},
+                    "host_abi":{"file":"host.txt","sha256":"0".repeat(64)}
+                }))
+                .unwrap(),
+            );
+        }
+        manifest
+            .packet_table()
+            .unwrap()
+            .validate(&manifest)
+            .unwrap();
+        LoadOptions {
+            mtp_drafts: Some(0),
+            ..Default::default()
+        }
+        .configure_mtp(&mut manifest)
+        .unwrap();
+        assert!(manifest.mtp.is_none());
+        assert!(!manifest.programs.contains_key("draft"));
+        assert!(!manifest.programs.contains_key("indirect"));
+        assert!(!manifest.kernels.iter().any(|k| k.name == "draft"));
+        manifest
+            .packet_table()
+            .unwrap()
+            .validate(&manifest)
+            .unwrap();
+    }
+
+    #[test]
     fn modes_roundtrip_and_invalid_values_fail() {
-        for mode in [
-            CudaGraphMode::DecodeOnly,
-            CudaGraphMode::Full,
-            CudaGraphMode::Off,
-        ] {
-            assert_eq!(mode.to_string().parse::<CudaGraphMode>().unwrap(), mode);
+        for mode in [GraphMode::DecodeOnly, GraphMode::Full, GraphMode::Off] {
+            assert_eq!(mode.to_string().parse::<GraphMode>().unwrap(), mode);
             assert_eq!(serde_json::to_string(&mode).unwrap(), format!("\"{mode}\""));
         }
         for invalid in ["", "on", "0", "1", "decode", "FULL"] {
-            assert!(invalid.parse::<CudaGraphMode>().is_err());
+            assert!(invalid.parse::<GraphMode>().is_err());
         }
-        assert_eq!(LoadOptions::default().cuda_graph, CudaGraphMode::DecodeOnly);
+        assert_eq!(LoadOptions::default().cuda_graph, GraphMode::DecodeOnly);
         assert_eq!(LoadOptions::default().mtp_drafts, None);
         assert!(!LoadOptions::default().prompt_lookup);
         assert_eq!(
@@ -363,11 +388,11 @@ mod tests {
             ExecutionPhase::Vision,
         ] {
             assert_eq!(
-                CudaGraphMode::DecodeOnly.uses_graph(phase),
+                GraphMode::DecodeOnly.uses_graph(phase),
                 phase == ExecutionPhase::Decode
             );
-            assert!(CudaGraphMode::Full.uses_graph(phase));
-            assert!(!CudaGraphMode::Off.uses_graph(phase));
+            assert!(GraphMode::Full.uses_graph(phase));
+            assert!(!GraphMode::Off.uses_graph(phase));
         }
     }
 }

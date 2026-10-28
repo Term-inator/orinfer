@@ -1,5 +1,4 @@
 use super::*;
-use crate::cuda::sys;
 
 impl ModelRuntime {
     pub(super) fn benchmark(
@@ -11,8 +10,7 @@ impl ModelRuntime {
         self.manifest.validate_requests(&requests)?;
         self.prepare_visual(&[], &[], &|| false)?;
         let manifest = &self.manifest;
-        let s = &self.execution.session;
-        let pointers = &self.execution.pointers;
+        let execution = &self.execution;
         let stats = self.stats;
         let output_directory = requests
             .logits_output
@@ -27,7 +25,7 @@ impl ModelRuntime {
             .iter()
             .find(|b| b.name == manifest.logits)
             .ok_or("Logits missing")?;
-        let dump_logits = |_session: &Session,
+        let dump_logits = |_session: &Executor,
                            q: &crate::model::Request,
                            step: usize,
                            files: &mut Vec<String>|
@@ -35,19 +33,7 @@ impl ModelRuntime {
             if !q.logits_steps.contains(&step) {
                 return Ok(());
             }
-            let mut raw = vec![0u8; logits_spec.bytes()?];
-            // SAFETY: Caller synchronized this stream, host range and device
-            // allocation cover the complete logits tensor.
-            unsafe {
-                check(
-                    sys::cuMemcpyDtoH_v2(
-                        raw.as_mut_ptr().cast(),
-                        pointers[&manifest.logits],
-                        raw.len(),
-                    ),
-                    "download logits",
-                )?;
-            }
+            let raw = execution.read_ready_bytes(&manifest.logits, logits_spec.bytes()?)?;
             let values = floats(&raw, logits_spec.dtype);
             if values.iter().any(|v| !v.is_finite()) {
                 return Err("Nonfinite logits".into());
@@ -67,18 +53,7 @@ impl ModelRuntime {
             files.push(path.display().to_string());
             Ok(())
         };
-        let read_i32 = |_session: &Session, name: &str| -> Result<i32> {
-            let mut value = 0i32;
-            // SAFETY: Control allocations and stack destination are >=4 bytes.
-            // Every caller has synchronized the producing stream.
-            unsafe {
-                check(
-                    sys::cuMemcpyDtoH_v2((&mut value as *mut i32).cast(), pointers[name], 4),
-                    "download control",
-                )?;
-            }
-            Ok(value)
-        };
+        let read_i32 = |execution: &Executor, name: &str| execution.read_ready_control(name);
         for q in &requests.requests {
             let (chunk_tokens, prefill_program, _) =
                 manifest.select_prefill_plan(q.input_tokens.len())?;
@@ -109,39 +84,23 @@ impl ModelRuntime {
                     self.execution
                         .upload_ids(&controls.last_index, &[(chunk.len() - 1) as u32])?;
                 }
-                // SAFETY: Input IDs fit this allocation and were range checked.
-                // Previous graph is complete before overwriting its input buffer.
-                unsafe {
-                    check(
-                        sys::cuStreamSynchronize(s.stream),
-                        "prefill input dependency",
-                    )?;
-                    if q.input_tokens.len() > 8192
-                        && chunk_index > 0
-                        && chunk_index.is_multiple_of(8)
-                    {
-                        eprintln!(
-                            "request {}: prefill {}/{} tokens complete after {:.3}s",
-                            q.id,
-                            chunk_index * chunk_tokens,
-                            q.input_tokens.len(),
-                            request_start.elapsed().as_secs_f64()
-                        );
-                    }
-                    check(
-                        sys::cuMemcpyHtoD_v2(
-                            pointers[if manifest.prefill_plan(chunk.len()).is_some() {
-                                &manifest.input
-                            } else {
-                                &manifest.token
-                            }],
-                            chunk.as_ptr().cast(),
-                            chunk.len() * 4,
-                        ),
-                        "prefill token upload",
-                    )?;
-                    check(sys::cuCtxSynchronize(), "prefill upload dependency")?;
+                self.execution.sync()?;
+                if q.input_tokens.len() > 8192 && chunk_index > 0 && chunk_index.is_multiple_of(8) {
+                    eprintln!(
+                        "request {}: prefill {}/{} tokens complete after {:.3}s",
+                        q.id,
+                        chunk_index * chunk_tokens,
+                        q.input_tokens.len(),
+                        request_start.elapsed().as_secs_f64()
+                    );
                 }
+                let input = if manifest.prefill_plan(chunk.len()).is_some() {
+                    &manifest.input
+                } else {
+                    &manifest.token
+                };
+                self.execution.upload_ids(input, chunk)?;
+                self.execution.sync()?;
                 self.model_package.prepare_inputs(
                     if manifest.row_execution.is_some() {
                         program
@@ -158,49 +117,32 @@ impl ModelRuntime {
                     ExecutionPhase::Prefill,
                 )?;
             }
-            // SAFETY: Synchronize before head timing and output download.
-            unsafe {
-                check(sys::cuStreamSynchronize(s.stream), "prefill complete")?;
-            }
+            self.execution.sync()?;
             let prefill_s = request_start.elapsed().as_secs_f64();
             let head_start = Instant::now();
             let last_rows = (q.input_tokens.len() - 1) % chunk_tokens + 1;
             let (_, _, head_program) = manifest.select_prefill_plan(last_rows)?;
             self.execution
                 .submit_program_rows(head_program, last_rows, ExecutionPhase::Prefill)?;
-            // SAFETY: Head consumes last prefill graph's buffers on the same stream.
-            unsafe {
-                check(sys::cuStreamSynchronize(s.stream), "head complete")?;
-            }
-            if read_i32(s, &manifest.status)? != 0 {
+            self.execution.sync()?;
+            if read_i32(execution, &manifest.status)? != 0 {
                 return Err("Token selection status failure".into());
             }
-            let token = read_i32(s, &manifest.token)?;
+            let token = read_i32(execution, &manifest.token)?;
             if token < 0 || token as usize >= manifest.vocab {
                 return Err("Invalid selected token".into());
             }
             tokens.push(token as u32);
             let head_s = head_start.elapsed().as_secs_f64();
             let ttft_s = request_start.elapsed().as_secs_f64();
-            dump_logits(s, q, 0, &mut logits_files)?;
             let expert_prefill = self.execution.expert_statistics();
+            dump_logits(execution, q, 0, &mut logits_files)?;
             let decode_start = Instant::now();
             let mut history = q.input_tokens.clone();
             for step in 1..q.max_new_tokens {
                 if let Some(id) = q.forced_tokens.get(step - 1) {
-                    // SAFETY: Previous graph completed, valid token ID and 4-byte
-                    // destination; explicit synchronization separates upload/replay.
-                    unsafe {
-                        check(
-                            sys::cuMemcpyHtoD_v2(
-                                pointers[&manifest.token],
-                                (id as *const u32).cast(),
-                                4,
-                            ),
-                            "teacher-force token",
-                        )?;
-                        check(sys::cuCtxSynchronize(), "teacher-force dependency")?;
-                    }
+                    self.execution.upload_ids(&manifest.token, &[*id])?;
+                    self.execution.sync()?;
                 }
                 let input = q
                     .forced_tokens
@@ -218,22 +160,19 @@ impl ModelRuntime {
                 self.execution
                     .submit_program("decode", ExecutionPhase::Decode)?;
                 history.push(input);
-                // SAFETY: This session owns the live stream and all queued work.
-                unsafe {
-                    check(sys::cuStreamSynchronize(s.stream), "decode complete")?;
-                }
-                if read_i32(s, &manifest.status)? != 0 {
+                self.execution.sync()?;
+                if read_i32(execution, &manifest.status)? != 0 {
                     return Err("Decode token status failure".into());
                 }
-                let token = read_i32(s, &manifest.token)?;
+                let token = read_i32(execution, &manifest.token)?;
                 if token < 0 || token as usize >= manifest.vocab {
                     return Err("Invalid decode token".into());
                 }
                 tokens.push(token as u32);
-                dump_logits(s, q, step, &mut logits_files)?;
+                dump_logits(execution, q, step, &mut logits_files)?;
             }
             let decode_s = decode_start.elapsed().as_secs_f64();
-            let final_position = read_i32(s, &manifest.position)?;
+            let final_position = read_i32(execution, &manifest.position)?;
             if final_position < 0
                 || final_position as usize != q.input_tokens.len() + q.max_new_tokens - 1
             {
@@ -281,7 +220,7 @@ impl ModelRuntime {
                 fs::rename(&temporary, &path).map_err(|e| e.to_string())?;
             }
         }
-        self.execution.session.cleanup()?;
+        self.execution.cleanup()?;
         let weight_bytes = manifest.weight_bytes + stats.load_stages.weight_arena_padding_bytes;
         Ok(Report {
             resident_experts: stats.resident_experts,
@@ -303,8 +242,8 @@ impl ModelRuntime {
             captured_programs: stats.captured_programs,
             buffer_bytes: stats.buffer_bytes,
             buffer_capacity_bytes: stats.buffer_capacity_bytes,
-            peak_kv_bytes: self.execution.peak_kv_bytes.get(),
-            peak_prefill_workspace_bytes: self.execution.peak_prefill_workspace_bytes.get(),
+            peak_kv_bytes: self.execution.peak_kv_bytes(),
+            peak_prefill_workspace_bytes: self.execution.peak_prefill_workspace_bytes(),
             weight_bytes,
             effective_weight_bits: 8.0 * weight_bytes as f64 / manifest.weight_parameters as f64,
             weight_scope: manifest.weight_scope.clone(),

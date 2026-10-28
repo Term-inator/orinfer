@@ -59,16 +59,23 @@ def inventory(data, package, manifest, compiler):
 def source_identity():
     # This pins both code generation and Rust's reconstruction of the input
     # architecture contract. Paths and mtimes never determine cache validity.
-    paths = [ROOT / "Cargo.lock", ROOT / "Cargo.toml", ROOT / "rust-toolchain.toml"]
+    paths = [
+        ROOT / "Cargo.lock",
+        ROOT / "Cargo.toml",
+        ROOT / "rust-toolchain.toml",
+        ROOT / "tools/build/compiler-requirements.txt",
+    ]
     paths.extend((ROOT / "crates").rglob("Cargo.toml"))
     paths.extend((ROOT / "configs").glob("*.json"))
     for directory, suffix in (
         ("kernels/model", "*.py"),
+        ("kernels/operators", "*.py"),
         ("tools/model", "*.py"),
         ("tools/operators", "*.py"),
         ("tools/build", "*.py"),
         ("crates/orinfer-models", "*.rs"),
         ("crates/orinfer-model-sdk", "*.rs"),
+        ("crates/orinfer-device", "*.rs"),
     ):
         paths.extend((ROOT / directory).rglob(suffix))
     return source_hash(ROOT, paths)
@@ -165,6 +172,10 @@ def rebuild(args):
         print(json.dumps(report, indent=2), flush=True)
         return
 
+    from tools.model.packet_graph import inspect as inspect_packets, compile_package
+
+    packet_layout = inspect_packets(args.model)
+
     from tools.model.projection_tuning import ProjectionTuner
     from tools.operators.common import export_kernel
     import torch
@@ -215,7 +226,7 @@ def rebuild(args):
             experts=count,
         )
         wc = weight_contract(operands, buffers)
-        for bm in (8, 16):
+        for bm, st in ((8, 2), (8, 4), (16, 2), (16, 4)):
             expert_contract = dict(
                 source=contract["source"],
                 toolchain=contract["toolchain"],
@@ -223,11 +234,12 @@ def rebuild(args):
                 spec=spec,
                 weights=wc,
                 block_m=bm,
+                stages=st,
             )
 
             def certify(folder):
                 actual = read_weights(args.model, operands, buffers)
-                config = dict(block_m=bm)
+                config = dict(block_m=bm, stages=st)
                 candidate = tilelang.compile(
                     make_prim(spec, config),
                     out_idx=[],
@@ -246,8 +258,10 @@ def rebuild(args):
                 torch.cuda.empty_cache()
 
             _, hit = cache.get(expert_contract, certify)
-            certificates.append(dict(spec=spec, block_m=bm, cache_hit=hit))
-            print("EXPERT CHECKED", count, n, k, bm, "cache" if hit else "validated", flush=True)
+            certificates.append(dict(spec=spec, block_m=bm, stages=st, cache_hit=hit))
+            print(
+                "EXPERT CHECKED", count, n, k, bm, st, "cache" if hit else "validated", flush=True
+            )
     with atomic_model(args.model_output) as staging:
         root = clone_model(args.model, staging, origin)
         compiler = Compiler(origin, root, args.output, buffers)
@@ -337,6 +351,12 @@ def rebuild(args):
                 dict(complete=False, finished=number, total=len(groups), operators=records),
             )
             print("BUILT", number, "/", len(groups), spec, "cache" if hit else "tuned", flush=True)
+        if args.hc_combine_norm:
+            from tools.model.flash_next.hc_fusion import publish as publish_hc_combine_norm
+
+            replacements.update(
+                publish_hc_combine_norm(package, manifest, compiler, args.output / "hc")
+            )
         package["kernels"] = [replacements.get(k["name"], k) for k in package["kernels"]]
         package["dynamic_batch_kernels"] = [
             launches.get(k["name"], k) for k in package["dynamic_batch_kernels"]
@@ -369,6 +389,16 @@ def rebuild(args):
 
                 rebuild_overlays(data, package, manifest, compiler, data["metadata"]["max_context"])
         coalesce_adjacent_selections(package)
+        compile_package(
+            data,
+            package,
+            manifest,
+            root,
+            root,
+            args.output / "packets",
+            args.cache / "packets",
+            packet_layout,
+        )
         digest = compact_package(root, package, staging / "cache/packages")
         shutil.rmtree(root)
         data["execution_package"] = digest
@@ -452,6 +482,11 @@ def main():
         help="Rebuild only declared prefill projections; preserve other certified bindings",
     )
     p.add_argument("--prefill-tuning-rows", type=int, nargs="+", default=[512, 2048, 4096])
+    p.add_argument(
+        "--hc-combine-norm",
+        action="store_true",
+        help="Replace decode HC combine bindings with the bit-identical fused combine-norm kernel",
+    )
     p.add_argument(
         "--projection-kinds",
         nargs="+",

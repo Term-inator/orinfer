@@ -118,6 +118,7 @@ def main():
             report["cases"].append(row)
             write_json(args.output / "results.json", report)
             print("QSA PARTITIONS", row, flush=True)
+
     report["complete"] = True
     write_json(args.output / "results.json", report)
 

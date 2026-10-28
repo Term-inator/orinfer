@@ -36,49 +36,6 @@ def _orin_jit(function):
 
 
 @_orin_jit
-def gdn_ab_simt(
-    M,
-    dtype: str = "float16",
-    output_dtype: str = "float16",
-    N: int = N_AB,
-    K: int = K_HIDDEN,
-    threads: int = 256,
-):
-    """Build explicit-output (X,W_ab,Y), dynamic M allowed; one CTA per scalar.
-
-    Products and parallel reduction use FP32; final store rounds to output dtype.
-    No workspace, global atomic, quantization, or native GEMM.
-    """
-    assert dtype in ("float16", "bfloat16")
-    assert output_dtype in ("float16", "bfloat16", "float32")
-
-    @T.prim_func
-    def kernel(
-        X: T.Tensor((M, K), dtype), W_ab: T.Tensor((N, K), dtype), Y: T.Tensor((M, N), output_dtype)
-    ):
-        with T.Kernel(N, M, threads=threads) as (n, m):
-            products = T.alloc_fragment((K,), T.float32)
-            total = T.alloc_fragment((1,), T.float32)
-            for k in T.Parallel(K):
-                if dtype == "bfloat16":
-                    # Exact BF16 expansion avoids compiler vector BF16 cast temporaries.
-                    xv = T.reinterpret(
-                        T.float32, T.cast(T.reinterpret(T.uint16, X[m, k]), T.uint32) << 16
-                    )
-                    wv = T.reinterpret(
-                        T.float32, T.cast(T.reinterpret(T.uint16, W_ab[n, k]), T.uint32) << 16
-                    )
-                    products[k] = xv * wv
-                else:
-                    products[k] = T.cast(X[m, k], T.float32) * T.cast(W_ab[n, k], T.float32)
-            T.reduce_sum(products, total, dim=0)
-            if T.get_thread_binding() == 0:
-                Y[m, n] = total[0]
-
-    return kernel
-
-
-@_orin_jit
 def gdn_ab_tensorcore(
     M,
     dtype: str = "float16",
@@ -116,10 +73,3 @@ def gdn_ab_tensorcore(
             T.copy(accum, Y[by * BM, bx * BN])
 
     return kernel
-
-
-def launch(kernel, x, w_ab, y, stream=None):
-    """Use the current stream at each invocation, including graph capture."""
-    if stream is None:
-        stream = torch.cuda.current_stream(x.device).cuda_stream
-    return kernel(x, w_ab, y, stream=stream)

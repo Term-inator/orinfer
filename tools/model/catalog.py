@@ -276,6 +276,9 @@ def finalize(model, output, engine=None):
 
     model = Path(model).resolve(strict=True)
     descriptor, origin, package = load_model(model)
+    spec = descriptor["metadata"].get("mtp") or {}
+    if spec.get("packet_table") and not descriptor["metadata"].get("packet_table"):
+        descriptor["metadata"]["packet_table"] = spec.pop("packet_table")
     with atomic_model(Path(output), engine) as staging:
         operator = clone_model(model, staging, origin)
         digest = commit_package(staging, operator, descriptor, package)

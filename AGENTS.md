@@ -11,7 +11,8 @@
 - ASR 文件前处理复用 Symphonia、Rubato 固定比例 FFT 重采样和启用 NEON 的 RealFFT；checkpoint 专用窗函数、mel 滤波与归一化保持参考语义。重采样改动检查时长、时间对齐、通带和抗混叠，并以真实录音及固定历史概率验收。
 - ASR 按本轮选中的文本 packet 准备录音，音频编码单独计入启动成本；特征通过 owner 地址写回，保留统一 stream 顺序和范围校验。吞吐策略的冷请求准入以模型 prefill packet 容量为预算。空闲 arena 选择在连续内存估算与租用之间复用，租用、释放、重置和回收使选择缓存失效。
 - Qwen 公共动态行执行器将普通 decode 的 token 输入、prepare、embedding、媒体覆盖、位置推进、MTP hidden 捕获、最终 norm 和输出分发作为地址表 packet 执行；混合普通 packet 中的 decode 前缀复用同一边界。离线通过 independent_rows 包装原始一行算术，层状态表后追加固定顺序的边界列，Rust 与 Python 共享列序契约并验证反向 owner、batch 变化、取消复用与 MTP 衔接。完整 logits 与选中 token 保留各请求的输出语义。
-- 在线运行时用 Rust，生产 GPU kernel 以 TileLang 为源；Python 只用于离线转换、编译、参考和验证。
+- 在线运行时用 Rust，生产 GPU kernel 以 TileLang 为源；Python 只用于离线转换、编译、参考和验证。A2 已有 ACLNN W4A8 grouped matmul 保留为接通模型的基线；新增 A2 算子用 TileLang-Ascend 离线编译，由 Rust 的指针表 C ABI 加载。AOT 库内描述必须与外部 dtype、shape、访问方式和编译身份一致，Graph 和完成事件持有全部原生资源。
+- DSv4.1 A2 的 W4 bank、scale 和 assist 在离线阶段准备并落盘；在线直接读取物理布局，按计划校验形状和字节范围，不执行 W4 转置、全量参考对照或权重 payload 哈希扫描。
 - 模型实现、公共执行组件、TileLang kernel 和离线构建工具在统一 workspace 维护，共享架构与计算策略组件。orinfer-models 分别注册模型适配器与计算策略，部署包内 Rust cdylib 通过版本化 C ABI 生成执行程序、动态 batch 和状态绑定，匹配的 TileLang cubin 与库同包发布。公共 CUDA 执行器从模型契约读取模型族、层数、维度和层序；新增架构通过适配器注册接入。
 - 第一阶段包含 prefix cache 与多请求 batching；缓存恢复和 batch 调度必须保持完整 KV/GDN/卷积/MTP 状态及请求隔离。
 - 项目许可证为 LGPL-3.0-or-later，保留第三方版权和许可证声明。

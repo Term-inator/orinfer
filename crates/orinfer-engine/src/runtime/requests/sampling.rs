@@ -119,10 +119,10 @@ impl ModelRuntime {
         let output = self.read_controls(&batch.output, candidates.len() * 2)?;
         #[cfg(test)]
         profile::mark("sampling_readback");
-        let mut stats = self.execution.batch_statistics.get();
+        let mut stats = self.execution.batch_statistics();
         stats.sampling_packets += 1;
         stats.sampling_rows += candidates.len();
-        self.execution.batch_statistics.set(stats);
+        self.execution.set_batch_statistics(stats);
         let mut result = BTreeMap::new();
         for ((index, _), values) in candidates.into_iter().zip(output.as_chunks::<2>().0) {
             let token = match validate_output(values, self.manifest.vocab) {

@@ -84,7 +84,7 @@ fn validate_flash_compact_expert_owners() {
             resident_experts: crate::execution::ResidentExperts::Count(8),
             // Force real host eviction and CPU/GPU coverage transitions.
             host_weight_cache_bytes: 256usize << 20,
-            cuda_graph: crate::execution::CudaGraphMode::Off,
+            cuda_graph: crate::execution::GraphMode::Off,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..Default::default()
@@ -257,8 +257,8 @@ fn validate_flash_expert_parallel_read_failure() {
     // SAFETY: The live model owns this stream; failed execution must drain it
     // before finish_request can release the owner's arena.
     unsafe {
-        crate::cuda::check(
-            crate::cuda::sys::cuStreamQuery(side),
+        crate::backend::cuda::check(
+            crate::backend::cuda::sys::cuStreamQuery(side),
             "failed branch drained",
         )
         .unwrap();
@@ -287,7 +287,7 @@ fn validate_flash_sequence_workspace_growth() {
         LoadOptions {
             resident_experts: crate::execution::ResidentExperts::Count(8),
             host_weight_cache_bytes: 256usize << 20,
-            cuda_graph: crate::execution::CudaGraphMode::Full,
+            cuda_graph: crate::execution::GraphMode::Full,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..Default::default()

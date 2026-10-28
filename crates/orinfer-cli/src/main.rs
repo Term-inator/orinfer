@@ -1,8 +1,7 @@
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use orinfer_api::{BatchConfig, PreprocessingLimits, ServerConfig};
 use orinfer_engine::execution::{
-    CudaGraphMode, LoadOptions, ResidentExperts, parse_cache_mib, parse_load_workers,
-    parse_mtp_drafts,
+    GraphMode, LoadOptions, ResidentExperts, parse_cache_mib, parse_load_workers, parse_mtp_drafts,
 };
 use std::{path::PathBuf, process::ExitCode};
 
@@ -16,7 +15,11 @@ impl std::str::FromStr for MtpDrafts {
 }
 
 #[derive(Parser)]
-#[command(name = "orinfer", version, about = "Native quantized LLM inference")]
+#[command(
+    name = "orinfer",
+    version,
+    about = "Native model inference and accelerator execution packages"
+)]
 struct Cli {
     #[arg(long, global = true, default_value_os_t = orinfer_api::manager::default_data_dir())]
     data_dir: PathBuf,
@@ -94,6 +97,50 @@ enum Command {
     },
     /// Show target and implementation status (default command).
     Info,
+    /// Inspect accelerator runtime availability without loading a model.
+    Devices {
+        #[arg(long)]
+        backend: orinfer_engine::backend::Backend,
+    },
+    /// Validate bounded native Ascend transfers and W4A8 arithmetic on one device.
+    ValidateAscend {
+        #[arg(long, default_value_t = 0)]
+        device: u32,
+    },
+    /// Validate TileLang A2 AOT operators and changed-input native Graph replay.
+    ValidateAscendKernels {
+        #[arg(long, default_value_t = 7)]
+        device: u32,
+        #[arg(long)]
+        fixtures: PathBuf,
+    },
+    /// Benchmark complete single-sequence native A2 model execution.
+    BenchAscend {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        model_dir: PathBuf,
+        #[arg(long)]
+        inputs: PathBuf,
+        #[arg(long, default_value_t = 128)]
+        output_tokens: usize,
+        #[arg(long, default_value_t = 3)]
+        repeats: usize,
+        #[arg(long)]
+        trace: Option<PathBuf>,
+    },
+    /// Validate native HCCL AllReduce and variable-count AlltoAllV on 2..8 devices.
+    ValidateHccl {
+        #[arg(long, value_delimiter = ',', required = true)]
+        devices: Vec<u32>,
+    },
+    /// Validate conditional-memory metadata and immutable host row staging on CPU.
+    ValidateEngram {
+        #[arg(long)]
+        metadata: PathBuf,
+        #[arg(long)]
+        model_dir: PathBuf,
+    },
     /// Print the benchmark specification as JSON.
     Plan,
     /// Check AOT fixture and file hashes without CUDA.
@@ -139,9 +186,9 @@ struct LoadArgs {
     /// CPU compressed expert cache budget in MiB; 0 disables it.
     #[arg(long = "host-weight-cache-mib", value_name = "MIB", default_value_t = 4096, value_parser = parse_cache_mib)]
     host_weight_cache_bytes: usize,
-    /// CUDA graph capture: decode_only, full or off.
-    #[arg(long, value_name = "MODE", default_value_t = CudaGraphMode::default())]
-    cuda_graph: CudaGraphMode,
+    /// Graph capture: decode_only, full or off. --graph is the backend-neutral alias.
+    #[arg(long, visible_alias = "graph", value_name = "MODE", default_value_t = GraphMode::default())]
+    cuda_graph: GraphMode,
     /// Hash loaded GPU weights and CPU row tables at startup (slower).
     #[arg(long)]
     verify_weights: bool,
@@ -511,6 +558,37 @@ fn execute(command: Command, data_dir: &std::path::Path) -> Result<(), String> {
             println!("Status: {}", orinfer_engine::STATUS);
             Ok(())
         }
+        Command::Devices { backend } => print_json(orinfer_engine::backend::inspect(backend)?),
+        Command::ValidateAscend { device } => {
+            print_json(orinfer_engine::backend::ascend::validation::run(device)?)
+        }
+        Command::ValidateAscendKernels { device, fixtures } => print_json(
+            orinfer_engine::backend::ascend::kernels::validation::run(device, &fixtures)?,
+        ),
+        Command::BenchAscend {
+            plan,
+            model_dir,
+            inputs,
+            output_tokens,
+            repeats,
+            trace,
+        } => print_json(&orinfer_engine::backend::ascend::model::run(
+            &plan,
+            &model_dir,
+            &inputs,
+            output_tokens,
+            repeats,
+            trace.as_deref(),
+        )?),
+        Command::ValidateHccl { devices } => print_json(
+            orinfer_engine::backend::ascend::hccl::validation::run(&devices)?,
+        ),
+        Command::ValidateEngram {
+            metadata,
+            model_dir,
+        } => print_json(orinfer_engine::host_rows::validation::run(
+            &metadata, &model_dir,
+        )?),
         Command::Plan => {
             println!("{}", orinfer_engine::BENCHMARK_PLAN);
             Ok(())
@@ -683,6 +761,32 @@ fn main() -> ExitCode {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backend_inventory_and_graph_alias_are_typed() {
+        let Some(Command::Devices { backend }) =
+            Cli::try_parse_from(["orinfer", "devices", "--backend", "ascend"])
+                .unwrap()
+                .command
+        else {
+            unreachable!()
+        };
+        assert_eq!(backend, orinfer_engine::backend::Backend::Ascend);
+        assert!(Cli::try_parse_from(["orinfer", "devices", "--backend", "unknown"]).is_err());
+        let Some(Command::RunModel(args)) = Cli::try_parse_from([
+            "orinfer",
+            "run-model",
+            "model",
+            "requests.json",
+            "--graph",
+            "full",
+        ])
+        .unwrap()
+        .command
+        else {
+            unreachable!()
+        };
+        assert_eq!(args.load.cuda_graph, GraphMode::Full);
+    }
     use super::*;
     #[test]
     fn managed_batch_only_overrides_explicit_model_options() {
@@ -732,7 +836,7 @@ mod tests {
         let config = serve(&[]).unwrap();
         config.validate().unwrap();
         assert_eq!(config.listen, "[::]:8088");
-        assert_eq!(config.cuda_graph, CudaGraphMode::DecodeOnly);
+        assert_eq!(config.cuda_graph, GraphMode::DecodeOnly);
         assert_eq!(config.prefix_cache_bytes, 12usize << 30);
         assert_eq!(config.host_weight_cache_bytes, 4usize << 30);
         assert_eq!(config.scheduler.max_active, 32);
@@ -769,7 +873,7 @@ mod tests {
         ])
         .unwrap();
         config.validate().unwrap();
-        assert_eq!(config.cuda_graph, CudaGraphMode::Off);
+        assert_eq!(config.cuda_graph, GraphMode::Off);
         assert_eq!(config.mtp_drafts, Some(7));
         assert_eq!(config.resident_experts, ResidentExperts::Count(256));
         assert_eq!(config.host_weight_cache_bytes, 16usize << 30);
@@ -949,7 +1053,7 @@ mod tests {
         let Some(Command::RunModel(args)) = cli.command else {
             unreachable!()
         };
-        assert_eq!(args.load.cuda_graph, CudaGraphMode::Full);
+        assert_eq!(args.load.cuda_graph, GraphMode::Full);
         assert!(args.load.verify_weights);
         assert_eq!(
             serve(&["--load-workers", "12"]).unwrap().load_workers,

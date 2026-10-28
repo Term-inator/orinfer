@@ -1,10 +1,13 @@
-.PHONY: check fmt lint build info python-env compiler-image check-offline check-gpu
+.PHONY: check check-locks fmt lint build info python-env compiler-image check-offline check-gpu
 
-PYTHON ?= .venv/bin/python
+UV ?= uv
+PYTHON = $(UV) run --locked python
 
 python-env:
-	uv venv --allow-existing --python python3.12 .venv
-	uv pip sync --python $(PYTHON) tools/build/cpu-requirements.txt
+	$(UV) sync --locked
+
+check-locks:
+	$(UV) lock --check --offline
 
 build:
 	bash tools/build/native.sh
@@ -19,17 +22,17 @@ lint:
 	$(PYTHON) -m ruff check tools kernels
 	cargo clippy --workspace --all-targets --locked --offline -- -D warnings
 
-check: lint
+check: check-locks lint
 	cargo check --workspace --locked --offline
 	cargo test --workspace --locked --offline
-	$(PYTHON) -m unittest tools.build.test_files tools.build.test_jetson_wheels tools.model.test_tuning -v
+	$(PYTHON) -m unittest tools.build.test_files tools.build.test_imports tools.model.test_tuning -v
 	$(PYTHON) -m unittest discover -s tools/api -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/eval -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/bench -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/operators -p 'test_abi.py' -v
 	$(PYTHON) -m unittest discover -s tools/vision -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/quantization -p 'test_*.py' -v
-	$(PYTHON) -m unittest tools.model.test_safetensors_source -v
+	$(PYTHON) -m unittest tools.model.test_safetensors_source tools.model.test_frontend -v
 	$(PYTHON) -m unittest tools.model.test_compile tools.model.flash_next.tests.test_storage tools.model.flash_next.tests.test_precision tools.model.flash_next.tests.test_hc -v
 	$(PYTHON) -m unittest tools.model.qwen35.test_build tools.model.qwen35.test_parallel tools.model.qwen35.test_attention tools.model.qwen35.test_q2 tools.model.qwen35.test_rebuild_attention tools.model.qwen35.test_rebuild_mtp -v
 	$(PYTHON) -m unittest tools.model.nemotron_embed.test_config tools.model.qwen_reranker.test_config -v
@@ -39,6 +42,7 @@ check: lint
 	$(PYTHON) -m unittest tools.model.test_row_selection tools.model.flash_next.tests.test_convergence tools.model.flash_next.tests.test_build tools.model.flash_next.tests.test_workspace -v
 	$(PYTHON) -m unittest tools.model.flash_next.tests.test_ple tools.model.flash_next.tests.test_chunks tools.model.flash_next.tests.test_validation tools.model.flash_next.tests.test_original tools.model.flash_next.tests.test_teacher_inputs tools.model.flash_next.tests.test_speculation tools.model.flash_next.tests.test_config -v
 	$(PYTHON) -m unittest tools.model.test_attach_execution tools.model.test_package tools.model.test_catalog tools.model.test_publication tools.model.test_row_contract tools.model.test_vision_capacity tools.release.test_package tools.test_reference -v
+	$(PYTHON) -m unittest tools.model.deepseek_v41.test_engram tools.model.deepseek_v41.test_prepare tools.model.deepseek_v41.test_official tools.operators.ascend.test_vector_launch -v
 	$(PYTHON) tools/bench/validate_plan.py
 
 info:

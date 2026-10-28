@@ -2,6 +2,8 @@
 
 CPU 工具使用项目 uv 环境，GPU 编码使用固定的 x86_64/SM120 编译镜像 `orinfer-compiler:0.2.0-sm120`。编码、存储重排和执行包构建分别完成；量化产物通过独立质量验收后才能部署。
 
+E8P Q2 编解码、GPU 算子、Q2_K 对比及两级 Q4 扩展见[量化技术 Wiki](../../docs/quantization.md)。
+
 ## 当前表示
 
 | 用途 | 权重表示 | 缩放与计算 |
@@ -24,7 +26,7 @@ CPU 工具使用项目 uv 环境，GPU 编码使用固定的 x86_64/SM120 编译
 调用者按输出行分块持有原始权重，例如每次 128 行；`raw` 必须直接读取原始 BF16/FP8 权重。存储、FP16 scale、旋转和系数均须与执行包匹配。
 
 ```bash
-.venv/bin/python -m unittest tools.quantization.test_e8p tools.quantization.test_e8p_q4
+uv run --locked python -m unittest tools.quantization.test_e8p tools.quantization.test_e8p_q4
 bash tools/operators/run.sh tools/quantization/check_e8p_q4.py artifacts/check-e8p-q4
 bash tools/operators/run.sh tools/quantization/check_e8p_search.py artifacts/check-e8p-search
 ```

@@ -18,10 +18,9 @@ pub(super) fn plan(
     let capacity = spec.batch_draft_profiles.last().copied().unwrap_or(0);
     let rows = crate::packet::Rows::packet(segments, capacity, capacity)?;
     let used = rows.total;
-    if (operation == BatchOperation::Draft && segments.len() < 2)
-        || segments
-            .iter()
-            .any(|s| operation != BatchOperation::Warm && s.tokens != 1)
+    if segments
+        .iter()
+        .any(|s| operation != BatchOperation::Warm && s.tokens != 1)
     {
         return Err("Draft packet requires unique independent one-token rows".into());
     }

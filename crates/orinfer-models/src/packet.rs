@@ -7,7 +7,29 @@ use crate::{
 use orinfer_model_sdk::{abi::StateBindings, architecture::BatchSegment};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Keep speculative packet addresses stable while rebinding each owner in data.
+/// Publish wrapped operands through one common program/export boundary.
+pub(crate) fn register_indirect(m: &mut Manifest) {
+    let Some(table) = m.packet_table() else {
+        return;
+    };
+    let operations = table
+        .kernels
+        .values()
+        .chain(table.copies.iter().map(|c| &c.kernel))
+        .map(|name| Operation::Kernel { name: name.clone() })
+        .collect();
+    m.programs.insert("mtp_packet_indirect".into(), operations);
+    if let Some(spec) = &mut m.mtp
+        && !spec
+            .batch_programs
+            .iter()
+            .any(|p| p == "mtp_packet_indirect")
+    {
+        spec.batch_programs.push("mtp_packet_indirect".into());
+    }
+}
+
+/// Keep packet addresses stable while rebinding each owner in data.
 /// Existing causal/commit table bindings precede the boundary table's bindings.
 pub(crate) fn indirect(
     m: &Manifest,
@@ -15,7 +37,7 @@ pub(crate) fn indirect(
     contracts: &[crate::artifact::Kernel],
     (mut plan, mut bindings): orinfer_model_sdk::abi::BatchPlan,
 ) -> Result<orinfer_model_sdk::abi::BatchPlan> {
-    let Some(table) = m.mtp.as_ref().and_then(|s| s.packet_table.as_ref()) else {
+    let Some(table) = m.packet_table() else {
         return Ok((plan, bindings));
     };
     let stride = table
@@ -38,6 +60,12 @@ pub(crate) fn indirect(
     };
     for call in &mut plan {
         let Some(owner) = call.sequence else { continue };
+        if call.views.iter().any(|(name, view)| {
+            (table.columns.contains(name) || table.columns.contains(&view.buffer))
+                && (name != &view.buffer || view.offset != 0)
+        }) {
+            return Err("Private packet views require an explicit indirect offset".into());
+        }
         let lane = *owners
             .get(&owner)
             .ok_or("Packet invocation owner is absent")?;
@@ -104,6 +132,10 @@ pub(crate) fn indirect(
                 destination,
                 bytes,
             } => {
+                if !table.columns.contains(source) && !table.columns.contains(destination) {
+                    call.sequence = None;
+                    continue;
+                }
                 let copy = table
                     .copies
                     .iter()

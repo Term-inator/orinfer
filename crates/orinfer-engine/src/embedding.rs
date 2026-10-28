@@ -1,7 +1,7 @@
 //! Complete bidirectional embedding requests through the shared CUDA executor.
 use crate::{
     artifact::Result,
-    cuda::executor::Executor,
+    backend::Executor,
     execution::{ExecutionPhase, LoadOptions},
 };
 use serde::Serialize;

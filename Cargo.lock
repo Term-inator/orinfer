@@ -1739,7 +1739,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "orinfer-api"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1767,7 +1767,7 @@ dependencies = [
 
 [[package]]
 name = "orinfer-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "orinfer-api",
@@ -1777,8 +1777,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "orinfer-device"
+version = "0.2.2"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "orinfer-engine"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cudarc",
  "flate2",
@@ -1788,6 +1796,7 @@ dependencies = [
  "libloading",
  "lzma-rust2",
  "memmap2",
+ "orinfer-device",
  "orinfer-model-sdk",
  "rayon",
  "realfft",
@@ -1801,15 +1810,16 @@ dependencies = [
 
 [[package]]
 name = "orinfer-model-sdk"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
+ "orinfer-device",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "orinfer-models"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "half",
  "hex",

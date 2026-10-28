@@ -29,7 +29,8 @@ def cold_expert_config():
 
 def expert_configs(codec, *, block_m=None, direct=False):
     if codec == "e8p_q2":
-        return [dict(block_m=m) for m in ((8, 16) if block_m is None else (block_m,))]
+        tiles = (8, 16) if block_m is None else (block_m,)
+        return [dict(block_m=m, stages=s) for m in tiles for s in (2, 4)]
     if codec != "e8p_q4" or block_m is not None:
         raise ValueError("Unsupported routed projection search")
     configs = [
@@ -97,7 +98,14 @@ def expert_projection(rows, outputs, inputs, experts, top_k, *, codec, config, d
         from kernels.model.e8p_exact import e8p_exact_grouped
 
         return inspect.unwrap(e8p_exact_grouped)(
-            rows * top_k, experts, tiles, outputs, inputs, block_m=tile, dynamic_rows=dynamic_rows
+            rows * top_k,
+            experts,
+            tiles,
+            outputs,
+            inputs,
+            block_m=tile,
+            stages=config.get("stages", 2),
+            dynamic_rows=dynamic_rows,
         )
     if codec not in ("e8p_q4", "e8p_q2_k128", "w8"):
         raise ValueError("Unsupported expert codec")

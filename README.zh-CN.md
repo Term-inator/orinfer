@@ -6,6 +6,8 @@
 
 面向 **Jetson AGX Orin 64GB / CUDA SM87**。Rust 负责引擎与 API，TileLang 在部署前将 GPU 算子编译为执行包。支持 Qwen3.8-27B、Qwen3.8-Flash-Next、Qwen3.5-4B，以及 Index-Translate-2B/9B/35B-A3B-preview，以及语音转写模型 Qwen3-ASR-1.7B；各模型包声明输入能力。
 
+共享运行时已将设备执行与调度、模型语义、prefix 状态分离。Ascend 910B / A2 后端提供原生 ACL 资源、异步传输、W4A8 grouped matmul、TileLang AOT 算子和 ACL Graph 验收，实验性 `bench-ascend` 提供 DSv4.1 Flash-1017 W4A8 完整 40 层的单流测量，Ascend 服务执行器仍在接入。在已配置 CANN 环境的主机上运行 `orinfer devices --backend ascend` 可查看设备，`orinfer validate-ascend --device 0` 执行有界原生验收；现有 CUDA 执行包和模型 C ABI 保持兼容。详见[设备后端边界](docs/model-packages.md#设备后端边界)。
+
 ## 功能
 
 - OpenAI Chat Completions 和 Ollama 聊天/生成 API：流式输出、thinking、采样、函数调用、JSON Schema 约束及 token 概率。
@@ -92,6 +94,7 @@ make check
 - [服务指南](docs/serving.md) · [离线 JSONL](docs/batch.md) · [性能参考](docs/performance.md)。
 - [构建与发布](tools/build/README.md) · [模型执行包](docs/model-packages.md)。
 - [模型构建](tools/model/README.md) · [GPU 算子](kernels/README.md) · [质量评测](tools/eval/README.md)。
+- [量化技术 Wiki](docs/quantization.md)：E8P Q2 码本、编解码与 Tensor Core 算子，Q2_K 对比及两级 Q4 扩展。
 
 详细指南目前以中文提供。
 

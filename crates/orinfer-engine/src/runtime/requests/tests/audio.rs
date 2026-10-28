@@ -249,7 +249,7 @@ fn packed_audio_matches_individual_recordings() {
     let mut model = ModelRuntime::load_with_options(
         &fixture.model,
         LoadOptions {
-            cuda_graph: crate::execution::CudaGraphMode::Full,
+            cuda_graph: crate::execution::GraphMode::Full,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
             ..Default::default()

@@ -1,4 +1,4 @@
-//! Hash-verified model libraries. The engine owns CUDA; packages own model plans.
+//! Hash-verified model libraries. The engine owns devices; packages own model plans.
 use crate::{
     artifact::{FileIdentity, Result, read_identity, resolve_file},
     execution::{BufferView, Invocation},
@@ -27,15 +27,26 @@ pub(crate) fn inspect_library(path: &Path) -> Result<abi::PackageInfo> {
     ModelPackage::open(path, &image)?.describe()
 }
 
-pub(crate) fn validate_library(image: &[u8]) -> Result<()> {
+pub(crate) fn validate_library(image: &[u8], host_arch: &str) -> Result<()> {
+    let machine = match host_arch {
+        "aarch64" => 183,
+        "x86_64" => 62,
+        _ => {
+            return Err(format!(
+                "Unsupported model-library host architecture {host_arch}"
+            ));
+        }
+    };
     if image.len() < 20
         || &image[..4] != b"\x7fELF"
         || image[4] != 2
         || image[5] != 1
         || u16::from_le_bytes([image[16], image[17]]) != 3
-        || u16::from_le_bytes([image[18], image[19]]) != orinfer_model_sdk::target::ELF_MACHINE
+        || u16::from_le_bytes([image[18], image[19]]) != machine
     {
-        return Err("Model library must be an x86_64 ELF shared object".into());
+        return Err(format!(
+            "Model library must be an {host_arch} ELF shared object"
+        ));
     }
     Ok(())
 }
@@ -69,11 +80,11 @@ pub(crate) struct ModelPackage {
     batch_capabilities:
         std::cell::RefCell<std::collections::VecDeque<(abi::BatchOperation, Vec<usize>, bool)>>,
     kernel_buffers: BTreeMap<String, Vec<String>>,
-    indirect_mtp: bool,
+    indirect_packets: bool,
 }
 impl ModelPackage {
     fn open(path: &Path, image: &[u8]) -> Result<Self> {
-        validate_library(image)?;
+        validate_library(image, std::env::consts::ARCH)?;
         // SAFETY: this explicitly selected native library implements the documented
         // C ABI. The model loader verifies its hash before calling open.
         let library = unsafe { Library::new(path) }.map_err(|e| format!("Model library: {e}"))?;
@@ -102,7 +113,7 @@ impl ModelPackage {
             batch_plans: Default::default(),
             batch_capabilities: Default::default(),
             kernel_buffers: Default::default(),
-            indirect_mtp: false,
+            indirect_packets: false,
         })
     }
     fn describe(&self) -> Result<abi::PackageInfo> {
@@ -120,6 +131,8 @@ impl ModelPackage {
         spec: &ExecutionLibrary,
         request: CreateRequest,
     ) -> Result<(Self, CreatedPlan)> {
+        orinfer_device::Target::from_package(&request.metadata.target)?
+            .require_host(std::env::consts::ARCH)?;
         if spec.library.tensor.is_some() {
             return Err("Native execution library must be a standalone file".into());
         }
@@ -166,7 +179,7 @@ impl ModelPackage {
         let description = model.describe()?;
         if description.package != spec.package
             || description.version != spec.version
-            || description.target != orinfer_model_sdk::target::CUDA_ARCH
+            || description.target != request.metadata.target
             || description.runtime_abi != abi::RUNTIME_ABI
             || !description.architectures.contains(&request.architecture)
             || !description
@@ -197,11 +210,7 @@ impl ModelPackage {
         if let Some(catalog) = &request.catalog {
             model.export_execution(catalog, &mut plan.metadata)?;
         }
-        model.indirect_mtp = plan
-            .metadata
-            .mtp
-            .as_ref()
-            .is_some_and(|s| s.packet_table.is_some());
+        model.indirect_packets = plan.metadata.packet_table().is_some();
         for kernel in &plan.metadata.kernels {
             let mut buffers: Vec<_> = kernel
                 .args
@@ -534,7 +543,7 @@ impl ModelPackage {
         // The packet-table contract makes calls a function of phase and exact
         // segment lengths. A new owner cohort needs fresh bindings, not a new
         // native plan plus a decode of thousands of identical commands.
-        if self.indirect_mtp && operation != abi::BatchOperation::Ordinary {
+        if self.indirect_packets {
             let shaped = cache.iter().find_map(|(kind, previous, (plan, _), bytes)| {
                 (*kind == operation
                     && previous.len() == key.len()
@@ -970,7 +979,7 @@ mod tests {
     fn indirect_packet_shape_reuses_commands_and_refreshes_membership_bindings() {
         let (root, spec, request) = fixture();
         let (mut model, _) = ModelPackage::create(&root, &spec, request).unwrap();
-        let phase = abi::BatchOperation::Verification;
+        let phase = abi::BatchOperation::Ordinary;
         let initial = [
             BatchSegment { slot: 0, tokens: 2 },
             BatchSegment { slot: 3, tokens: 4 },
@@ -982,7 +991,7 @@ mod tests {
         commands[0].sequence = None;
         let commands = std::rc::Rc::new(commands);
         model.batch_plans.borrow_mut().back_mut().unwrap().2.0 = commands.clone();
-        model.indirect_mtp = true;
+        model.indirect_packets = true;
         let replacement = [
             BatchSegment {
                 slot: 11,
@@ -1010,7 +1019,7 @@ mod tests {
         }
         // Without the declared table contract, exact membership remains part
         // of plan identity even when a previous plan happens to be shared.
-        model.indirect_mtp = false;
+        model.indirect_packets = false;
         let (different, _) = model
             .cached_batch(
                 &[
@@ -1113,14 +1122,25 @@ mod tests {
 #[cfg(test)]
 mod portable_tests {
     #[test]
-    fn non_x86_64_execution_library_is_rejected_before_loading() {
+    fn execution_library_machine_matches_its_host_abi_before_loading() {
         let mut image = [0u8; 20];
         image[..6].copy_from_slice(b"\x7fELF\x02\x01");
         image[16..18].copy_from_slice(&3u16.to_le_bytes());
+        image[18..20].copy_from_slice(&62u16.to_le_bytes());
+        assert!(super::validate_library(&image, "x86_64").is_ok());
+        assert!(super::validate_library(&image, "aarch64").is_err());
         image[18..20].copy_from_slice(&183u16.to_le_bytes());
+        assert!(super::validate_library(&image, "aarch64").is_ok());
+        assert!(super::validate_library(&image, "x86_64").is_err());
+        let other = if std::env::consts::ARCH == "aarch64" {
+            62u16
+        } else {
+            183u16
+        };
+        image[18..20].copy_from_slice(&other.to_le_bytes());
         let error = super::ModelPackage::open(std::path::Path::new("unused.so"), &image)
             .err()
             .unwrap();
-        assert!(error.contains("x86_64 ELF shared object"));
+        assert!(error.contains("ELF shared object"));
     }
 }

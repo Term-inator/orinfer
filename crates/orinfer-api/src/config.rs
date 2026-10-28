@@ -1,6 +1,6 @@
 //! Typed service configuration; argument parsing belongs to the CLI.
 use orinfer_engine::{
-    execution::{CudaGraphMode, ResidentExperts},
+    execution::{GraphMode, ResidentExperts},
     scheduler,
 };
 use std::path::PathBuf;
@@ -77,7 +77,7 @@ pub struct ServerConfig {
     /// Missing Chat request fields supplied by this deployment.
     pub default_request_params: serde_json::Map<String, serde_json::Value>,
     pub gpu_lock: PathBuf,
-    pub cuda_graph: CudaGraphMode,
+    pub cuda_graph: GraphMode,
     pub verify_weights: bool,
     pub load_workers: Option<usize>,
     pub resident_experts: ResidentExperts,
@@ -96,7 +96,7 @@ impl Default for ServerConfig {
             listen: "[::]:8088".into(),
             default_request_params: Default::default(),
             gpu_lock: "artifacts/gpu-experiment.lock".into(),
-            cuda_graph: CudaGraphMode::default(),
+            cuda_graph: GraphMode::default(),
             verify_weights: false,
             load_workers: None,
             resident_experts: ResidentExperts::default(),

@@ -1,6 +1,38 @@
 # 性能参考
 
-本页记录 Jetson AGX Orin 64GB / CUDA SM87 上的实测参考，各节注明测量日期。2026-10-12 的机器为 MAXN 模式、GPU 频率 1300.5 MHz；测试保持原有全局功耗和频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
+本页记录 Jetson AGX Orin 64GB / CUDA SM87 和 Ascend 910B3 上的实测参考，各节注明设备与测量日期。2026-10-12 的 Orin 为 MAXN 模式、GPU 频率 1300.5 MHz；测试保持原有全局功耗和频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
+
+## DSv4.1 A2 单流 decode（2026-10-28）
+
+八卡 Ascend 910B3、TP8，使用 DSv4.1 Flash-1017 原始 W4A8 checkpoint 和完整 40 层 `bench-ascend`。运行时为 CANN 9.2；离线编译使用固定的 CANN 9.1 / TileLang-Ascend 0.1.4（`d182ae8`）镜像。保持原始 W4 bank、scale 和 assist，在线直接读取准备好的物理布局。
+
+输入采用 `tools/bench/ascend_single.py --prepare` 生成的 1024-token completion case，greedy、seed `20261002`，关闭投机解码和跨请求 prefix 复用。每次生成 129 tokens，decode 按首输出之后的 128 tokens / 生成耗时计算，包含 CPU 查找、传输、图提交、完成等待和 HCCL。排除模型加载，每项先预热，再测三次完整请求，表中取中位数。TTFT 包含 prefill 和首输出头。
+
+| 累积优化 | Decode tokens/s | TTFT（秒） |
+| --- | ---: | ---: |
+| 优化前 | 20.62 | 10.340 |
+| Packet 提交、输入上传与共享 Engram 行包 | 21.96 | 9.286 |
+| 单行投影 K tile 与 mHC 输出分块 | 24.23 | 9.276 |
+| W4、TileLang 和 HCCL 整段 Graph 捕获 | 24.43 | 9.281 |
+| Indexer / TopK 有效候选裁剪 | 25.01 | 8.043 |
+| W4 只计算有效专家行 | 25.94 | 7.815 |
+| Attention 掩码与 TopK 索引向量化 | 26.37 | 7.624 |
+| Recorded 事件查询与层边界 Engram 查找 | 27.38 | 7.348 |
+| HCCL AIV 通信展开 | 29.02 | 7.194 |
+| 单行投影输出列分块 | 29.80 | 7.135 |
+| 独立 Vector 程序使用 AIV-only 调度 | **34.13** | **6.630** |
+
+整数投影按实际矩阵几何测量 128/256/512 的 K tile，单行选择 512 或 256，prefill 保留 128；mHC 单行每组处理 8 个输出通道，prefill 保留 32。各配置保持原始归约顺序、scale 和输出舍入边界。Indexer 跳过完全无效的候选块；TopK 根据有效长度缩小排序范围，同分候选次序和 padding 结果保持一致。W4 的 group counts 只包含有效路由，空闲容量保留为 `-1` gather 槽，避免计算补齐的零行。
+
+投影输出列 tile 按真实矩阵几何选择 64/128/256，以不同权重 bank 的微测和完整请求确认；prefill 保留 64。离线编译将可识别、没有 Cube 计算或跨核同步的独立 Vector 程序改为 AIV-only 调度，保持原有算术、逻辑块和双 Vector 索引。本次构建的 150 个独立 kernel 配置中，112 个采用 AIV-only，其余保留混合调度。
+
+Attention 保留 16-token 块的 FP32 打分、在线 softmax 和逐块累积，仅将掩码操作补齐到 64 个 FP32 元素后向量执行；TopK 的固定交织索引通过精确的整数值向量运算生成。单行 attention 微测约 121 → 93 µs；TopK 常见形状约 51 → 17–23 µs，最终收益以上表完整请求为准。
+
+输入按 compute stream 的原层边界更新，整段提交持有图、原生 W4 executor、通信组及设备资源；完成事件通过 `aclrtQueryEventStatus` 查询 recorded 状态，随后通过硬完成栅栏回收 DMA 源；Engram CPU 行查找与此前已提交的图段重叠。W4 图节点按原顺序复用同一 workspace。ACLNN 会原地变换 A8 输入，独立数值探针在每次调用和重放前恢复输入；完整模型由上游 kernel 重新准备 A8。
+
+最终测量在进程启动前设置 `HCCL_OP_EXPANSION_MODE=AIV`，八卡 AllReduce / AlltoAllV 原生验收通过。1K 三次 decode 为 34.126 / 34.109 / 34.239 tokens/s，相对本轮基线的中位数提升 **65.5%**。另用一次完整的 8192 输入、33 输出请求检查长上下文，decode 为 32.69 tokens/s，TTFT 为 57.94 秒；长请求之后的 1K 请求为 34.35 tokens/s。短请求、三次 1K、8K 和重置后的 1K 共 553 个生成 token ID，与原生 W4 基线逐项一致。
+
+算子检查包含矩阵几何、尾部、TopK 同分项及改变输入后的 Graph 重放；AIV-only 调度在 1/3/16 行的 96 个配置上通过 384 次直接数值检查和 192 次 Rust 原生 Graph replay。路由检查另含 108 组直接／重放输入和 Rust 原生验收。`make check` 通过。构建与运行命令见 [A2 单流模型实验入口](model-packages.md#a2-单流模型实验入口)。关闭投机解码的单流目标为 **60 tokens/s**，当前尚未达到。
 
 ## 六模型统一基准（2026-10-21）
 
@@ -56,6 +88,31 @@ README 的六模型表格使用本节固定英译中请求的统一基准。MTP 
 
 单流使用 `runtime::requests::profile::profile_cached_generation` 的独立完整请求，按每种长度的全局预热与三次测量槽位汇总；多流使用 `runtime::requests::tests::benchmark::benchmark_fixed_requests`。均使用本轮 `cargo test --release --locked --offline --lib --no-run --message-format=json` 返回的实际测试可执行文件，并核对测量结果及容量限制日志。输入按各模型原生 chat template 和 tokenizer 生成，长背景在保留模板尾部的前提下裁剪到准确 token 数。模型数据及执行包沿用上述固定身份。
 
+
+## Flash Next 输入行解码与固定 buffer 分配（2026-10-27）
+
+CPU W8 embedding／E8P PLE 行准备改为先解析整包行号、去重后并行读取解码，再按原顺序组装上传；解码行 LRU 预算由 8/32 MiB 提高到 64/128 MiB。加载期除权重 arena 外不再逐 buffer `cuMemAlloc`：非 paged/lazy/deferred 的固定 buffer 从单个 arena 按对齐切分（`cuda_allocations` 1917→2），sequence 切片登记为固定 slice，lease 增长与空闲回收跳过其地址释放。行解码数学与组装顺序不变。
+
+Rust release `run-model`，`decode_only`、greedy、seed `20261002`、prefix 关闭。随机 token 夹具各请求 token 互不相同（行缓存冷、系统页缓存热），每种输入一次预热加三次测量，取后两次：
+
+| 输入 | 前 → 后 prefill TPS（首个请求） | 前 → 后 prefill TPS（后续请求） |
+| --- | ---: | ---: |
+| 随机 token 512 | 197.3 → 441.9 | 389.2–400.8 → 917.0–918.3 |
+| 随机 token 8192 | 384.9 → 811.7 | 394.2–400.3 → 813.8–816.0 |
+| 自然文本 512 | 406.0 → 485.3 | 1017.2–1017.7 → 1018.9–1023.5 |
+| 自然文本 8192 | 907.3 → 918.8 | 908.7–908.9 → 919.7–920.3 |
+
+所有改动前后请求的输出 token 逐项一致；decode 维持 29.3–30.2 TPS。serve 单流 28.2、8 路 124.9–125.4 TPS，MTP 3 草稿请求正常，无 worker 错误。随机 token 的剩余约 11% 差距来自逐 chunk 主机组装与 8K 输入的 PLE LRU 边缘换出，GPU kernel 分布不变。此前将随机 token 差距笼统归因于 CPU 行缓存未命中；本轮确认串行行读取/解码约占 2/3（可并行消除），其余在主机组装与 GPU 侧。
+
+加载分段中 `buffer_alloc_s` 约 5.9 s 不变：该成本与约 6 GiB 固定 buffer 的物理提交成正比，而非分配次数。合并分配在构建后页缓存被冲掉的场景实测完整加载 39.7 s，优于历史 45.7 s 冷启动记录；暖缓存加载维持约 14 s。`make check` 通过。
+
+## Flash Next HC combine-norm 融合（2026-10-27）
+
+新增 `--hc-combine-norm` 构建开关：把 decode 程序中 94 对相邻的 HC combine 与 norm 绑定替换为位等价的融合 kernel（`kernels/model/hyperconnection.py` 的 `hc_combine_norm`，流 dtype FP16；融合版在 M=1..4096 全部行数与分开链逐位一致）。Rust 侧 `decode_fusions` 按符号 `hc_combine_norm_kernel` 注册融合：校验 host ABI 顺序（Block, Inject, Normed, Output, Residual, Weight）、几何与 buffer dtype/尺寸后删除相邻 norm 操作；decode 程序 1772 → 1678 op。融合 kernel 实测 6.0 μs/次（0.56 ms/步）。
+
+宿主机复刻编译工具链（`artifacts/host-compiler`，与 orinfer-compiler:0.1.3 同版本：Python 3.12.15/torch 2.14.1+orinfer1/tilelang 0.1.15/sm87）完成本次重建：`--hc-combine-norm --projection-kinds w8 --projection-shape 2560 640` 过滤重建约 10 分钟，发布通过 Rust 计划检查。
+
+Rust release `run-model`，自然文本夹具，输出 token 与基线逐项一致；decode 30.29–30.31 → 30.42–30.43 TPS（+0.4%），prefill −0.9%（伴随的 W8 640×2560 重调在噪声内）。结论：单对 combine+norm 融合的收益上限小；本轮价值在于打通"保留族 kernel 重编译 + Rust 融合注册"闭环，供后续更大粒度的 HC 块融合使用。SM87 向量化 BF16 trap 以固定工具链复现（BF16 特异、FP16 全安全），但标量路径已达带宽上限，不构成优化项。
 
 ## Dense 模型与 vLLM 对照（2026-10-20–21）
 

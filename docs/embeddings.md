@@ -31,7 +31,7 @@ operator wrapper 持有公共 GPU 锁，转换器的内部锁因此使用独立�
 已有完成的 E8P checkpoint 可从同一 BF16 来源提升该层精度，复用其余压缩值：
 
 ```sh
-.venv/bin/python -m tools.quantization.nemotron_embed \
+uv run --locked python -m tools.quantization.nemotron_embed \
   --source-dir artifacts/nemotron-source --upgrade-from artifacts/nemotron-converted \
   --output artifacts/nemotron-converted-quality
 ```

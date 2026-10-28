@@ -37,8 +37,8 @@ fn program_kernels(
     use std::collections::BTreeSet;
     let mut kernels = BTreeSet::new();
     let mut packets = BTreeSet::new();
-    let table = manifest.mtp.as_ref().and_then(|spec| {
-        let table = spec.packet_table.as_ref()?;
+    let table = manifest.packet_table();
+    if let Some(spec) = manifest.mtp.as_ref().filter(|_| table.is_some()) {
         packets.insert(spec.draft_program.as_str());
         for plan in &spec.warm_plans {
             packets.extend([plan.program.as_str(), plan.head_program.as_str()]);
@@ -46,8 +46,7 @@ fn program_kernels(
         for plan in &spec.verification_plans {
             packets.extend([plan.program.as_str(), plan.restore_program.as_str()]);
         }
-        Some(table)
-    });
+    }
     for program in programs(manifest) {
         let ops = manifest
             .programs
@@ -140,8 +139,8 @@ mod tests {
     use serde_json::json;
     #[test]
     fn packet_preload_uses_indirect_kernels_and_copies_and_retains_direct_consumers() {
-        let mut manifest: crate::model::Manifest = serde_json::from_str(r#"{
-            "schema_version":1,"target":"sm_87","model":"unknown-family","chunk_tokens":1,
+        let mut manifest: crate::model::Manifest = serde_json::from_str(&r#"{
+            "schema_version":1,"target":"DEPLOYMENT_TARGET","model":"unknown-family","chunk_tokens":1,
             "max_context":64,"vocab":32,"toolchain":{},"buffers":[],"reset_buffers":[],
             "input":"i","token":"t","status":"s","logits":"l","position":"p",
             "weight_bytes":0,"weight_parameters":1,"weight_scope":"test",
@@ -173,7 +172,7 @@ mod tests {
                     "copies":[{"source":"Output","destination":"PrivateOutput","kernel":"packet_copy","row_bytes":4}]
                 }
             }
-        }"#).unwrap();
+        }"#.replace("DEPLOYMENT_TARGET", orinfer_model_sdk::target::CUDA_ARCH)).unwrap();
         assert_eq!(
             program_kernels(&manifest).unwrap(),
             [

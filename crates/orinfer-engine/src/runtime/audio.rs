@@ -270,7 +270,7 @@ mod tests {
         let model = ModelRuntime::load_with_options(
             &f.model,
             LoadOptions {
-                cuda_graph: crate::execution::CudaGraphMode::Full,
+                cuda_graph: crate::execution::GraphMode::Full,
                 ..Default::default()
             },
         )

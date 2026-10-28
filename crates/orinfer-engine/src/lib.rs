@@ -1,13 +1,15 @@
-//! SM120 AOT model execution.
+//! Shared model runtime with device-owned execution backends.
 //!
-//! AOT fixtures and explicit text-model programs execute through the CUDA Driver.
+//! CUDA executes SM120 model packages. Ascend provides CANN discovery and native
+//! launch contracts; its model executor is not registered yet.
 
 pub mod architecture;
 pub mod artifact;
-mod cuda;
+pub mod backend;
 pub mod embedding;
 pub mod error;
 pub mod execution;
+pub mod host_rows;
 mod loader;
 pub mod model;
 mod model_package;

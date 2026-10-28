@@ -68,26 +68,7 @@ pub struct Spec {
     pub shared_verification_state: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PacketTable {
-    pub buffer: String,
-    pub columns: Vec<String>,
-    pub kernels: std::collections::BTreeMap<String, String>,
-    /// Original host argument index -> wrapped host argument index.
-    #[serde(default)]
-    pub scalar_arguments: std::collections::BTreeMap<String, Vec<(usize, usize)>>,
-    pub copies: Vec<PacketCopy>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PacketCopy {
-    pub source: String,
-    pub destination: String,
-    pub kernel: String,
-    pub row_bytes: usize,
-}
+pub use crate::packet::{PacketCopy, PacketTable};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -218,37 +199,7 @@ impl Spec {
     }
     pub fn validate(&self, model: &Manifest) -> Result<()> {
         if let Some(table) = &self.packet_table {
-            let columns: BTreeSet<_> = table.columns.iter().collect();
-            let runtime_buffers: BTreeSet<_> = model
-                .buffers
-                .iter()
-                .filter(|buffer| buffer.data.is_none())
-                .map(|buffer| buffer.name.as_str())
-                .collect();
-            let kernels: BTreeSet<_> = model.kernels.iter().map(|k| k.name.as_str()).collect();
-            if columns.is_empty()
-                || columns.len() != table.columns.len()
-                || !model.buffers.iter().any(|b| {
-                    b.name == table.buffer
-                        && b.dtype == Dtype::U64
-                        && b.data.is_none()
-                        && b.shape == [128 * columns.len()]
-                })
-                || table
-                    .columns
-                    .iter()
-                    .any(|name| !runtime_buffers.contains(name.as_str()))
-                || table.copies.iter().any(|copy| {
-                    copy.row_bytes == 0 || !model.dynamic_batch_kernels.contains_key(&copy.kernel)
-                })
-                || table
-                    .kernels
-                    .values()
-                    .chain(table.copies.iter().map(|c| &c.kernel))
-                    .any(|name| !kernels.contains(name.as_str()))
-            {
-                return Err("Invalid MTP packet address table".into());
-            }
+            table.validate(model)?;
         }
         let program = |name: &str| -> Result<()> {
             if model.programs.get(name).is_none_or(Vec::is_empty) {

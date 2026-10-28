@@ -31,6 +31,50 @@ class ReleaseTests(unittest.TestCase):
 
 
 class ExecutionAssetsTests(unittest.TestCase):
+    def test_encoder_assets_use_their_pinned_configuration_shapes(self):
+        cases = [
+            (
+                "nemotron_embed",
+                {
+                    "text_config": dict(
+                        hidden_size=2048,
+                        intermediate_size=6144,
+                        num_hidden_layers=16,
+                        num_attention_heads=24,
+                        num_key_value_heads=8,
+                    )
+                },
+                "nemotron35-embed-1b",
+            ),
+            (
+                "qwen3_reranker",
+                dict(
+                    hidden_size=1024,
+                    intermediate_size=3072,
+                    num_hidden_layers=28,
+                    num_attention_heads=16,
+                    num_key_value_heads=8,
+                ),
+                "qwen3-reranker-0-6b",
+            ),
+        ]
+        for architecture, signature, expected in cases:
+            with self.subTest(architecture=architecture):
+                package = dict(
+                    architecture=architecture,
+                    compute_policy="int8_quality",
+                    target="sm_87",
+                    config_signature=signature,
+                )
+                self.assertEqual(
+                    execution_asset_identity(package, "v0.2.2"),
+                    (f"orinfer-exec-{expected}-a8-sm87-v0.2.2.tar.xz", expected),
+                )
+                text = signature.get("text_config", signature)
+                text["hidden_size"] += 1
+                with self.assertRaisesRegex(ValueError, "Register one"):
+                    execution_asset_identity(package, "v0.2.2")
+
     def test_model_variants_have_distinct_assets_and_tampered_identity_fails(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

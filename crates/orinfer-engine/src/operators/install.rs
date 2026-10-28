@@ -111,7 +111,11 @@ fn validate(root: &Path, digest: &str) -> Result<()> {
         return Err("Incompatible native execution library identity or ABI".into());
     }
     let mut reader = AssetReader::default();
-    crate::model_package::validate_library(&reader.read(root, &execution.library)?)?;
+    let target = orinfer_device::Target::from_package(&package.target)?;
+    crate::model_package::validate_library(
+        &reader.read(root, &execution.library)?,
+        &target.host_arch,
+    )?;
     let mut checked = BTreeSet::new();
     for asset in &package.catalog.assets {
         if checked.insert((asset.key(), &asset.sha256)) {

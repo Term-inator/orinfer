@@ -153,15 +153,10 @@ impl Controller {
         self.retain_key(key);
         let cohort = self.cohorts.entry(key).or_default();
         let arm = cohort.arms.entry(width).or_default();
-        if (matches!(
-            self.single_policy,
-            SinglePolicy::Explore | SinglePolicy::ExploreLocal
-        ) || (self.single_policy == SinglePolicy::Auto && width > 1))
-            && key.batch == 1
-            && key.prefill == 0
-            && arm.trials == 1
-        {
+        if key.batch == 1 && key.prefill == 0 && width > 1 && arm.trials == 1 {
             // Exclude the first cold graph/module cost from the steady estimate.
+            // The width-one baseline keeps every observation: its cohort gate
+            // requires three plain samples before any speculation is weighed.
             arm.time = Default::default();
         }
         arm.trials += 1;

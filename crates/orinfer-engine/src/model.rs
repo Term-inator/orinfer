@@ -1,6 +1,6 @@
 //! AOT model programs: architecture-specific plans, parameterized Rust runtime.
 use crate::artifact::Result;
-use crate::execution::{CudaGraphMode, LoadOptions};
+use crate::execution::{GraphMode, LoadOptions};
 pub use crate::weights::TensorIdentity;
 use serde::Serialize;
 use std::{
@@ -54,7 +54,7 @@ pub struct Report {
     pub expert_cache: Option<crate::execution::ExpertCacheStatistics>,
     pub manifest_sha256: String,
     pub model: String,
-    pub device: crate::cuda::DeviceInfo,
+    pub device: crate::backend::DeviceInfo,
     pub load_to_ready_s: f64,
     pub load_stages: LoadStages,
     pub verify_weights: bool,
@@ -65,7 +65,7 @@ pub struct Report {
     pub weight_upload_s: f64,
     pub module_load_bind_s: f64,
     pub graph_capture_s: f64,
-    pub cuda_graph: CudaGraphMode,
+    pub cuda_graph: GraphMode,
     pub captured_programs: Vec<String>,
     /// Resident fixed buffers at load, excluding demand-mapped KV.
     pub buffer_bytes: usize,

@@ -109,7 +109,7 @@ fn validate_batched_gpu_sampling_requests() {
                 policy: scheduler::Policy::Throughput,
                 ..Default::default()
             };
-            let before = model.execution.batch_statistics.get();
+            let before = model.execution.batch_statistics();
             let at = Instant::now();
             let mut tokens = vec![Vec::new(); count];
             let mut iteration = 0;
@@ -151,7 +151,7 @@ fn validate_batched_gpu_sampling_requests() {
                 }
             }
             let seconds = at.elapsed().as_secs_f64();
-            let after = model.execution.batch_statistics.get();
+            let after = model.execution.batch_statistics();
             // Row 0 is greedy. Other owners exercise distinct parameters and
             // masks, reverse row order, then replace a cancelled arena mid-run.
             if batched && count > 1 {

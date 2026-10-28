@@ -10,6 +10,7 @@ use std::{
 };
 
 pub use orinfer_model_sdk::model::TensorIdentity;
+pub(crate) mod checkpoint;
 
 #[derive(Deserialize)]
 struct Index {
