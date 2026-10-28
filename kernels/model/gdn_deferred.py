@@ -52,10 +52,15 @@ def pending_updates(capacity, hk, hv, vt, threads):
     return apply
 
 
-def recurrent(capacity, *, key_heads=16, value_heads=48, value_tile=16, threads=64):
+def recurrent(
+    capacity, *, key_heads=16, value_heads=48, value_tile=16, threads=64, state_dtype="float32"
+):
     HK, HV, DK, DV = key_heads, value_heads, 128, 128
     vt = value_tile
     validate_geometry(capacity, HK, HV, vt, threads)
+    if state_dtype not in ("float32", "float16"):
+        raise ValueError("Invalid GDN state storage dtype")
+    storage = T.float32 if state_dtype == "float32" else T.float16
     replay = pending_updates(capacity, HK, HV, vt, threads)
     prediction = predict(vt)
     advance = update_readout(vt, 128**-0.5, saved_delta=True)
@@ -67,7 +72,7 @@ def recurrent(capacity, *, key_heads=16, value_heads=48, value_tile=16, threads=
         V: T.Tensor((HV, 1, DV), T.float16),
         G: T.Tensor((1, HV), T.float32),
         Beta: T.Tensor((1, HV), T.float32),
-        State: T.Tensor((HV, DK, DV), T.float32),
+        State: T.Tensor((HV, DK, DV), storage),
         LogK: T.Tensor((capacity, HK, DK), T.float16),
         LogD: T.Tensor((capacity, HV, DV), T.float32),
         LogG: T.Tensor((capacity, HV), T.float32),
@@ -86,7 +91,11 @@ def recurrent(capacity, *, key_heads=16, value_heads=48, value_tile=16, threads=
             delta = T.alloc_fragment((vt,), T.float32)
             # Preserve the reduction layout while loading directly into its
             # registers; staging the full state adds a copy and a CTA barrier.
-            T.copy(State[h, 0:DK, bv * vt : (bv + 1) * vt], state)
+            if state_dtype == "float32":
+                T.copy(State[h, 0:DK, bv * vt : (bv + 1) * vt], state)
+            else:
+                for i, j in T.Parallel(DK, vt):
+                    state[i, j] = T.cast(State[h, i, bv * vt + j], T.float32)
             replay(state, LogK, LogD, LogG, phase[0], h, bv)
             prediction(state, product, predicted, K, G, kh, 0, h)
             for j in T.Parallel(vt):
@@ -97,7 +106,11 @@ def recurrent(capacity, *, key_heads=16, value_heads=48, value_tile=16, threads=
                 Out[0, h * DV + bv * vt + j] = result[j]
                 Count[h, bv * vt + j] = T.if_then_else(phase[0] + 1 == capacity, 0, phase[0] + 1)
             if phase[0] + 1 == capacity:
-                T.copy(state, State[h, 0:DK, bv * vt : (bv + 1) * vt])
+                if state_dtype == "float32":
+                    T.copy(state, State[h, 0:DK, bv * vt : (bv + 1) * vt])
+                else:
+                    for i, j in T.Parallel(DK, vt):
+                        State[h, i, bv * vt + j] = T.cast(state[i, j], T.float16)
             if bv == 0:
                 if T.get_thread_binding() == 0:
                     LogG[phase[0], h] = G[0, h]
@@ -108,7 +121,9 @@ def recurrent(capacity, *, key_heads=16, value_heads=48, value_tile=16, threads=
     return main
 
 
-def materialize(capacity, *, key_heads=16, value_heads=48, value_tile=16, threads=64):
+def materialize(
+    capacity, *, key_heads=16, value_heads=48, value_tile=16, threads=64, state_dtype="float32"
+):
     """Canonicalize a request before dense prefill or speculative verification.
 
     Each CTA owns its counters. No other CTA reads these counters, so resetting
@@ -116,12 +131,15 @@ def materialize(capacity, *, key_heads=16, value_heads=48, value_tile=16, thread
     """
     HK, HV, vt = key_heads, value_heads, value_tile
     validate_geometry(capacity, HK, HV, vt, threads)
+    if state_dtype not in ("float32", "float16"):
+        raise ValueError("Invalid GDN state storage dtype")
+    storage = T.float32 if state_dtype == "float32" else T.float16
 
     replay = pending_updates(capacity, HK, HV, vt, threads)
 
     @T.prim_func
     def main(
-        State: T.Tensor((HV, 128, 128), T.float32),
+        State: T.Tensor((HV, 128, 128), storage),
         LogK: T.Tensor((capacity, HK, 128), T.float16),
         LogD: T.Tensor((capacity, HV, 128), T.float32),
         LogG: T.Tensor((capacity, HV), T.float32),
@@ -134,11 +152,19 @@ def materialize(capacity, *, key_heads=16, value_heads=48, value_tile=16, thread
                 state = T.alloc_fragment((128, vt), T.float32)
                 tile = T.alloc_shared((128, vt), T.float32)
                 T.annotate_layout({state: state_layout(vt, threads)})
-                T.copy(State[h, 0:128, bv * vt : (bv + 1) * vt], tile)
-                T.copy(tile, state)
+                if state_dtype == "float32":
+                    T.copy(State[h, 0:128, bv * vt : (bv + 1) * vt], tile)
+                    T.copy(tile, state)
+                else:
+                    for i, j in T.Parallel(128, vt):
+                        state[i, j] = T.cast(State[h, i, bv * vt + j], T.float32)
                 replay(state, LogK, LogD, LogG, phase[0], h, bv)
-                T.copy(state, tile)
-                T.copy(tile, State[h, 0:128, bv * vt : (bv + 1) * vt])
+                if state_dtype == "float32":
+                    T.copy(state, tile)
+                    T.copy(tile, State[h, 0:128, bv * vt : (bv + 1) * vt])
+                else:
+                    for i, j in T.Parallel(128, vt):
+                        State[h, i, bv * vt + j] = T.cast(state[i, j], T.float16)
                 for j in T.Parallel(vt):
                     Count[h, bv * vt + j] = 0
 
@@ -186,10 +212,22 @@ def verification(capacity, *, key_heads=16, value_heads=48, tokens=8, value_tile
     )
 
 
-def commit(capacity, *, key_heads=16, value_heads=48, tokens=8, value_tile=16, threads=128):
+def commit(
+    capacity,
+    *,
+    key_heads=16,
+    value_heads=48,
+    tokens=8,
+    value_tile=16,
+    threads=128,
+    state_dtype="float32",
+):
     """Append an exact accepted prefix; canonicalize only when its log fills."""
     hk, hv, vt = key_heads, value_heads, value_tile
     validate_geometry(capacity, hk, hv, vt, threads)
+    if state_dtype not in ("float32", "float16"):
+        raise ValueError("Invalid GDN state storage dtype")
+    storage = T.float32 if state_dtype == "float32" else T.float16
     pending = pending_updates(capacity, hk, hv, vt, threads)
     advance = rank_one(vt, staged=True)
 
@@ -200,7 +238,7 @@ def commit(capacity, *, key_heads=16, value_heads=48, tokens=8, value_tile=16, t
         Update: T.Tensor((tokens, hv, 128), T.float32),
         Accepted: T.Tensor((1,), T.int32),
         Length: T.Tensor((1,), T.int32),
-        State: T.Tensor((hv, 128, 128), T.float32),
+        State: T.Tensor((hv, 128, 128), storage),
         LogK: T.Tensor((capacity, hk, 128), T.float16),
         LogD: T.Tensor((capacity, hv, 128), T.float32),
         LogG: T.Tensor((capacity, hv), T.float32),
@@ -219,7 +257,11 @@ def commit(capacity, *, key_heads=16, value_heads=48, tokens=8, value_tile=16, t
                 delta = T.alloc_fragment((vt,), T.float32)
                 T.annotate_layout({state: state_layout(vt, threads)})
                 for i, j in T.Parallel(128, vt):
-                    state[i, j] = State[h, i, bv * vt + j]
+                    state[i, j] = (
+                        State[h, i, bv * vt + j]
+                        if state_dtype == "float32"
+                        else T.cast(State[h, i, bv * vt + j], T.float32)
+                    )
                 pending(state, LogK, LogD, LogG, phase[0], h, bv)
                 for t in T.serial(tokens):
                     if t < Accepted[0]:
@@ -227,7 +269,9 @@ def commit(capacity, *, key_heads=16, value_heads=48, tokens=8, value_tile=16, t
                             delta[j] = Update[t, h, bv * vt + j]
                         advance(state, keys, delta, T.exp(G[t, h]), 0, t, h, bv)
                 for i, j in T.Parallel(128, vt):
-                    State[h, i, bv * vt + j] = state[i, j]
+                    State[h, i, bv * vt + j] = (
+                        state[i, j] if state_dtype == "float32" else T.cast(state[i, j], T.float16)
+                    )
                 for j in T.Parallel(vt):
                     Count[h, bv * vt + j] = 0
             else:
