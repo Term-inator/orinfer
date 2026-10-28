@@ -5,10 +5,12 @@ import math
 import tilelang.language as T
 
 
-def projection(rows, output, reduction, integer=False):
+def projection(rows, output, reduction, integer=False, block_k=128):
     if rows < 1 or output % 32 or reduction % 128:
         raise ValueError("A2 projection requires positive rows, N%32=0 and K%128=0")
-    block_m, block_n, block_k = 16, math.gcd(output, 64), 128
+    block_m, block_n = 16, math.gcd(output, 64)
+    if block_k not in (128, 256, 512) or reduction % block_k:
+        raise ValueError("A2 projection K tile must divide K and be 128, 256 or 512")
     m_blocks = (rows + block_m - 1) // block_m
     n_blocks = output // block_n
     input_dtype = "int8" if integer else "bfloat16"

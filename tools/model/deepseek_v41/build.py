@@ -224,7 +224,13 @@ class Builder:
         self.kernel(
             dense,
             "projection",
-            {"rows": rows, "output": n, "reduction": k, "integer": integer},
+            {
+                "rows": rows,
+                "output": n,
+                "reduction": k,
+                "integer": integer,
+                "block_k": math.gcd(k, 512) if rows == 1 else 128,
+            },
             [
                 ("activation", x, "i8" if integer else "bf16", (rows, k), "read"),
                 ("weight", weight, "i8" if integer else "bf16", (n, k), "read"),
@@ -382,7 +388,7 @@ class Builder:
         self.kernel(
             vector,
             "mhc_prenorm_partials",
-            {"rows": rows, "width": 5120},
+            {"rows": rows, "width": 5120, "lanes": 8 if rows == 1 else 32},
             [
                 ("residual", current, "bf16", (rows, 20480), "read"),
                 ("fn", fn, "f32", (32, 20480), "read"),
@@ -766,6 +772,7 @@ class Builder:
                 "local": 48,
                 "selected": 6,
                 "base": self.rank * 48,
+                "pad_last": False,
             },
             [
                 ("indices", indices, "i32", (rows, 8), "read"),

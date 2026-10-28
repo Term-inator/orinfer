@@ -100,6 +100,8 @@ def quantized_logits(rows, length, table_rows, heads=32, dimension=128):
             ksb = T.alloc_ub((block,), "float16")
             ks = T.alloc_ub((block,), "float32")
             ids = T.alloc_ub((block,), "int32")
+            ids_float = T.alloc_ub((1, block), "float32")
+            last_id = T.alloc_ub((1, 1), "float32")
             partial = T.alloc_ub((block,), "float32")
             total = T.alloc_ub((block,), "float32")
             index = cid * 2 + vid
@@ -108,47 +110,54 @@ def quantized_logits(rows, length, table_rows, heads=32, dimension=128):
             if row < rows:
                 start = tile * block
                 valid = T.min(block, length - start)
-                T.copy(query[row, :, :], qb)
-                T.copy(query_scale[row, :], qsb)
-                T.copy(weights[row, :], wb)
                 T.tile.fill(ids, -1)
                 T.copy(indices[row, start : start + valid], ids[:valid])
-                # A2 has no INT8 Duplicate. Clear the FP16 alias, then copy only
-                # real keys; invalid positions never participate in a score.
-                T.reinterpretcast(kb, kb_zero, "int8_t")
-                T.tile.fill(kb_zero, 0)
-                for i in T.serial(block):
-                    slot = ids[i]
-                    if slot >= 0 and slot < table_rows:
-                        T.copy(keys[slot, :], kb[i, :])
-                        ksb[i] = key_scale[slot]
-                    else:
-                        ksb[i] = T.float16(0.0)
-                T.tile.cast(qh, qb, "CAST_NONE", heads * dimension)
-                T.tile.cast(q, qh, "CAST_NONE", heads * dimension)
-                T.tile.cast(kh, kb, "CAST_NONE", block * dimension)
-                T.tile.cast(k, kh, "CAST_NONE", block * dimension)
-                T.tile.cast(qs, qsb, "CAST_NONE", heads)
-                T.tile.cast(ks, ksb, "CAST_NONE", block)
-                T.tile.cast(w, wb, "CAST_NONE", heads)
-                T.tile.mul(w, w, weights_scale)
-                T.tile.cast(wh, w, "CAST_RINT", heads)
-                T.tile.cast(w, wh, "CAST_NONE", heads)
-                T.tile.fill(total, 0.0)
-                for head in T.serial(heads):
-                    query_factor = qs[head]
-                    weight_factor = w[head]
-                    T.tile.broadcast(product, q[head : head + 1, :])
-                    T.tile.mul(product, product, k)
-                    T.reduce_sum(product, partial, dim=1)
-                    T.tile.max(partial, partial, 0.0)
-                    T.tile.mul(partial, partial, query_factor)
-                    T.tile.mul(partial, partial, ks)
-                    T.tile.mul(partial, partial, weight_factor)
-                    T.tile.add(total, total, partial)
-                for i in T.serial(block):
-                    if ids[i] < 0 or ids[i] >= table_rows:
-                        total[i] = -T.infinity("float32")
+                T.tile.cast(ids_float, ids, "CAST_NONE", block)
+                T.reduce_max(ids_float, last_id, dim=1)
+                # A completely masked tile has no score computation. Retain
+                # the original arithmetic for every tile with a real index.
+                if last_id[0, 0] >= 0.0:
+                    T.copy(query[row, :, :], qb)
+                    T.copy(query_scale[row, :], qsb)
+                    T.copy(weights[row, :], wb)
+                    # A2 has no INT8 Duplicate. Clear the FP16 alias, then copy only
+                    # real keys; invalid positions never participate in a score.
+                    T.reinterpretcast(kb, kb_zero, "int8_t")
+                    T.tile.fill(kb_zero, 0)
+                    for i in T.serial(block):
+                        slot = ids[i]
+                        if slot >= 0 and slot < table_rows:
+                            T.copy(keys[slot, :], kb[i, :])
+                            ksb[i] = key_scale[slot]
+                        else:
+                            ksb[i] = T.float16(0.0)
+                    T.tile.cast(qh, qb, "CAST_NONE", heads * dimension)
+                    T.tile.cast(q, qh, "CAST_NONE", heads * dimension)
+                    T.tile.cast(kh, kb, "CAST_NONE", block * dimension)
+                    T.tile.cast(k, kh, "CAST_NONE", block * dimension)
+                    T.tile.cast(qs, qsb, "CAST_NONE", heads)
+                    T.tile.cast(ks, ksb, "CAST_NONE", block)
+                    T.tile.cast(w, wb, "CAST_NONE", heads)
+                    T.tile.mul(w, w, weights_scale)
+                    T.tile.cast(wh, w, "CAST_RINT", heads)
+                    T.tile.cast(w, wh, "CAST_NONE", heads)
+                    T.tile.fill(total, 0.0)
+                    for head in T.serial(heads):
+                        query_factor = qs[head]
+                        weight_factor = w[head]
+                        T.tile.broadcast(product, q[head : head + 1, :])
+                        T.tile.mul(product, product, k)
+                        T.reduce_sum(product, partial, dim=1)
+                        T.tile.max(partial, partial, 0.0)
+                        T.tile.mul(partial, partial, query_factor)
+                        T.tile.mul(partial, partial, ks)
+                        T.tile.mul(partial, partial, weight_factor)
+                        T.tile.add(total, total, partial)
+                    for i in T.serial(block):
+                        if ids[i] < 0 or ids[i] >= table_rows:
+                            total[i] = -T.infinity("float32")
+                else:
+                    T.tile.fill(total, -T.infinity("float32"))
                 T.copy(total[:valid], out[row, start : start + valid])
 
     return main

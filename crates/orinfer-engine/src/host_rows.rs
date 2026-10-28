@@ -2,7 +2,12 @@
 use crate::artifact::Result;
 use memmap2::MmapOptions;
 use safetensors::{Dtype, SafeTensors};
-use std::{collections::HashMap, fs::File, path::Path};
+use std::{
+    collections::HashMap,
+    fs::File,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 pub mod validation;
 
 #[derive(Clone, Copy, Debug)]
@@ -143,6 +148,49 @@ pub struct Int8Rows {
     scale: Plane,
     shard: Shard,
     row_bytes: usize,
+}
+
+/// Replicated device workers share one immutable row packet. Keep only the
+/// latest query per store; changing query order, repetitions or owner rows
+/// replaces the cache without invalidating packets still held by consumers.
+pub struct SharedInt8Rows {
+    store: Int8Rows,
+    last: Mutex<Option<RowBatch>>,
+}
+struct RowBatch {
+    ids: Vec<u64>,
+    bytes: Arc<Vec<u8>>,
+}
+impl SharedInt8Rows {
+    pub fn new(store: Int8Rows) -> Self {
+        Self {
+            store,
+            last: Mutex::new(None),
+        }
+    }
+    pub fn gather(&self, ids: &[u64], max_bytes: usize) -> Result<Arc<Vec<u8>>> {
+        ids.len()
+            .checked_mul(self.store.row_bytes())
+            .filter(|&n| n <= max_bytes)
+            .ok_or("Host-row staging budget exceeded")?;
+        let mut last = self
+            .last
+            .lock()
+            .map_err(|_| "Shared host-row reader poisoned")?;
+        if let Some(batch) = last.as_ref().filter(|batch| batch.ids == ids) {
+            return Ok(Arc::clone(&batch.bytes));
+        }
+        // Hold the cache lock across the parallel gather so simultaneous rank
+        // misses join one read rather than submitting duplicate random I/O.
+        let mut bytes = vec![];
+        self.store.gather_into(ids, &mut bytes, max_bytes)?;
+        let bytes = Arc::new(bytes);
+        *last = Some(RowBatch {
+            ids: ids.to_vec(),
+            bytes: Arc::clone(&bytes),
+        });
+        Ok(bytes)
+    }
 }
 impl Int8Rows {
     pub fn open(
@@ -285,5 +333,25 @@ mod tests {
         assert_eq!(packet, expected);
         assert!(rows.gather_into(&[3], &mut packet, 35).is_err());
         assert_eq!(packet, expected);
+        let shared = SharedInt8Rows::new(rows);
+        let batches = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| shared.gather(&[3, 2, 3], 108).unwrap()))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for batch in &batches {
+            assert_eq!(**batch, expected);
+            assert!(Arc::ptr_eq(batch, &batches[0]));
+        }
+        assert!(shared.gather(&[3, 2, 3], 107).is_err());
+        assert!(shared.gather(&[1], 108).is_err());
+        let changed = shared.gather(&[2, 3], 72).unwrap();
+        assert_eq!(&changed[..36], &expected[36..72]);
+        assert_eq!(&changed[36..], &expected[..36]);
+        assert_eq!(*batches[0], expected);
     }
 }

@@ -213,6 +213,139 @@ fn aot_program_orders_shared_operands_and_retains_the_whole_fragment() {
 }
 
 #[test]
+fn input_batch_copies_host_data_and_preserves_compute_reader_order() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let other = fixture.session();
+    let input = session.allocate(4).unwrap();
+    let output = session.allocate(4).unwrap();
+    let scale = session.allocate(2).unwrap();
+    let mut inputs = vec![
+        (input.clone(), vec![1, 2, 3, 4]),
+        (scale.clone(), vec![7, 8]),
+    ];
+    let uploaded = session.upload_inputs(&inputs).unwrap();
+    for (_, data) in &mut inputs {
+        data.fill(0);
+    }
+    drop(inputs);
+    assert_eq!(session.pinned_bytes(), 6);
+    assert_eq!(fixture.counter(1), 1, "one pinned allocation for the batch");
+    assert!(!uploaded.is_ready().unwrap());
+    let copied = session.copy(&input, 0, &output, 0, 4).unwrap();
+    let overwritten = session
+        .upload_inputs(&[(input.clone(), vec![9; 4])])
+        .unwrap();
+    assert_eq!(session.download(&output, 0, 4).unwrap(), [1, 2, 3, 4]);
+    assert_eq!(session.download(&input, 0, 4).unwrap(), [9; 4]);
+    assert_eq!(session.download(&scale, 0, 2).unwrap(), [7, 8]);
+    assert!(other.upload_inputs(&[(input.clone(), vec![0; 4])]).is_err());
+    assert!(
+        session
+            .upload_inputs(&[(input.clone(), vec![0; 3])])
+            .is_err()
+    );
+    drop((
+        uploaded,
+        copied,
+        overwritten,
+        input,
+        output,
+        scale,
+        session,
+        other,
+    ));
+    fixture.assert_clean();
+}
+
+#[test]
+fn input_batch_validates_all_spans_before_submitting_and_fences_errors() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let first = session.allocate(4).unwrap();
+    let second = session.allocate(2).unwrap();
+    assert!(
+        session
+            .upload_inputs(&[(first.clone(), vec![1; 4]), (second.clone(), vec![1])])
+            .is_err()
+    );
+    assert_eq!(fixture.counter(1), 0);
+    assert_eq!(session.download(&first, 0, 4).unwrap(), [0; 4]);
+    fixture.failure(4);
+    assert!(
+        session
+            .upload_inputs(&[(first.clone(), vec![2; 4]), (second.clone(), vec![3; 2])])
+            .is_err()
+    );
+    assert_eq!(session.pinned_bytes(), 0);
+    fixture.failure(0);
+    assert_eq!(session.download(&first, 0, 4).unwrap(), [2; 4]);
+    assert_eq!(session.download(&second, 0, 2).unwrap(), [3; 2]);
+    drop((first, second, session));
+    fixture.assert_clean();
+}
+
+#[test]
+fn packet_completion_retains_graphs_and_fences_partial_submission_errors() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    // SAFETY: Empty fixture capture has no operands and uses the owned stream.
+    let graph = std::rc::Rc::new(unsafe {
+        super::graph::Graph::capture(&session, Box::new(()), |_| Ok(())).unwrap()
+    });
+    // SAFETY: The enclosing completion retains the graph; the stream belongs
+    // to the session that captured it.
+    let ticket = unsafe {
+        session
+            .submit_compute(vec![], Box::new(graph.clone()), |stream| {
+                graph.execute_on_stream(stream)
+            })
+            .unwrap()
+    };
+    drop(graph);
+    assert_eq!(fixture.counter(7), 1);
+    ticket.wait().unwrap();
+    assert_eq!(fixture.counter(7), 0);
+    // SAFETY: Same empty fixture capture on the owned stream.
+    let graph = std::rc::Rc::new(unsafe {
+        super::graph::Graph::capture(&session, Box::new(()), |_| Ok(())).unwrap()
+    });
+    // SAFETY: Even on failure, submit_compute fences queued work before its
+    // retained owner can be released.
+    let result = unsafe {
+        session.submit_compute(vec![], Box::new(graph.clone()), |stream| {
+            graph.execute_on_stream(stream)?;
+            Err("partial packet failure".into())
+        })
+    };
+    assert!(result.is_err());
+    drop(graph);
+    assert_eq!(fixture.counter(7), 0);
+    drop((ticket, session));
+    fixture.assert_clean();
+}
+
+#[test]
+fn ready_query_keeps_dma_backing_until_a_hard_completion_fence() {
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let buffer = session.allocate(4).unwrap();
+    let ticket = session
+        .upload_inputs(&[(buffer.clone(), vec![1, 2, 3, 4])])
+        .unwrap();
+    fixture.failure(11);
+    assert!(ticket.is_ready().unwrap());
+    assert_eq!(session.pinned_bytes(), 4);
+    drop(ticket);
+    session.reap().unwrap();
+    fixture.failure(0);
+    assert_eq!(session.pinned_bytes(), 0);
+    assert_eq!(session.download(&buffer, 0, 4).unwrap(), [1, 2, 3, 4]);
+    drop((buffer, session));
+    fixture.assert_clean();
+}
+
+#[test]
 fn async_upload_retains_copied_host_data_and_dropped_device_handles() {
     let mut fixture = Fixture::new();
     let session = fixture.session();
@@ -426,6 +559,43 @@ fn graph_retains_its_resources_through_replay_and_rolls_back_capture_errors() {
     assert!(result.is_err());
     assert_eq!(fixture.counter(7), 0);
     drop((ticket, session));
+    fixture.assert_clean();
+}
+
+#[test]
+fn packet_graph_keeps_collective_operands_and_communicator_until_completion() {
+    use super::hccl::{Communicator, Element, RootInfo};
+    let mut fixture = Fixture::new();
+    let session = fixture.session();
+    let root = RootInfo::fixture(&session, &fixture._dir.path().join("libacl-fixture.so")).unwrap();
+    let comm = Communicator::join(&session, &root, 0).unwrap();
+    let a = session.allocate(16).unwrap();
+    let b = session.allocate(16).unwrap();
+    // SAFETY: The graph retains every operand and the communicator used by
+    // its captured collective, all belonging to this session.
+    let graph = std::rc::Rc::new(unsafe {
+        super::graph::Graph::capture(
+            &session,
+            Box::new((a.clone(), b.clone(), comm.clone())),
+            |stream| comm.reduce_on_stream(stream, &a, &b, 4, Element::Float32),
+        )
+        .unwrap()
+    });
+    // SAFETY: The packet completion retains the graph on its owning stream.
+    let ticket = unsafe {
+        session
+            .submit_compute(vec![], Box::new(graph.clone()), |stream| {
+                graph.execute_on_stream(stream)
+            })
+            .unwrap()
+    };
+    drop((graph, a, b, comm));
+    assert_eq!(fixture.counter(8), 1);
+    assert_eq!(session.allocated_bytes(), 32);
+    ticket.wait().unwrap();
+    assert_eq!(fixture.counter(8), 0);
+    assert_eq!(session.allocated_bytes(), 0);
+    drop((ticket, root, session));
     fixture.assert_clean();
 }
 

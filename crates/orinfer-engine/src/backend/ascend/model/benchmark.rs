@@ -1,4 +1,4 @@
-use super::{Limits, Model, RootInfo, Session, Worker, load_spec, packet::Best};
+use super::{Limits, Model, RootInfo, Session, SharedTables, Worker, load_spec, packet::Best};
 use crate::artifact::Result;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -91,10 +91,12 @@ pub fn run(
     let load = Instant::now();
     let bootstrap = Session::new(0, Limits::default())?;
     let root = RootInfo::new(&bootstrap, 8)?;
+    let shared_tables = SharedTables::new();
     std::thread::scope(|scope| {
         let mut handles = vec![];
         let mut peers = vec![];
         let model_ref: &Model = &model;
+        let shared_tables = &shared_tables;
         for rank in ranks {
             let (send, commands) = mpsc::channel();
             let (reply, receive) = mpsc::channel();
@@ -120,6 +122,7 @@ pub fn run(
                         package,
                         layout,
                         trace.is_some(),
+                        shared_tables,
                     )
                 })();
                 let mut worker = match loaded {

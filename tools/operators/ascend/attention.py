@@ -30,6 +30,11 @@ def sparse_attention(rows, heads, selected, dimension=512, scale=None):
             product = T.alloc_ub((block, dimension), "float32")
             ids = T.alloc_ub((block,), "int32")
             scores = T.alloc_ub((block,), "float32")
+            # Compare/select operate on 256-byte vectors. Keep the arithmetic
+            # at 16 scores and pad only the mask operation to 64 FP32 lanes.
+            ids_float = T.alloc_ub((64,), "float32")
+            mask = T.alloc_ub((8,), "uint8")
+            masked_scores = T.alloc_ub((64,), "float32")
             probabilities = T.alloc_ub((block, 1), "float32")
             maximum = T.alloc_ub((1, 1), "float32")
             block_maximum = T.alloc_ub((1, 1), "float32")
@@ -59,9 +64,19 @@ def sparse_attention(rows, heads, selected, dimension=512, scale=None):
                     T.tile.mul(product, product, k)
                     T.reduce_sum(product, scores, dim=1)
                     T.tile.mul(scores, scores, scale)
-                    for i in T.serial(block):
-                        if ids[i] < 0:
-                            scores[i] = -T.infinity("float32")
+                    T.tile.fill(ids_float, -1.0)
+                    T.tile.cast(ids_float, ids, "CAST_NONE", block)
+                    T.tile.compare(mask, ids_float, -1.0, "GT")
+                    T.tile.fill(masked_scores, -T.infinity("float32"))
+                    T.copy(scores, masked_scores[:block])
+                    T.tile.select(
+                        masked_scores,
+                        mask,
+                        masked_scores,
+                        -T.infinity("float32"),
+                        "VSEL_TENSOR_SCALAR_MODE",
+                    )
+                    T.copy(masked_scores[:block], scores)
                     T.reduce_max(scores, block_maximum[0, :], dim=0)
                     T.tile.max(updated_maximum, maximum, block_maximum)
                     T.tile.sub(alpha, maximum, updated_maximum)

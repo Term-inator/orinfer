@@ -33,6 +33,7 @@ EXACT_OPS = {
     "select_local",
     "select_merge",
     "select_finalize",
+    "regroup",
 }
 
 
@@ -139,6 +140,29 @@ def reference(kind, inputs, parameters):
             values / values.sum(-1, keepdim=True) * parameters["routed_scale"]
         )
         return [indices, weights]
+    if kind == "regroup":
+        indices, original_errors = inputs
+        rows, selected = parameters["rows"], parameters["selected"]
+        gather = torch.full((rows * selected,), -1, dtype=torch.int32)
+        restore = torch.full_like(indices, -1)
+        counts = torch.zeros(parameters["local"], dtype=torch.int64)
+        position = 0
+        for expert in range(parameters["local"]):
+            for row in range(rows):
+                for lane in range(selected):
+                    if indices[row, lane] == parameters["base"] + expert:
+                        gather[position] = row
+                        restore[row, lane] = position
+                        counts[expert] += 1
+                        position += 1
+        if parameters["pad_last"]:
+            counts[-1] += gather.numel() - position
+        errors = original_errors.clone()
+        errors[0] = (
+            (indices[:, :selected] < 0) | (indices[:, :selected] >= parameters["experts"])
+        ).any()
+        errors[rows] = position
+        return [gather, restore, counts, errors]
     if kind in ("w8_projection", "bf16_projection"):
         x, w, sa, sw = inputs
         raw = (
@@ -459,6 +483,30 @@ def cases(rows, width, index_length=8192, attention_selected=32, select_k=512):
         [torch.randn(rows, 384) * 8, torch.randn(384) * 0.1],
     )
     output = 64 if width < 2304 else 2304
+    route_ids = torch.arange(rows * 8, dtype=torch.int32).view(rows, 8) % 48
+    route_ids[0, 0] = -2
+    route_ids[-1, 5] = 384
+    regroup_parameters = {
+        "rows": rows,
+        "experts": 384,
+        "local": 48,
+        "selected": 6,
+        "base": 0,
+        "pad_last": False,
+    }
+    yield (
+        "regroup",
+        routing.regroup(**regroup_parameters),
+        regroup_parameters,
+        [
+            operand("indices", "i32", (rows, 8)),
+            operand("gather", "i32", (rows * 6,), "write"),
+            operand("restore", "i32", (rows, 8), "write"),
+            operand("counts", "i64", (48,), "write"),
+            operand("errors", "i32", (rows + 1,), "read_write"),
+        ],
+        [route_ids, torch.zeros(rows + 1, dtype=torch.int32)],
+    )
     for integer in (True, False):
         kind = "w8_projection" if integer else "bf16_projection"
         dtype = "i8" if integer else "bf16"
@@ -802,6 +850,7 @@ def main():
             "dequant_rows",
             "rope",
             "route",
+            "regroup",
             "w8_projection",
             "bf16_projection",
             "rotate_blocks",

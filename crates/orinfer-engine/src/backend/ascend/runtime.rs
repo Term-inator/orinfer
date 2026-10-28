@@ -226,7 +226,6 @@ impl Completion {
         )?;
         match state {
             0 => {
-                self.complete.set(true);
                 // Retained resources — pinned DMA sources in particular — are
                 // released only by the hard event wait in wait()/Drop: a query
                 // completion does not prove an async memcpy finished reading
@@ -470,6 +469,9 @@ impl Session {
         let mut index = 0;
         while index < pending.len() {
             if pending[index].done()? {
+                // A ready query does not replace the hard completion fence
+                // required before releasing retained DMA backing.
+                pending[index].wait()?;
                 pending.swap_remove(index);
             } else {
                 index += 1;
@@ -480,6 +482,12 @@ impl Session {
     pub fn synchronize(&self) -> Result<()> {
         self.context.sync(self.context.transfer)?;
         self.context.sync(self.context.compute)?;
+        // Both owned streams completed. Every pending fence was recorded on
+        // one of them; mark all fences before releasing nested ticket owners.
+        // Surviving public Tickets observe the same completed state.
+        for pending in self.pending.borrow().iter() {
+            pending.complete.set(true);
+        }
         for pending in self.pending.borrow().iter() {
             pending.wait()?;
         }
@@ -579,6 +587,66 @@ impl Session {
                     },
                     "ACL upload",
                 )
+            },
+        )
+    }
+    /// Stage a bounded group of complete inputs with one pinned allocation and
+    /// completion. Compute-stream ordering protects earlier readers when a
+    /// later layer reuses the same input buffers.
+    pub(super) fn upload_inputs(&self, inputs: &[(Buffer, Vec<u8>)]) -> Result<Ticket> {
+        let mut bytes = 0usize;
+        for (buffer, data) in inputs {
+            self.require(buffer)?;
+            if data.len() != buffer.bytes() {
+                return Err("Model input upload byte extent differs".into());
+            }
+            bytes = bytes
+                .checked_add(data.len())
+                .ok_or("Input upload overflow")?;
+        }
+        self.reap()?;
+        let host = self.pinned(bytes)?;
+        let mut offset = 0;
+        for (_, data) in inputs {
+            // SAFETY: Exclusive pinned allocation spans the checked total; each
+            // source slice is copied before this method returns.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    host.pointer.cast::<u8>().add(offset),
+                    data.len(),
+                );
+            }
+            offset += data.len();
+        }
+        self.submit(
+            self.context.compute,
+            Retained {
+                _buffers: inputs.iter().map(|(buffer, _)| buffer.clone()).collect(),
+                _host: Some(Rc::clone(&host)),
+                _extra: None,
+            },
+            |stream| {
+                let mut offset = 0;
+                for (buffer, data) in inputs {
+                    check(
+                        // SAFETY: Complete device spans and disjoint slices of
+                        // the retained pinned source were checked above; H2D=1.
+                        unsafe {
+                            (self.context.api.memcpy)(
+                                buffer.pointer(),
+                                data.len(),
+                                host.pointer.cast::<u8>().add(offset).cast(),
+                                data.len(),
+                                1,
+                                stream,
+                            )
+                        },
+                        "ACL input upload",
+                    )?;
+                    offset += data.len();
+                }
+                Ok(())
             },
         )
     }

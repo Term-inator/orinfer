@@ -425,17 +425,22 @@ def mhc_post(rows, width):
     return main
 
 
-def mhc_prenorm_partials(rows, width, splits=8):
+def mhc_prenorm_partials(rows, width, splits=8, lanes=32):
     """FP32 fn arithmetic, split over K; no BF16 approximation of HC weights.
 
     The padded fn has 24 valid rows. Output lane 24 stores sum(x*x), lanes
-    25..31 are reserved zeros. The reduction kernel owns the RMS boundary.
+    25..31 are reserved zeros. Splitting output lanes distributes the same
+    per-lane K reduction across more cores without changing its arithmetic.
+    The reduction kernel owns the RMS boundary.
     """
     reduction = 4 * width
     chunk = math.gcd(reduction // splits, 256)
     if reduction % splits:
         raise ValueError("mHC K must be divisible by split count")
     loops = reduction // splits // chunk
+    if lanes not in (8, 16, 32):
+        raise ValueError("mHC output lane tile must be 8, 16 or 32")
+    groups = 32 // lanes
 
     @T.prim_func
     def main(
@@ -443,27 +448,28 @@ def mhc_prenorm_partials(rows, width, splits=8):
         fn: T.Tensor((32, reduction), "float32"),
         out: T.Tensor((rows, splits, 32), "float32"),
     ):
-        with T.Kernel(T.ceildiv(rows * splits, 2), is_npu=True) as (cid, vid):
+        with T.Kernel(T.ceildiv(rows * splits * groups, 2), is_npu=True) as (cid, vid):
             xb = T.alloc_ub((1, chunk), "bfloat16")
             x = T.alloc_ub((1, chunk), "float32")
             square = T.alloc_ub((1, chunk), "float32")
             sq = T.alloc_ub((1, 1), "float32")
             sq_acc = T.alloc_ub((1, 1), "float32")
-            broadcast = T.alloc_ub((32, chunk), "float32")
-            w = T.alloc_ub((32, chunk), "float32")
-            product = T.alloc_ub((32, chunk), "float32")
-            partial = T.alloc_ub((32, 1), "float32")
-            total = T.alloc_ub((32, 1), "float32")
+            broadcast = T.alloc_ub((lanes, chunk), "float32")
+            w = T.alloc_ub((lanes, chunk), "float32")
+            product = T.alloc_ub((lanes, chunk), "float32")
+            partial = T.alloc_ub((lanes, 1), "float32")
+            total = T.alloc_ub((lanes, 1), "float32")
             index = cid * 2 + vid
-            row = index // splits
-            split = index % splits
+            row = index // (splits * groups)
+            split = index // groups % splits
+            group = index % groups
             if row < rows:
                 T.tile.fill(total, 0.0)
                 T.tile.fill(sq_acc, 0.0)
                 for k in T.serial(loops):
                     offset = (split * loops + k) * chunk
                     T.copy(residual[row : row + 1, offset : offset + chunk], xb)
-                    T.copy(fn[:, offset : offset + chunk], w)
+                    T.copy(fn[group * lanes : (group + 1) * lanes, offset : offset + chunk], w)
                     T.tile.cast(x, xb, "CAST_NONE", chunk)
                     T.tile.mul(square, x, x)
                     T.reduce_sum(square, sq, dim=1)
@@ -472,10 +478,11 @@ def mhc_prenorm_partials(rows, width, splits=8):
                     T.tile.mul(product, w, broadcast)
                     T.reduce_sum(product, partial, dim=1)
                     T.tile.add(total, total, partial)
-                total[24, 0] = sq_acc[0, 0]
-                for i in T.Parallel(7):
-                    total[25 + i, 0] = 0.0
-                T.copy(total, out[row, split, :])
+                if group == 24 // lanes:
+                    total[24 % lanes, 0] = sq_acc[0, 0]
+                    for i in T.Parallel(7):
+                        total[24 % lanes + 1 + i, 0] = 0.0
+                T.copy(total, out[row, split, group * lanes : (group + 1) * lanes])
 
     return main
 

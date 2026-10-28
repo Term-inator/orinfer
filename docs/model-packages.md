@@ -107,6 +107,9 @@ bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate \
 # BF16 尾数覆盖与动态 A8 舍入边界：
 bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate \
   --output artifacts/ascend-runtime/a8-grid --rows 128 --width 512 --quant-grid --only quantize
+# 专家行重排、空路由与异常索引的精确检查：
+bash tools/operators/ascend/run.sh python3 -m tools.operators.ascend.validate \
+  --output artifacts/ascend-runtime/route --rows 3 --only regroup
 flock -w 5 artifacts/gpu-experiment.lock orinfer validate-ascend-kernels \
   --device 7 --fixtures artifacts/ascend-runtime/aot/fixtures.json
 ```
@@ -142,9 +145,13 @@ CPU 验收读取真实表的小批量行，检查所有 token 分块边界的 ha
 
 ### A2 单流模型实验入口
 
-`backend/ascend/model/` 提供 DSv4.1 Flash-1017 原始 W4A8 checkpoint 的实验性单流执行入口 `bench-ascend`。八个 Rust worker 各持有独立 ACL context，以 TP8 执行 attention、每卡 48 个专家执行 MoE，并通过 HCCL 合并结果。执行计划包含全部 40 层、Engram CPU 行查找、C2/C1 缓存、索引 TopK 与输出头。W4 grouped matmul 保留 ACLNN，其余设备计算从 TileLang AOT 库加载；连续 TileLang 片段复用 ACL Graph。
+`backend/ascend/model/` 提供 DSv4.1 Flash-1017 原始 W4A8 checkpoint 的实验性单流执行入口 `bench-ascend`。八个 Rust worker 各持有独立 ACL context，以 TP8 执行 attention、每卡 48 个专家执行 MoE，并通过 HCCL 合并结果。执行计划包含全部 40 层、Engram CPU 行查找、C2/C1 缓存、索引 TopK 与输出头。W4 grouped matmul 保留 ACLNN，其余设备计算从 TileLang AOT 库加载；连续 TileLang、W4 和 HCCL 调用共同捕获为 ACL Graph，按原执行顺序复用同一 W4 workspace。设置 `ORINFER_A2_W4_NO_CAPTURE=1` 可单独提交 W4，供诊断使用。
 
 该入口使用独立的实验计划描述，公共模型包 schema 1 和 C ABI v1 保持原样；`serve` 的 Ascend 执行器仍未注册。当前上下文容量限定为 128–16384，须为 32 的倍数；默认 8448，覆盖 8K 输入和 128 个输出。此范围内候选块覆盖完整历史。prefill 使用 16 行 packet，decode 使用单行 packet；请求间清空历史和残余压缩状态，通过因果索引隔离旧 KV。prefix 复用、并发调度及 MTP 需要后续接入。
+
+普通 packet 用一次完成事件保留图、W4 executor、通信组及其设备资源。坐标、embedding 和 Engram 输入通过 compute stream 有序上传，复用的输入地址在原层边界更新；完成查询后仍通过硬完成栅栏回收 pinned 内存。各 rank 共用只读 Engram 行包，缓存身份包含有序行 ID，掩码保持本次请求私有。ACLNN W4A8 会原地变换激活字节，每次调用前均由上游整数投影准备新的 A8 输入；离线复用 executor 的数值检查也需重新上传原始激活。
+
+专家张量的行数表示容量，group counts 总和等于本卡的有效路由数，可以小于容量或为零。空闲 gather 槽保持 `-1`，W4 只计算有效行。路由错误标记和扫描计数器由同一个标量核心更新；算子验收覆盖异常索引、反向行序、空路由和改变输入后的 Graph 重放。
 
 `ORINFER_ASCEND_IMAGE` 可选择编译镜像，`ORINFER_ASCEND_DRIVER_ROOT` 可选择主机驱动目录。编译 runner 将主机 `/data/models` 只读挂载到相同路径；其他模型根目录通过 `ORINFER_ASCEND_MODEL_ROOT` 指定绝对路径。在 CANN 和离线编译镜像准备完成后，先导出上述 Engram 元数据，再构建实验计划和固定 token 输入：
 

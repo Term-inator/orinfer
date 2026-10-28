@@ -1,6 +1,32 @@
 # 性能参考
 
-本页记录 Jetson AGX Orin 64GB / CUDA SM87 上的实测参考，各节注明测量日期。2026-10-12 的机器为 MAXN 模式、GPU 频率 1300.5 MHz；测试保持原有全局功耗和频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
+本页记录 Jetson AGX Orin 64GB / CUDA SM87 和 Ascend 910B3 上的实测参考，各节注明设备与测量日期。2026-10-12 的 Orin 为 MAXN 模式、GPU 频率 1300.5 MHz；测试保持原有全局功耗和频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
+
+## DSv4.1 A2 单流 decode（2026-10-28）
+
+八卡 Ascend 910B3、TP8，使用 DSv4.1 Flash-1017 原始 W4A8 checkpoint 和完整 40 层 `bench-ascend`。运行时为 CANN 9.2；离线编译使用固定的 CANN 9.1 / TileLang-Ascend 0.1.4（`d182ae8`）镜像。保持原始 W4 bank、scale 和 assist，在线直接读取准备好的物理布局。
+
+输入采用 `tools/bench/ascend_single.py --prepare` 生成的 1024-token completion case，greedy、seed `20261002`，关闭投机解码和跨请求 prefix 复用。每次生成 129 tokens，decode 按首输出之后的 128 tokens / 生成耗时计算，包含 CPU 查找、传输、图提交、完成等待和 HCCL。排除模型加载，每项先预热，再测三次完整请求，表中取中位数。TTFT 包含 prefill 和首输出头。
+
+| 累积优化 | Decode tokens/s | TTFT（秒） |
+| --- | ---: | ---: |
+| 优化前 | 20.62 | 10.340 |
+| Packet 提交、输入上传与共享 Engram 行包 | 21.96 | 9.286 |
+| 单行投影 K tile 与 mHC 输出分块 | 24.23 | 9.276 |
+| W4、TileLang 和 HCCL 整段 Graph 捕获 | 24.43 | 9.281 |
+| Indexer / TopK 有效候选裁剪 | 25.01 | 8.043 |
+| W4 只计算有效专家行 | 25.94 | 7.815 |
+| Attention 掩码与 TopK 索引向量化 | **26.37** | **7.624** |
+
+整数投影按实际矩阵几何测量 128/256/512 的 K tile，单行选择 512 或 256，prefill 保留 128；mHC 单行每组处理 8 个输出通道，prefill 保留 32。各配置保持原始归约顺序、scale 和输出舍入边界。Indexer 跳过完全无效的候选块；TopK 根据有效长度缩小排序范围，同分候选次序和 padding 结果保持一致。W4 的 group counts 只包含有效路由，空闲容量保留为 `-1` gather 槽，避免计算补齐的零行。
+
+Attention 保留 16-token 块的 FP32 打分、在线 softmax 和逐块累积，仅将掩码操作补齐到 64 个 FP32 元素后向量执行；TopK 的固定交织索引通过精确的整数值向量运算生成。单行 attention 微测约 121 → 93 µs；TopK 常见形状约 51 → 17–23 µs，最终收益以上表完整请求为准。
+
+输入按 compute stream 的原层边界更新，整段提交持有图、原生 W4 executor、通信组及设备资源；完成事件查询之后通过硬完成栅栏回收 DMA 源。W4 图节点按原顺序复用同一 workspace。ACLNN 会原地变换 A8 输入，独立数值探针在每次调用和重放前恢复输入；完整模型由上游 kernel 重新准备 A8。
+
+最终 1K 三次 decode 为 26.367 / 26.435 / 26.339 tokens/s，相对本轮基线的中位数提升 **27.9%**。另用一次完整的 8192 输入、33 输出请求检查长上下文，decode 为 25.47 tokens/s，TTFT 为 66.23 秒；长请求之后的 1K 请求为 26.48 tokens/s。短请求、三次 1K、8K 和重置后的 1K 共 553 个生成 token ID，与原生 W4 基线逐项一致。
+
+算子检查包含矩阵几何、尾部、TopK 同分项及改变输入后的 Graph 重放；路由检查包含 108 组直接／重放输入和 Rust 原生验收。`make check` 通过。构建与运行命令见 [A2 单流模型实验入口](model-packages.md#a2-单流模型实验入口)。关闭投机解码的单流目标为 **60 tokens/s**，当前尚未达到。
 
 ## 六模型统一基准（2026-10-21）
 

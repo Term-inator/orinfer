@@ -48,6 +48,16 @@ pub struct Graph {
     last: RefCell<Option<Ticket>>,
 }
 impl Graph {
+    /// The caller retains this graph through an enclosing compute completion
+    /// and serializes invocations on the owning session's compute stream.
+    pub(super) unsafe fn execute_on_stream(&self, stream: Handle) -> Result<()> {
+        check(
+            // SAFETY: The caller supplies this graph's owned stream and retains
+            // its stable operands and native resources through completion.
+            unsafe { (self.captured.api.execute)(self.captured.handle, stream) },
+            "execute ACL Graph segment",
+        )
+    }
     /// Caller guarantees stable addresses and retains every native resource used
     /// by enqueue in keepalive. Allocation and preparation happen before capture.
     pub(super) unsafe fn capture(

@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     artifact::{FileIdentity, Result, read_identity, resolve_file},
-    host_rows::{Int8Rows, Shard},
+    host_rows::{Int8Rows, Shard, SharedInt8Rows},
     weights::checkpoint::Checkpoint,
 };
 use orinfer_model_sdk::conditional_memory::{HashLayout, Hasher};
@@ -20,6 +20,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     rc::Rc,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 
@@ -118,7 +119,7 @@ enum Instruction {
 }
 enum Step {
     Graph(super::graph::Graph),
-    W4(String),
+    W4(Rc<GroupedW4A8>),
     Route {
         indices: Buffer,
         gather: Buffer,
@@ -156,15 +157,16 @@ struct Execution {
     body: Vec<Step>,
     head: Vec<Step>,
 }
+type SharedTables = OnceLock<Result<Arc<BTreeMap<usize, SharedInt8Rows>>>>;
 struct Worker {
     session: Session,
     comm: Communicator,
     buffers: BTreeMap<String, Buffer>,
     w4: BTreeMap<String, Rc<GroupedW4A8>>,
-    packets: BTreeMap<usize, Execution>,
+    packets: BTreeMap<usize, Rc<Execution>>,
     checkpoint: Checkpoint,
     hasher: Hasher,
-    tables: BTreeMap<usize, Int8Rows>,
+    tables: Arc<BTreeMap<usize, SharedInt8Rows>>,
     rope: BTreeMap<String, Vec<u8>>,
     capacity: usize,
     rank: u32,
@@ -349,6 +351,7 @@ impl Worker {
         package: &Path,
         layout: HashLayout,
         snapshots: bool,
+        shared_tables: &SharedTables,
     ) -> Result<Self> {
         let start = Instant::now();
         let mut phases = LoadPhases::default();
@@ -433,23 +436,30 @@ impl Worker {
         }
         phases.zero.seconds += t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let mut tables = BTreeMap::new();
-        for layer in &layout.layers {
-            let prefix = format!("layers.{}.engram.embed", layer.layer);
-            tables.insert(
-                layer.layer,
-                Int8Rows::open(
-                    &checkpoint.path(&format!("{prefix}.weight"))?,
-                    &format!("{prefix}.weight"),
-                    &checkpoint.path(&format!("{prefix}.scale"))?,
-                    &format!("{prefix}.scale"),
-                    Shard {
-                        first: 0,
-                        rows: layer.rows,
-                    },
-                )?,
-            );
-        }
+        let tables = shared_tables
+            .get_or_init(|| {
+                let mut tables = BTreeMap::new();
+                for layer in &layout.layers {
+                    let prefix = format!("layers.{}.engram.embed", layer.layer);
+                    tables.insert(
+                        layer.layer,
+                        SharedInt8Rows::new(Int8Rows::open(
+                            &checkpoint.path(&format!("{prefix}.weight"))?,
+                            &format!("{prefix}.weight"),
+                            &checkpoint.path(&format!("{prefix}.scale"))?,
+                            &format!("{prefix}.scale"),
+                            Shard {
+                                first: 0,
+                                rows: layer.rows,
+                            },
+                        )?),
+                    );
+                }
+                Ok(Arc::new(tables))
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let tables = Arc::clone(tables);
         let rope = model
             .rope
             .iter()
@@ -477,7 +487,7 @@ impl Worker {
             let head = worker.compile(&packet.head, package, snapshots)?;
             if worker
                 .packets
-                .insert(packet.rows, Execution { packet, body, head })
+                .insert(packet.rows, Rc::new(Execution { packet, body, head }))
                 .is_some()
             {
                 return Err("Duplicate packet row count".into());
@@ -600,6 +610,8 @@ impl Worker {
                     Some(name) => Some(get(&self.buffers, name)?),
                     None => None,
                 };
+                let capture_w4 = std::env::var_os("ORINFER_A2_W4_NO_CAPTURE").is_none();
+                let shared_workspace = get(&self.buffers, workspace)?;
                 let t = Instant::now();
                 let plan = Rc::new(GroupedW4A8::prepare_with_workspace(
                     &self.session,
@@ -618,7 +630,7 @@ impl Worker {
                         token_scale: &b[4],
                         output: &b[5],
                     },
-                    Some(&get(&self.buffers, workspace)?),
+                    Some(&shared_workspace),
                     counts.as_ref(),
                 )?);
                 self.phases.aclnn.0 += 1;
@@ -626,16 +638,14 @@ impl Worker {
                 if self.w4.insert(name.clone(), Rc::clone(&plan)).is_some() {
                     return Err("Duplicate W4 binding".into());
                 }
-                // The repeatable ACLNN executor bakes its group partition
-                // into the captured graph, so replays would keep using the
-                // counts present at capture time instead of the rows the
-                // in-graph regroup kernel writes. Enqueue at runtime; the
-                // capture path stays behind an explicit experiment switch.
-                if std::env::var_os("ORINFER_A2_W4_CAPTURE").is_some() {
+                // W4 graph nodes use the same stream-ordered scratch as direct
+                // enqueues. The surrounding kernels restore activation bytes:
+                // ACLNN's A8/W4 implementation transforms its input in place.
+                if capture_w4 {
                     pending.push(SegmentOp::W4(plan));
                 } else {
                     self.capture_pending(&mut pending, &mut steps)?;
-                    steps.push(Step::W4(name.clone()));
+                    steps.push(Step::W4(plan));
                 }
                 continue;
             }
@@ -727,23 +737,31 @@ impl Worker {
         // communicator and ACLNN plan used by the replayed launches; all
         // addresses are stable for the lifetime of the captured graph.
         let graph = unsafe {
-            super::graph::Graph::capture(&self.session, Box::new(ops.clone()), move |stream| {
-                for op in ops.iter() {
-                    match op {
-                        SegmentOp::Kernel(kernel) => kernel.launch_on_stream(stream)?,
-                        SegmentOp::Reduce {
-                            source,
-                            destination,
-                            elements,
-                            element,
-                        } => {
-                            comm.reduce_on_stream(stream, source, destination, *elements, *element)?
+            super::graph::Graph::capture(
+                &self.session,
+                Box::new((ops.clone(), comm.clone())),
+                move |stream| {
+                    for op in ops.iter() {
+                        match op {
+                            SegmentOp::Kernel(kernel) => kernel.launch_on_stream(stream)?,
+                            SegmentOp::Reduce {
+                                source,
+                                destination,
+                                elements,
+                                element,
+                            } => comm.reduce_on_stream(
+                                stream,
+                                source,
+                                destination,
+                                *elements,
+                                *element,
+                            )?,
+                            SegmentOp::W4(plan) => plan.execute_on_stream(stream)?,
                         }
-                        SegmentOp::W4(plan) => plan.execute_on_stream(stream)?,
                     }
-                }
-                Ok(())
-            })?
+                    Ok(())
+                },
+            )?
         };
         self.phases.captures.0 += 1;
         self.phases.captures.1 += t.elapsed().as_secs_f64();

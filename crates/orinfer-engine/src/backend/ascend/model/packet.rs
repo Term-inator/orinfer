@@ -1,8 +1,11 @@
-use super::{Step, Worker, get, upload};
-use crate::{artifact::Result, backend::ascend::runtime::Buffer};
+use super::{Execution, Step, Worker, get, upload};
+use crate::{
+    artifact::Result,
+    backend::ascend::runtime::{Buffer, Ticket},
+};
 use safetensors::Dtype;
 use serde::Deserialize;
-use std::{fs, path::Path, time::Instant};
+use std::{fs, path::Path, rc::Rc, time::Instant};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,13 +58,15 @@ fn ints(values: &[i32]) -> Vec<u8> {
     values.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 impl Worker {
-    fn put(&self, name: &str, data: &[u8]) -> Result<()> {
-        upload(&self.session, &get(&self.buffers, name)?, data)
+    fn put(&self, inputs: &mut Vec<(Buffer, Vec<u8>)>, name: &str, data: &[u8]) -> Result<()> {
+        inputs.push((get(&self.buffers, name)?, data.to_vec()));
+        Ok(())
     }
     fn coordinate(&self, names: &Coordinates, base: usize, rows: usize) -> Result<()> {
         if rows == 0 || base.checked_add(rows).is_none_or(|end| end > self.capacity) {
             return Err("Packet exceeds model context capacity".into());
         }
+        let mut inputs = vec![];
         for (asset, target, compressed) in [
             ("base_cos", &names.base_cos, false),
             ("base_sin", &names.base_sin, false),
@@ -84,14 +89,14 @@ impl Worker {
                         .ok_or("RoPE position outside table")?,
                 );
             }
-            self.put(target, &data)?;
+            self.put(&mut inputs, target, &data)?;
         }
         let slots = (base..base + rows).map(|p| p as i32).collect::<Vec<_>>();
         let c2_slots = (base..base + rows)
             .map(|p| if p % 2 == 1 { (p / 2) as i32 } else { -1 })
             .collect::<Vec<_>>();
-        self.put(&names.slots, &ints(&slots))?;
-        self.put(&names.c2_slots, &ints(&c2_slots))?;
+        self.put(&mut inputs, &names.slots, &ints(&slots))?;
+        self.put(&mut inputs, &names.c2_slots, &ints(&c2_slots))?;
         let mut swa = vec![-1; rows * 128];
         let mut metadata = vec![0; rows * 8];
         let mut mix = vec![0f32; rows * 8];
@@ -110,9 +115,10 @@ impl Worker {
             ]);
             mix[row * 8] = 1.0;
         }
-        self.put(&names.swa_indices, &ints(&swa))?;
-        self.put(&names.ring, &ints(&metadata))?;
+        self.put(&mut inputs, &names.swa_indices, &ints(&swa))?;
+        self.put(&mut inputs, &names.ring, &ints(&metadata))?;
         self.put(
+            &mut inputs,
             &names.premix,
             &mix.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
         )?;
@@ -130,9 +136,10 @@ impl Worker {
                     ids[row * capacity + slot] = slot as i32;
                 }
             }
-            self.put(indices, &ints(&ids))?;
-            self.put(lengths, &ints(&lens))?;
+            self.put(&mut inputs, indices, &ints(&ids))?;
+            self.put(&mut inputs, lengths, &ints(&lens))?;
         }
+        self.session.upload_inputs(&inputs)?;
         Ok(())
     }
     pub(super) fn forward(
@@ -145,64 +152,146 @@ impl Worker {
         let rows = tokens.len();
         let execution = self
             .packets
-            .remove(&rows)
+            .get(&rows)
+            .cloned()
             .ok_or_else(|| format!("No A2 packet for {rows} rows"))?;
-        let result = (|| {
-            let t = Instant::now();
-            self.coordinate(&execution.packet.coordinates, history.len(), rows)?;
-            let coordinate = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            let mut hashes = vec![];
-            let mut valid = vec![];
-            self.hasher
-                .hash_into(history, tokens, &mut hashes, &mut valid)?;
-            let hash = t.elapsed().as_secs_f64();
-            let t = Instant::now();
+        let t = Instant::now();
+        self.coordinate(&execution.packet.coordinates, history.len(), rows)?;
+        let coordinate = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let mut hashes = vec![];
+        let mut valid = vec![];
+        self.hasher
+            .hash_into(history, tokens, &mut hashes, &mut valid)?;
+        let hash = t.elapsed().as_secs_f64();
+        let batched = trace.is_none()
+            && std::env::var_os("ORINFER_A2_SYNC_PROFILE").is_none()
+            && std::env::var_os("ORINFER_A2_STEP_FENCES").is_none()
+            && !execution
+                .body
+                .iter()
+                .chain(&execution.head)
+                .any(|s| matches!(s, Step::Route { .. }));
+        let t = Instant::now();
+        if batched {
+            self.enqueue_packet(Rc::clone(&execution), tokens, &hashes, &valid, logits)?;
+        } else {
             for step in &execution.body {
                 self.step(step, tokens, &hashes, &valid, history.len(), trace)?;
             }
-            let body = t.elapsed().as_secs_f64();
-            if !logits {
-                self.session.synchronize()?;
-                let stats = self.steps.entry(rows).or_default();
-                stats.forwards += 1;
-                stats.coordinate_s += coordinate;
-                stats.hash_s += hash;
-                stats.body_s += body;
-                return Ok(None);
-            }
-            let t = Instant::now();
-            for step in &execution.head {
-                self.step(step, tokens, &hashes, &valid, history.len(), trace)?;
-            }
-            let head = t.elapsed().as_secs_f64();
-            let t = Instant::now();
-            let raw_value =
-                self.session
-                    .download(&get(&self.buffers, &execution.packet.best_value)?, 0, 4)?;
-            let raw_index =
-                self.session
-                    .download(&get(&self.buffers, &execution.packet.best_index)?, 0, 4)?;
-            let download = t.elapsed().as_secs_f64();
-            let value = f32::from_le_bytes(raw_value.try_into().unwrap());
-            let local = i32::from_le_bytes(raw_index.try_into().unwrap());
-            if !value.is_finite() || !(0..16160).contains(&local) {
-                return Err("Nonfinite/invalid native model output".into());
-            }
+        }
+        let body = t.elapsed().as_secs_f64();
+        if !logits {
+            self.session.synchronize()?;
             let stats = self.steps.entry(rows).or_default();
             stats.forwards += 1;
             stats.coordinate_s += coordinate;
             stats.hash_s += hash;
             stats.body_s += body;
-            stats.head_s += head;
-            stats.download_s += download;
-            Ok(Some(Best {
-                value,
-                token: execution.packet.vocab_first + local as u32,
-            }))
-        })();
-        self.packets.insert(rows, execution);
-        result
+            return Ok(None);
+        }
+        let t = Instant::now();
+        if !batched {
+            for step in &execution.head {
+                self.step(step, tokens, &hashes, &valid, history.len(), trace)?;
+            }
+        }
+        let head = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let raw_value =
+            self.session
+                .download(&get(&self.buffers, &execution.packet.best_value)?, 0, 4)?;
+        let raw_index =
+            self.session
+                .download(&get(&self.buffers, &execution.packet.best_index)?, 0, 4)?;
+        let download = t.elapsed().as_secs_f64();
+        let value = f32::from_le_bytes(raw_value.try_into().unwrap());
+        let local = i32::from_le_bytes(raw_index.try_into().unwrap());
+        if !value.is_finite() || !(0..16160).contains(&local) {
+            return Err("Nonfinite/invalid native model output".into());
+        }
+        let stats = self.steps.entry(rows).or_default();
+        stats.forwards += 1;
+        stats.coordinate_s += coordinate;
+        stats.hash_s += hash;
+        stats.body_s += body;
+        stats.head_s += head;
+        stats.download_s += download;
+        Ok(Some(Best {
+            value,
+            token: execution.packet.vocab_first + local as u32,
+        }))
+    }
+    /// One completion owns every graph, ACLNN executor and native operand in
+    /// this invocation. Input uploads have their own retained pinned backing
+    /// and join the same compute stream at their original layer boundaries.
+    fn enqueue_packet(
+        &mut self,
+        execution: Rc<Execution>,
+        tokens: &[u32],
+        hashes: &[i64],
+        valid: &[bool],
+        logits: bool,
+    ) -> Result<Ticket> {
+        let head = if logits {
+            execution.head.as_slice()
+        } else {
+            &[]
+        };
+        let mut inputs = vec![];
+        for step in execution.body.iter().chain(head) {
+            match step {
+                Step::Embed(destination) => {
+                    inputs.push(vec![(destination.clone(), self.embedding(tokens)?)])
+                }
+                Step::Lookup {
+                    layer,
+                    values,
+                    scales,
+                    mask,
+                } => inputs.push(self.lookup_inputs(
+                    *layer,
+                    tokens.len(),
+                    hashes,
+                    valid,
+                    values,
+                    scales,
+                    mask,
+                )?),
+                _ => {}
+            }
+        }
+        let mut inputs = inputs.into_iter();
+        // SAFETY: Execution owns the stable graphs and W4 plans; each graph
+        // retains its kernels/collectives, and W4 retains tensors/workspace.
+        // submit_compute fences partial submission on failure. Each forward
+        // completes before these packet resources can be invoked again.
+        unsafe {
+            self.session
+                .submit_compute(vec![], Box::new(Rc::clone(&execution)), |stream| {
+                    let head = if logits {
+                        execution.head.as_slice()
+                    } else {
+                        &[]
+                    };
+                    for step in execution.body.iter().chain(head) {
+                        match step {
+                            Step::Graph(graph) => graph.execute_on_stream(stream)?,
+                            Step::W4(plan) => plan.execute_on_stream(stream)?,
+                            Step::Embed(_) | Step::Lookup { .. } => {
+                                self.session.upload_inputs(
+                                    &inputs.next().ok_or("Packet inputs missing")?,
+                                )?;
+                            }
+                            Step::Snapshot { .. } => {}
+                            Step::Route { .. } => {
+                                return Err("Host routing requires step completions".into());
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+        }
     }
     /// Prints and clears per-row-count step accounting for this rank.
     pub(super) fn report_steps(&mut self) {
@@ -260,11 +349,7 @@ impl Worker {
             let t = Instant::now();
             let submission = match step {
                 Step::Graph(program) => program.enqueue(&self.session).map(|_| ()),
-                Step::W4(name) => self
-                    .w4
-                    .get(name)
-                    .ok_or("W4 binding missing".to_string())
-                    .and_then(|plan| plan.enqueue(&self.session).map(|_| ())),
+                Step::W4(plan) => plan.enqueue(&self.session).map(|_| ()),
                 _ => Ok(()),
             };
             let result = submission.and_then(|()| self.session.synchronize());
@@ -281,7 +366,10 @@ impl Worker {
                 }
                 _ => {}
             }
-            return result;
+            if matches!(step, Step::Graph(_) | Step::W4(_)) {
+                return result;
+            }
+            result?;
         }
         let t = Instant::now();
         let result = self.step_inner(step, tokens, hashes, valid, position, trace);
@@ -323,11 +411,8 @@ impl Worker {
             Step::Graph(program) => {
                 program.enqueue(&self.session)?;
             }
-            Step::W4(name) => {
-                self.w4
-                    .get(name)
-                    .ok_or("W4 binding missing")?
-                    .enqueue(&self.session)?;
+            Step::W4(plan) => {
+                plan.enqueue(&self.session)?;
             }
             Step::Route {
                 indices,
@@ -403,28 +488,20 @@ impl Worker {
                 stats.route_grp.1 += grp;
             }
             Step::Embed(destination) => {
-                let embedding = self.checkpoint.read("embed.weight")?;
-                if embedding.dtype != Dtype::BF16 || embedding.shape != [129280, 5120] {
-                    return Err("Embedding checkpoint layout differs".into());
-                }
-                let mut values = Vec::with_capacity(tokens.len() * 10240);
-                for &token in tokens {
-                    let start = token as usize * 10240;
-                    values.extend_from_slice(
-                        embedding
-                            .data
-                            .get(start..start + 10240)
-                            .ok_or("Embedding token out of range")?,
-                    );
-                }
-                upload(&self.session, destination, &values)?;
+                let values = self.embedding(tokens)?;
+                self.session
+                    .upload_inputs(&[(destination.clone(), values)])?;
             }
             Step::Lookup {
                 layer,
                 values,
                 scales,
                 mask,
-            } => self.lookup(*layer, tokens.len(), hashes, valid, values, scales, mask)?,
+            } => {
+                let inputs =
+                    self.lookup_inputs(*layer, tokens.len(), hashes, valid, values, scales, mask)?;
+                self.session.upload_inputs(&inputs)?;
+            }
             Step::Snapshot { name, buffer } => {
                 if let Some(base) = trace.filter(|_| self.rank == 0) {
                     fs::create_dir_all(base).map_err(|e| e.to_string())?;
@@ -436,8 +513,25 @@ impl Worker {
         }
         Ok(())
     }
+    fn embedding(&mut self, tokens: &[u32]) -> Result<Vec<u8>> {
+        let embedding = self.checkpoint.read("embed.weight")?;
+        if embedding.dtype != Dtype::BF16 || embedding.shape != [129280, 5120] {
+            return Err("Embedding checkpoint layout differs".into());
+        }
+        let mut values = Vec::with_capacity(tokens.len() * 10240);
+        for &token in tokens {
+            let start = token as usize * 10240;
+            values.extend_from_slice(
+                embedding
+                    .data
+                    .get(start..start + 10240)
+                    .ok_or("Embedding token out of range")?,
+            );
+        }
+        Ok(values)
+    }
     #[allow(clippy::too_many_arguments)]
-    fn lookup(
+    fn lookup_inputs(
         &self,
         layer: usize,
         rows: usize,
@@ -446,7 +540,7 @@ impl Worker {
         values: &Buffer,
         scales: &Buffer,
         mask: &Buffer,
-    ) -> Result<()> {
+    ) -> Result<Vec<(Buffer, Vec<u8>)>> {
         let layer_index = self
             .hasher
             .layout()
@@ -466,21 +560,17 @@ impl Worker {
             }
         }
         let table = self.tables.get(&layer).ok_or("Engram table missing")?;
-        let mut packed = vec![];
-        table.gather_into(&ids, &mut packed, rows * 24 * 288)?;
+        let packed = table.gather(&ids, rows * 24 * 288)?;
         let mut q = Vec::with_capacity(rows * 24 * 256);
         let mut scale = Vec::with_capacity(rows * 24 * 32);
         for data in packed.as_chunks::<288>().0.iter() {
             q.extend_from_slice(&data[..256]);
             scale.extend_from_slice(&data[256..]);
         }
-        upload(&self.session, values, &q)?;
-        upload(&self.session, scales, &scale)?;
-        upload(
-            &self.session,
-            mask,
-            &valid.iter().map(|&v| u8::from(v)).collect::<Vec<_>>(),
-        )?;
-        Ok(())
+        Ok(vec![
+            (values.clone(), q),
+            (scales.clone(), scale),
+            (mask.clone(), valid.iter().map(|&v| u8::from(v)).collect()),
+        ])
     }
 }
