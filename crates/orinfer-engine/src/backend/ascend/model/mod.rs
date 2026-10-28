@@ -869,11 +869,19 @@ impl Worker {
                 Box::new((Rc::clone(&ops), comm.clone())),
             )?)
         };
-        let stream = self.session.compute_stream();
         let _current = self.session.context.enter()?;
         let t = Instant::now();
-        enqueue_segment(&ops, &comm, parallel.as_deref(), stream)?;
-        self.session.synchronize()?;
+        // SAFETY: The warmup completion retains every operand and branch.
+        // Partial submission errors fence the main stream; Branches also
+        // fences auxiliary work if failure occurs before a matching join.
+        let warmup = unsafe {
+            self.session.submit_compute(
+                vec![],
+                Box::new((Rc::clone(&ops), comm.clone(), parallel.clone())),
+                |stream| enqueue_segment(&ops, &comm, parallel.as_deref(), stream),
+            )
+        }?;
+        warmup.wait()?;
         self.phases.warmups.0 += 1;
         self.phases.warmups.1 += t.elapsed().as_secs_f64();
         let t = Instant::now();

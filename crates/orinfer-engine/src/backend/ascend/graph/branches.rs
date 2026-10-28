@@ -120,18 +120,22 @@ impl Drop for Branches {
             std::mem::forget(Rc::clone(&self.context));
             return;
         };
-        // Also fence partial warmup/capture failures before operands or events
-        // can disappear. A failed fence quarantines native resources together.
-        // SAFETY: Every stream is owned by this retained, current context.
-        if self.streams.iter().any(|&stream| unsafe {
-            (self.context.api.sync_stream)(stream, self.context.timeout_ms()) != 0
-        }) {
+        // A failed warmup can leave the main branch queued before its join.
+        // Fence every stream before operands or events can disappear. A failed
+        // fence quarantines native resources together.
+        if std::iter::once(self.context.compute_stream())
+            .chain(self.streams.iter().copied())
+            .any(|stream| {
+                // SAFETY: Every stream belongs to this retained, current context.
+                unsafe { (self.context.api.sync_stream)(stream, self.context.timeout_ms()) != 0 }
+            })
+        {
             self.context.retire();
             std::mem::forget(self.keepalive.take());
             std::mem::forget(Rc::clone(&self.context));
             return;
         }
-        // SAFETY: No side work remains; all successful allocations are owned.
+        // SAFETY: No work remains; all successful allocations are owned.
         unsafe {
             for &(start, done) in &self.events {
                 if !start.is_null() {
@@ -151,7 +155,56 @@ impl Drop for Branches {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::ascend::runtime::Buffer;
     use crate::backend::ascend::tests::Fixture;
+    use std::cell::Cell;
+
+    #[test]
+    fn failed_warmup_fences_main_before_releasing_operands() {
+        struct Observe {
+            source: Box<[u8; 4]>,
+            destination: Buffer,
+            observed: Rc<Cell<[u8; 4]>>,
+        }
+        impl Drop for Observe {
+            fn drop(&mut self) {
+                // SAFETY: The CPU fixture owns four initialized host bytes.
+                self.observed
+                    .set(unsafe { *self.destination.pointer().cast::<[u8; 4]>() });
+            }
+        }
+        let mut fixture = Fixture::new();
+        {
+            let session = fixture.session();
+            let destination = session.allocate(4).unwrap();
+            session.fill(&destination, 0).unwrap().wait().unwrap();
+            let observed = Rc::new(Cell::new([0; 4]));
+            let operands = Observe {
+                source: Box::new([37, 41, 53, 67]),
+                destination: destination.clone(),
+                observed: observed.clone(),
+            };
+            let source = operands.source.as_ptr();
+            let branches = Branches::new(&session, &[0], Box::new(operands)).unwrap();
+            let _current = session.context.enter().unwrap();
+            // SAFETY: Branches retains the source and destination through the
+            // untracked warmup, including an early return before a join.
+            let status = unsafe {
+                (session.context.api.memcpy)(
+                    destination.pointer(),
+                    4,
+                    source.cast(),
+                    4,
+                    1,
+                    session.compute_stream(),
+                )
+            };
+            assert_eq!(status, 0);
+            drop(branches);
+            assert_eq!(observed.get(), [37, 41, 53, 67]);
+        }
+        fixture.assert_clean();
+    }
 
     #[test]
     fn branch_resources_roll_back_partial_event_creation() {
