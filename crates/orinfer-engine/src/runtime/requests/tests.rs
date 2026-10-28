@@ -1055,7 +1055,10 @@ fn validate_flash_mtp() {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 0,
             mtp_drafts: Some(7),
-
+            resident_experts: fixture
+                .resident_experts
+                .map(crate::execution::ResidentExperts::Count)
+                .unwrap_or_default(),
             ..Default::default()
         },
     )
@@ -1063,6 +1066,7 @@ fn validate_flash_mtp() {
     let spec = model.manifest.mtp.clone().expect("Native MTP package");
     assert!(spec.commit_always);
     assert_eq!(spec.default_verification_tokens, 8);
+    assert_eq!(spec.verification_widths(), (2..=8).collect::<Vec<_>>());
     let options = scheduler::Options::default();
     let mut checks = vec![];
     assert!(
@@ -1121,8 +1125,8 @@ fn validate_flash_mtp() {
         let saved = model.execution.snapshot(&plan).unwrap().unwrap();
         for width in spec.verification_widths() {
             let verify = spec.verification_plan(width).unwrap();
-            for accepted in 1..=verify.tokens {
-                let tokens: Vec<u32> = (0..verify.tokens).map(|i| 11 + i as u32 * 71).collect();
+            for accepted in 1..=width {
+                let tokens: Vec<u32> = (0..width).map(|i| 11 + i as u32 * 71).collect();
                 let mut expected = None;
                 let mut expected_tokens = None;
                 for variant in 0..2 {
@@ -1141,9 +1145,9 @@ fn validate_flash_mtp() {
                             &req.history[..req.history.len() - 1],
                         )
                         .unwrap();
-                    model.upload_segment_controls(verify.tokens).unwrap();
+                    model.upload_segment_controls(width).unwrap();
                     model
-                        .launch_rows(&verify.program, verify.tokens, ExecutionPhase::Decode)
+                        .launch_rows(&verify.program, width, ExecutionPhase::Decode)
                         .unwrap();
                     let predicted = model
                         .read_controls(&spec.verification_tokens, accepted)
@@ -1152,11 +1156,7 @@ fn validate_flash_mtp() {
                         .upload_ids(&spec.accepted_inputs, &[accepted as u32])
                         .unwrap();
                     model
-                        .launch_rows(
-                            &verify.restore_program,
-                            verify.tokens,
-                            ExecutionPhase::Decode,
-                        )
+                        .launch_rows(&verify.restore_program, width, ExecutionPhase::Decode)
                         .unwrap();
                     model
                         .upload_ids(&model.manifest.position, &[(start + accepted) as u32])
@@ -1195,7 +1195,7 @@ fn validate_flash_mtp() {
                         assert_eq!(
                             &actual, reference,
                             "Rejected suffix changed committed state: start {start}, width {}, accepted {accepted}",
-                            verify.tokens
+                            width
                         );
                         assert_eq!(expected_tokens.as_ref().unwrap(), &predicted);
                     } else {
@@ -1203,7 +1203,7 @@ fn validate_flash_mtp() {
                         expected_tokens = Some(predicted);
                     }
                 }
-                checks.push(json!({"start":start,"verification":verify.tokens,"accepted_inputs":accepted,"target_state_count":state_names.len(),"rejected_suffix_isolation":true}));
+                checks.push(json!({"start":start,"verification":width,"accepted_inputs":accepted,"target_state_count":state_names.len(),"rejected_suffix_isolation":true}));
             }
         }
         model.execution.release_snapshot(saved).unwrap();

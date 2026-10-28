@@ -153,10 +153,11 @@ impl Controller {
         self.retain_key(key);
         let cohort = self.cohorts.entry(key).or_default();
         let arm = cohort.arms.entry(width).or_default();
-        if matches!(
+        if (matches!(
             self.single_policy,
             SinglePolicy::Explore | SinglePolicy::ExploreLocal
-        ) && key.batch == 1
+        ) || (self.single_policy == SinglePolicy::Auto && width > 1))
+            && key.batch == 1
             && key.prefill == 0
             && arm.trials == 1
         {
@@ -247,7 +248,15 @@ impl Controller {
                 continue;
             }
             let arm = cohort.arms.get(&candidate.width);
-            let seconds = arm.map_or(candidate.prior_seconds, |a| a.time.upper());
+            // The first call may pay module/Graph setup. Give the cheapest
+            // single-request depth one warm measurement before judging it.
+            let warm_bootstrap =
+                single && Some(candidate.width) == bootstrap && arm.is_some_and(|a| a.trials == 1);
+            let seconds = if warm_bootstrap {
+                candidate.prior_seconds
+            } else {
+                arm.map_or(candidate.prior_seconds, |a| a.time.upper())
+            };
             if !seconds.is_finite() || seconds <= 0. || seconds > slack {
                 continue;
             }
@@ -267,9 +276,10 @@ impl Controller {
             // time credit; a short cohort cannot afford a free sweep of all arms.
             // Include cold priors in credit_cap so pessimistic estimates never
             // permanently prevent discovering a profitable depth.
-            let initial = samples == 0
-                && (Some(candidate.width) == bootstrap
-                    || candidate.prior_seconds / candidate.expected_tokens < baseline);
+            let initial = warm_bootstrap
+                || (samples == 0
+                    && (Some(candidate.width) == bootstrap
+                        || candidate.prior_seconds / candidate.expected_tokens < baseline));
             let promising = samples < 3 && score < baseline * 1.1;
             let stale = arm.is_some_and(|a| cohort.calls.saturating_sub(a.last_trial) >= 32);
             // Cheap stale losers must not repeatedly consume all credit before
@@ -360,6 +370,40 @@ mod tests {
         c.observe(key(1), 3, 0.03, 2);
         assert_eq!(c.cohorts[&key(1)].arms[&3].time.samples, 2);
         assert!((c.cohorts[&key(1)].arms[&3].time.mean - 0.03).abs() < 1e-9);
+    }
+    #[test]
+    fn auto_rechecks_cheapest_single_depth_after_cold_start() {
+        for (cold_seconds, warm_seconds) in [(0.2, 0.03), (0.8, 0.03), (0.2, 0.08)] {
+            let mut c = Controller::default();
+            for _ in 0..3 {
+                c.observe(key(1), 1, 0.025, 1);
+            }
+            let plans = [
+                Candidate {
+                    width: 2,
+                    expected_tokens: 1.5,
+                    prior_seconds: 0.06,
+                },
+                Candidate {
+                    width: 3,
+                    expected_tokens: 1.7,
+                    prior_seconds: 0.09,
+                },
+            ];
+            assert_eq!(c.choose(key(1), &plans, 0.025, 0.4), Some((2, true)));
+            c.observe(key(1), 2, cold_seconds, 1);
+            assert_eq!(c.choose(key(1), &plans, 0.025, 0.04), None);
+            assert_eq!(c.choose(key(1), &plans, 0.025, 0.4), Some((2, true)));
+            c.observe(key(1), 2, warm_seconds, 2);
+            let time = c.cohorts[&key(1)].arms[&2].time;
+            assert_eq!(time.samples, 1);
+            assert!((time.mean - warm_seconds).abs() < 1e-9);
+            assert_eq!(
+                c.choose(key(1), &plans, 0.025, 0.4),
+                (warm_seconds == 0.03).then_some((2, true))
+            );
+            assert!(!c.cohorts[&key(1)].arms.contains_key(&3));
+        }
     }
     #[test]
     fn single_local_acceptance_does_not_inherit_another_prompts_rejection_rate() {
@@ -486,6 +530,8 @@ mod tests {
                 prior_seconds: 0.2,
             },
         ];
+        assert_eq!(c.choose(k, &plans, 0.02, 1.), Some((2, true)));
+        c.observe(k, 2, 0.04, 1);
         assert_eq!(c.choose(k, &plans, 0.02, 1.), Some((2, true)));
         c.observe(k, 2, 0.04, 1);
         for _ in 0..20 {
