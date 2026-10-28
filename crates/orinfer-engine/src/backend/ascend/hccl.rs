@@ -22,6 +22,7 @@ struct Api {
     destroy: unsafe extern "C" fn(Handle) -> i32,
     async_error: unsafe extern "C" fn(Handle, *mut i32) -> i32,
     reduce: unsafe extern "C" fn(Handle, Handle, u64, i32, i32, Handle, Handle) -> i32,
+    gather: unsafe extern "C" fn(Handle, Handle, u64, i32, Handle, Handle) -> i32,
     exchange: unsafe extern "C" fn(
         *const c_void,
         *const c_void,
@@ -66,6 +67,7 @@ impl Api {
                     .get(b"HcclGetCommAsyncError\0")
                     .map_err(|e| e.to_string())?,
                 reduce: *library.get(b"HcclAllReduce\0").map_err(|e| e.to_string())?,
+                gather: *library.get(b"HcclAllGather\0").map_err(|e| e.to_string())?,
                 exchange: *library.get(b"HcclAlltoAllV\0").map_err(|e| e.to_string())?,
                 _library: library,
             }))
@@ -342,6 +344,64 @@ impl Communicator {
                 },
             )
         }
+    }
+    pub fn all_gather(
+        &self,
+        session: &Session,
+        source: &Buffer,
+        destination: &Buffer,
+        count: u64,
+        element: Element,
+    ) -> Result<Ticket> {
+        self.validate(session, source, destination)?;
+        let bytes = count
+            .checked_mul(element.bytes())
+            .ok_or("HCCL gather byte size overflow")?;
+        let output = bytes
+            .checked_mul(u64::from(self.ranks))
+            .ok_or("HCCL gather output overflow")?;
+        if source.overlaps(destination)
+            || count == 0
+            || bytes > source.bytes() as u64
+            || output > destination.bytes() as u64
+        {
+            return Err("HCCL AllGather requires disjoint spans with valid extents".into());
+        }
+        let comm = self.clone();
+        // SAFETY: Same-context, disjoint spans and element extents are checked;
+        // the completion retains the communicator and both device allocations.
+        unsafe {
+            session.submit_compute(
+                vec![],
+                Box::new((self.clone(), source.clone(), destination.clone())),
+                move |stream| comm.gather_on_stream(stream, source, destination, count, element),
+            )
+        }
+    }
+
+    pub(super) fn gather_on_stream(
+        &self,
+        stream: Handle,
+        source: &Buffer,
+        destination: &Buffer,
+        count: u64,
+        element: Element,
+    ) -> Result<()> {
+        // SAFETY: The caller checks spans and retains all owners through the
+        // enclosing completion; a captured graph uses the same stable bindings.
+        self.native.status(
+            unsafe {
+                (self.native.api.gather)(
+                    source.pointer(),
+                    destination.pointer(),
+                    count,
+                    element.native(),
+                    self.native.handle,
+                    stream,
+                )
+            },
+            "HCCL AllGather",
+        )
     }
     /// Submits one validated SUM collective on an explicit stream. Used by
     /// captured segments that replay the collective inside an ACL Graph.

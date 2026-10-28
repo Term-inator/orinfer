@@ -5,6 +5,64 @@ import math
 import tilelang.language as T
 
 
+def gather_quantized_rows(rows, table_rows, width):
+    """Move one complete INT8 activation and its FP32 scale per owner."""
+    if width % 32 or not 0 < table_rows <= 2147483647:
+        raise ValueError("Quantized gather requires aligned width and positive table rows")
+
+    @T.prim_func
+    def main(
+        table: T.Tensor((table_rows, width), "int8"),
+        scales: T.Tensor((table_rows,), "float32"),
+        indices: T.Tensor((rows,), "int32"),
+        out: T.Tensor((rows, width), "int8"),
+        out_scales: T.Tensor((rows,), "float32"),
+        errors: T.Tensor((rows,), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2), is_npu=True) as (cid, vid):
+            a = T.alloc_ub((width,), "int8")
+            zeros = T.alloc_ub((width // 2,), "int16")
+            scale = T.alloc_ub((8,), "float32")
+            flag = T.alloc_ub((8,), "int32")
+            row = cid * 2 + vid
+            if row < rows:
+                index = indices[row]
+                T.reinterpretcast(a, zeros, "int8_t")
+                T.tile.fill(zeros, 0)
+                T.tile.fill(scale, 0.0)
+                if index >= 0 and index < table_rows:
+                    T.copy(table[index, :], a)
+                    T.copy(scales[index : index + 1], scale[:1])
+                T.copy(a, out[row, :])
+                T.copy(scale[:1], out_scales[row : row + 1])
+                flag[0] = T.if_then_else(index < -1 or index >= table_rows, 1, 0)
+                T.copy(flag[:1], errors[row : row + 1])
+
+    return main
+
+
+def gather_columns(rows, width, ranks=8):
+    """Convert rank-major AllGather output into row-major concatenated columns."""
+    if width % ranks or (width // ranks) % 16:
+        raise ValueError("Gathered columns must have aligned, equal rank partitions")
+    local = width // ranks
+
+    @T.prim_func
+    def main(
+        gathered: T.Tensor((ranks, rows, local), "bfloat16"),
+        out: T.Tensor((rows, width), "bfloat16"),
+    ):
+        with T.Kernel(T.ceildiv(rows * ranks, 2), is_npu=True) as (cid, vid):
+            data = T.alloc_ub((local,), "bfloat16")
+            index = cid * 2 + vid
+            row, rank = index // ranks, index % ranks
+            if row < rows:
+                T.copy(gathered[rank, row, :], data)
+                T.copy(data, out[row, rank * local : (rank + 1) * local])
+
+    return main
+
+
 def gather_rows(rows, table_rows, width, dtype="bfloat16", index_dtype="int64"):
     if table_rows > 2147483647:
         raise ValueError("A2 row table exceeds signed 32-bit addressing")

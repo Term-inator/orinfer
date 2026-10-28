@@ -1,10 +1,12 @@
 //! Stable-address ACL Graph resources with retained native operation owners.
+mod branches;
 use super::{
     api::Handle,
     check,
     runtime::{Context, Session, Ticket},
 };
 use crate::artifact::Result;
+pub(super) use branches::Branches;
 use std::{any::Any, cell::RefCell, ptr, rc::Rc};
 struct Api {
     begin: unsafe extern "C" fn(Handle, i32) -> i32,

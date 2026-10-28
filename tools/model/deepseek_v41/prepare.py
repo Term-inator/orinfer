@@ -3,6 +3,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
+import hashlib
 import inspect
 import json
 import os
@@ -108,6 +109,10 @@ class Checkpoint:
 
 
 def tensor_names(weight):
+    if weight.get("kind") == "shared":
+        suffix = "weight_scale" if weight["plane"] == "scale" else "weight"
+        parts = ("w2",) if weight["plane"] == "down" else ("w1", "w3")
+        return [f"{weight['prefix']}.{part}.{suffix}" for part in parts]
     names = []
     suffix = {"packed": "weight", "scale": "weight_scale", "assist": "scale_bias"}[weight["plane"]]
     for expert in weight["experts"]:
@@ -150,6 +155,30 @@ def convert(weight, checkpoint, transpose):
     return bank
 
 
+def convert_shared(weight, checkpoint):
+    rank, prefix, plane = weight["rank"], weight["prefix"], weight["plane"]
+    if not 0 <= rank < 8:
+        raise ValueError("Shared-expert rank must be within TP8")
+    if plane == "down":
+        data = checkpoint.read(prefix + ".w2.weight", "I8")
+        if data.ndim != 2 or data.shape[1] % 8:
+            raise ValueError("Shared down projection cannot be partitioned over TP8")
+        local = data.shape[1] // 8
+        return data[:, rank * local : (rank + 1) * local].copy()
+    if plane not in ("up", "scale"):
+        raise ValueError("Unknown shared-expert bank plane")
+    kind, suffix = ("F32", "weight_scale") if plane == "scale" else ("I8", "weight")
+    gate = checkpoint.read(prefix + ".w1." + suffix, kind)
+    up = checkpoint.read(prefix + ".w3." + suffix, kind, gate.shape)
+    if gate.ndim != 2 or gate.shape[0] % 8 or (plane == "scale" and gate.shape[1] != 1):
+        raise ValueError("Shared gate/up projection cannot be partitioned over TP8")
+    local = gate.shape[0] // 8
+    bank = np.concatenate(
+        (gate[rank * local : (rank + 1) * local], up[rank * local : (rank + 1) * local])
+    )
+    return bank.reshape(-1) if plane == "scale" else bank
+
+
 def prepare(plan, model_dir, output, workers):
     start = time.perf_counter()
     base = plan.resolve().parent
@@ -166,6 +195,14 @@ def prepare(plan, model_dir, output, workers):
         for definition in rank["buffers"]
         if definition.get("weight", {}).get("kind") == "w4"
     ]
+    # Keep W4 job order and converter identity stable so existing physical
+    # banks resume without retransposing or rewriting their payloads.
+    jobs += [
+        (rank["rank"], definition)
+        for rank in model["ranks"]
+        for definition in rank["buffers"]
+        if definition.get("weight", {}).get("kind") == "shared"
+    ]
     names = {name for _, definition in jobs for name in tensor_names(definition["weight"])}
     checkpoint = Checkpoint(model_dir, model["index"]["file"], names)
     converter = {
@@ -178,13 +215,19 @@ def prepare(plan, model_dir, output, workers):
         index, (rank, definition) = indexed_job
         weight = definition["weight"]
         source_files = sorted({checkpoint.index[n] for n in tensor_names(weight)})
+        shared = weight["kind"] == "shared"
         identity = {
-            "converter": converter,
+            "converter": {"layout_version": 1, "transform": inspect.getsource(convert_shared)}
+            if shared
+            else converter,
             "weight": weight,
             "model_index": model["index"],
             "source_files": {f: checkpoint.signatures[f] for f in source_files},
         }
-        manifest = manifests / f"r{rank}-b{index:04}.json"
+        shared_key = hashlib.sha256(json.dumps(weight, sort_keys=True).encode()).hexdigest()
+        manifest = manifests / (
+            f"r{rank}-shared-{shared_key}.json" if shared else f"r{rank}-b{index:04}.json"
+        )
         target = None
         if manifest.exists():
             record = json.loads(manifest.read_text())
@@ -196,7 +239,11 @@ def prepare(plan, model_dir, output, workers):
                     target = candidate
         reused = target is not None
         if not reused:
-            bank = convert(weight, checkpoint, transpose)
+            bank = (
+                convert_shared(weight, checkpoint)
+                if shared
+                else convert(weight, checkpoint, transpose)
+            )
             data = memoryview(bank).cast("B")
             if len(data) != definition["bytes"]:
                 raise ValueError("Prepared weight extent differs from execution plan")

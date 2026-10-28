@@ -21,6 +21,7 @@ struct Rank {
     rank: u32,
     device: u32,
     all_reduce_verified: bool,
+    all_gather_verified: bool,
     all_to_all_v_verified: bool,
     initialize_ms: f64,
 }
@@ -91,7 +92,7 @@ pub fn run(devices: &[u32]) -> Result<Report> {
     })?;
     Ok(Report {
         ranks,
-        scope: "Native HCCL AllReduce and variable-count AlltoAllV across device contexts; no model execution",
+        scope: "Native HCCL AllReduce, AllGather and variable-count AlltoAllV across device contexts; no model execution",
     })
 }
 fn count(source: u32, destination: u32) -> u64 {
@@ -129,6 +130,17 @@ fn validate_rank(session: &Session, root: &RootInfo, rank: u32, device: u32) -> 
     {
         return Err(format!("HCCL AllReduce mismatch on rank {rank}"));
     }
+    let gathered = session.allocate(128 * root.ranks() as usize)?;
+    comm.all_gather(session, &a, &gathered, 32, Element::Float32)?
+        .wait()?;
+    let actual = values(&session.download(&gathered, 0, gathered.bytes())?);
+    if actual
+        .iter()
+        .enumerate()
+        .any(|(i, &v)| v != (i / 32 + 1) as f32)
+    {
+        return Err(format!("HCCL AllGather mismatch on rank {rank}"));
+    }
     let sends: Vec<u64> = (0..root.ranks()).map(|peer| count(rank, peer)).collect();
     let receives: Vec<u64> = (0..root.ranks()).map(|peer| count(peer, rank)).collect();
     let send = Counts::new(sends)?;
@@ -159,6 +171,7 @@ fn validate_rank(session: &Session, root: &RootInfo, rank: u32, device: u32) -> 
         rank,
         device,
         all_reduce_verified: true,
+        all_gather_verified: true,
         all_to_all_v_verified: true,
         initialize_ms,
     })

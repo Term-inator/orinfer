@@ -307,6 +307,19 @@ pub struct GroupedW4A8 {
     last: RefCell<Option<Ticket>>,
 }
 impl GroupedW4A8 {
+    pub(super) fn branch_accesses(&self) -> Vec<(Buffer, bool)> {
+        self.prepared
+            ._lists
+            .iter()
+            .flat_map(|list| list._buffers.iter())
+            .chain(std::iter::once(&self.prepared._groups.buffer))
+            .chain(self.prepared.workspace.iter())
+            // ACLNN transforms A8 in place. Conservatively treat every retained
+            // span as writable when checking independence between branches.
+            .cloned()
+            .map(|buffer| (buffer, true))
+            .collect()
+    }
     pub fn prepare(
         session: &Session,
         shape: GroupedShape,

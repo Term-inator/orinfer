@@ -1,0 +1,117 @@
+"""Bounded Cube QK/PV with FP32 masked softmax and BF16 probabilities."""
+
+import tilelang.language as T
+
+
+def qk(rows, heads, selected, dimension=512, tile_s=64):
+    if not 0 < heads <= 16 or selected % tile_s or dimension % 128:
+        raise ValueError("Cube attention requires H<=16, S%tile_s=0 and D%128=0")
+    blocks = selected // tile_s
+
+    @T.prim_func
+    def main(
+        query: T.Tensor((rows, heads, dimension), "bfloat16"),
+        kv: T.Tensor((rows, selected, dimension), "bfloat16"),
+        scores: T.Tensor((rows, 16, selected), "float32"),
+    ):
+        with T.Kernel(rows * blocks, is_npu=True) as (cid, vid):
+            row, tile = cid // blocks, cid % blocks
+            with T.Scope("C"):
+                a = T.alloc_L1((16, 128), "bfloat16")
+                b = T.alloc_L1((tile_s, 128), "bfloat16")
+                c = T.alloc_L0C((16, tile_s), "float32")
+                for k in T.serial(dimension // 128):
+                    T.copy(query[row, :, k * 128 : (k + 1) * 128], a[:heads, :])
+                    T.copy(kv[row, tile * tile_s : (tile + 1) * tile_s, k * 128 : (k + 1) * 128], b)
+                    T.gemm_v0(a, b, c, transpose_B=True, init=(k == 0))
+                T.copy(c, scores[row, :, tile * tile_s : (tile + 1) * tile_s])
+
+    return main
+
+
+def softmax(rows, heads, selected, dimension=512):
+    if not 0 < heads <= 16 or selected % 64:
+        raise ValueError("Cube softmax requires H<=16 and S%64=0")
+
+    @T.prim_func
+    def main(
+        scores: T.Tensor((rows, 16, selected), "float32"),
+        indices: T.Tensor((rows, selected), "int32"),
+        sink: T.Tensor((heads,), "float32"),
+        probabilities: T.Tensor((rows, 16, selected), "bfloat16"),
+    ):
+        with T.Kernel(T.ceildiv(rows * heads, 2), is_npu=True) as (cid, vid):
+            x = T.alloc_ub((1, selected), "float32")
+            ids = T.alloc_ub((1, selected), "int32")
+            valid = T.alloc_ub((1, selected), "float32")
+            mask = T.alloc_ub((selected // 8,), "uint8")
+            maximum = T.alloc_ub((1, 1), "float32")
+            denominator = T.alloc_ub((1, 1), "float32")
+            sink_value = T.alloc_ub((1, 1), "float32")
+            p = T.alloc_ub((1, selected), "bfloat16")
+            index = cid * 2 + vid
+            row, head = index // heads, index % heads
+            if row < rows:
+                T.copy(scores[row, head, :], x)
+                T.copy(indices[row, :], ids)
+                T.tile.cast(valid, ids, "CAST_NONE", selected)
+                T.tile.compare(mask, valid, -1.0, "GT")
+                T.tile.mul(x, x, dimension**-0.5)
+                T.tile.select(x, mask, x, -T.infinity("float32"), "VSEL_TENSOR_SCALAR_MODE")
+                T.reduce_max(x, maximum, dim=1)
+                sink_value[0, 0] = sink[head]
+                T.tile.max(maximum, maximum, sink_value)
+                T.tile.sub(x, x, maximum[0, 0])
+                T.tile.exp(x, x)
+                T.reduce_sum(x, denominator, dim=1)
+                T.tile.sub(sink_value, sink_value, maximum)
+                T.tile.exp(sink_value, sink_value)
+                T.tile.add(denominator, denominator, sink_value)
+                T.tile.div(x, x, denominator[0, 0])
+                T.tile.cast(p, x, "CAST_RINT", selected)
+                T.copy(p, probabilities[row, head, :])
+
+    return main
+
+
+def pv(rows, heads, selected, dimension=512, tile_d=32):
+    if not 0 < heads <= 16 or selected % 128 or dimension % tile_d:
+        raise ValueError("Cube PV requires H<=16, S%128=0 and D%tile_d=0")
+    blocks = dimension // tile_d
+
+    @T.prim_func
+    def main(
+        probabilities: T.Tensor((rows, 16, selected), "bfloat16"),
+        kv: T.Tensor((rows, selected, dimension), "bfloat16"),
+        output: T.Tensor((rows, heads, dimension), "bfloat16"),
+        workspace: T.Tensor((rows, 16, dimension), "float32"),
+    ):
+        with T.Kernel(rows * blocks, is_npu=True) as (cid, vid):
+            row, tile = cid // blocks, cid % blocks
+            with T.Scope("C"):
+                a = T.alloc_L1((16, 128), "bfloat16")
+                b = T.alloc_L1((128, tile_d), "bfloat16")
+                c = T.alloc_L0C((16, tile_d), "float32")
+                for k in T.serial(selected // 128):
+                    T.copy(probabilities[row, :, k * 128 : (k + 1) * 128], a)
+                    T.copy(kv[row, k * 128 : (k + 1) * 128, tile * tile_d : (tile + 1) * tile_d], b)
+                    T.gemm_v0(a, b, c, init=(k == 0))
+                T.copy(c, workspace[row, :, tile * tile_d : (tile + 1) * tile_d])
+                T.set_cross_flag("FIX", 0)
+            with T.Scope("V"):
+                x = T.alloc_ub((8, tile_d), "float32")
+                y = T.alloc_ub((8, tile_d), "bfloat16")
+                start = vid * 8
+                T.wait_cross_flag(0)
+                if start < heads:
+                    valid = T.min(8, heads - start)
+                    T.copy(
+                        workspace[row, start : start + 8, tile * tile_d : (tile + 1) * tile_d], x
+                    )
+                    T.tile.cast(y, x, "CAST_RINT", 8 * tile_d)
+                    T.copy(
+                        y[:valid, :],
+                        output[row, start : start + valid, tile * tile_d : (tile + 1) * tile_d],
+                    )
+
+    return main

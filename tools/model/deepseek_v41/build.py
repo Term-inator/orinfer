@@ -7,6 +7,7 @@ full coverage within the initial <=16384-position single-stream scope.
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 import importlib
 import json
 import math
@@ -18,7 +19,15 @@ import numpy as np
 import torch
 
 from tools.build.files import atomic_json, file_hash
-from tools.operators.ascend import attention, compressor, dense, engram, indexer, memory
+from tools.operators.ascend import (
+    attention,
+    attention_cube,
+    compressor,
+    dense,
+    engram,
+    indexer,
+    memory,
+)
 from tools.operators.ascend import model_ops, moe, routing, topk, vector
 from tools.operators.ascend.build import compile_kernel, operand
 
@@ -40,16 +49,33 @@ DECODE_COLUMN_TILES = {
     (True, 5120, 2304): 256,
     (False, 5120, 1024): 128,
     (False, 25600, 6144): 128,
+    (False, 3200, 6144): 128,
+    (True, 576, 5120): 32,
+    (True, 5120, 288): 128,
 }
 
 
+@dataclass(frozen=True)
+class Strategy:
+    shared_tp: bool = False
+    cube_attention: bool = False
+    parallel: bool = False
+    fusion: bool = False
+    engram_tp: bool = False
+
+
+OPTIMIZED = Strategy(True, True, True, True, True)
+
+
 class Builder:
-    def __init__(self, output, rank, capacity, kernels):
+    def __init__(self, output, rank, capacity, kernels, strategy=None):
         self.output, self.rank, self.capacity = output, rank, capacity
         self.kernels = kernels
         self.buffers, self.by_name, self.types = [], {}, {}
         self.prefix = ""
         self.steps = []
+        self.strategy = strategy or Strategy()
+        self.ready_collapsed = None
 
     def buffer(self, name, shape, dtype, **source):
         size = math.prod(shape) * DTYPE[dtype][1]
@@ -239,8 +265,12 @@ class Builder:
                 "output": n,
                 "reduction": k,
                 "integer": integer,
-                "block_k": math.gcd(k, 512) if rows == 1 else 128,
-                "tile_n": DECODE_COLUMN_TILES.get((integer, n, k), 64) if rows == 1 else 64,
+                "block_k": 288
+                if integer and k == 288
+                else (512 if integer and n == 576 else (math.gcd(k, 512) if rows == 1 else 128)),
+                "tile_n": DECODE_COLUMN_TILES.get((integer, n, k), 64)
+                if rows == 1 or (integer and (k == 288 or n == 576))
+                else 64,
             },
             [
                 ("activation", x, "i8" if integer else "bf16", (rows, k), "read"),
@@ -396,6 +426,8 @@ class Builder:
         next_mix = self.temp("pre.b" if incoming.endswith("pre.a") else "pre.a", (rows, 8), "f32")
         post = self.temp("hc.post", (rows, 8), "f32")
         combination = self.temp("hc.combination", (rows, 16), "f32")
+        if self.strategy.parallel:
+            self.steps.append({"op": "fork"})
         self.kernel(
             vector,
             "mhc_prenorm_partials",
@@ -428,34 +460,48 @@ class Builder:
                 ("combination", combination, "f32", (rows, 16), "write"),
             ],
         )
+        if self.strategy.parallel:
+            self.steps.append({"op": "switch"})
         x = self.temp("collapsed", (rows, 5120))
-        self.kernel(
-            vector,
-            "mhc_pre_apply",
-            {"rows": rows, "width": 5120},
-            [
-                ("residual", current, "bf16", (rows, 4, 5120), "read"),
-                ("mix", incoming, "f32", (rows, 8), "read"),
-                ("out", x, "bf16", (rows, 5120), "write"),
-            ],
-        )
+        if self.ready_collapsed != (current, incoming):
+            self.kernel(
+                vector,
+                "mhc_pre_apply",
+                {"rows": rows, "width": 5120},
+                [
+                    ("residual", current, "bf16", (rows, 4, 5120), "read"),
+                    ("mix", incoming, "f32", (rows, 8), "read"),
+                    ("out", x, "bf16", (rows, 5120), "write"),
+                ],
+            )
+        self.ready_collapsed = None
         return x, next_mix, post, combination
 
-    def hc_post(self, x, residual, post, combination):
+    def hc_post(self, x, residual, post, combination, next_mix=None):
         out = self.temp(
             "residual.b" if residual.endswith("residual.a") else "residual.a", (self.rows, 4, 5120)
         )
+        operands = [
+            ("layer", x, "bf16", (self.rows, 5120), "read"),
+            ("residual", residual, "bf16", (self.rows, 4, 5120), "read"),
+            ("post", post, "f32", (self.rows, 8), "read"),
+            ("combination", combination, "f32", (self.rows, 16), "read"),
+            ("out", out, "bf16", (self.rows, 4, 5120), "write"),
+        ]
+        if next_mix is not None:
+            collapsed = self.temp("collapsed", (self.rows, 5120))
+            operands.extend(
+                [
+                    ("mix", next_mix, "f32", (self.rows, 8), "read"),
+                    ("collapsed", collapsed, "bf16", (self.rows, 5120), "write"),
+                ]
+            )
+            self.ready_collapsed = (out, next_mix)
         self.kernel(
             vector,
-            "mhc_post",
+            "mhc_post_pre" if next_mix is not None else "mhc_post",
             {"rows": self.rows, "width": 5120},
-            [
-                ("layer", x, "bf16", (self.rows, 5120), "read"),
-                ("residual", residual, "bf16", (self.rows, 4, 5120), "read"),
-                ("post", post, "f32", (self.rows, 8), "read"),
-                ("combination", combination, "f32", (self.rows, 16), "read"),
-                ("out", out, "bf16", (self.rows, 4, 5120), "write"),
-            ],
+            operands,
         )
         return out
 
@@ -479,13 +525,43 @@ class Builder:
                 ("out", lookup, "bf16", (rows * 24, 256), "write"),
             ],
         )
-        projected = self.projection(
-            lookup,
-            self.matrix(prefix + ".wkv.weight", "bf16", 25600, 6144),
-            25600,
-            6144,
-            "engram.projected",
-        )
+        if self.strategy.engram_tp:
+            local = self.projection(
+                lookup,
+                self.matrix(prefix + ".wkv.weight", "bf16", 3200, 6144, first_row=self.rank * 3200),
+                3200,
+                6144,
+                "engram.local",
+            )
+            projected = self.temp("engram.projected", (rows, 25600))
+            gathered = projected if rows == 1 else self.temp("engram.gathered", (8, rows, 3200))
+            self.steps.append(
+                {
+                    "op": "gather",
+                    "source": local,
+                    "destination": gathered,
+                    "elements": rows * 3200,
+                    "fp32": False,
+                }
+            )
+            if rows != 1:
+                self.kernel(
+                    memory,
+                    "gather_columns",
+                    {"rows": rows, "width": 25600},
+                    [
+                        ("gathered", gathered, "bf16", (8, rows, 3200), "read"),
+                        ("out", projected, "bf16", (rows, 25600), "write"),
+                    ],
+                )
+        else:
+            projected = self.projection(
+                lookup,
+                self.matrix(prefix + ".wkv.weight", "bf16", 25600, 6144),
+                25600,
+                6144,
+                "engram.projected",
+            )
         key = self.temp("engram.key", (rows, 20480))
         value = self.temp("engram.value", (rows, 5120))
         self.kernel(
@@ -538,6 +614,17 @@ class Builder:
         )
         return out
 
+    def attention_kv(self, quant, scales, layer, cosine, sine, slots):
+        prefix = f"layers.{layer}.attn"
+        kv = self.w8(quant, scales, prefix + ".wkv", 512, 5120, "kv")
+        kv, _ = self.norm(
+            kv, self.matrix(prefix + ".kv_norm.weight", "f32", 512, 1), 512, "kv.normalized"
+        )
+        kv = self.rope(kv, 1, 512, cosine, sine, "kv.rope")
+        swa = self.buffer(f"cache.swa.{layer}", (self.capacity, 512), "bf16")
+        self.scatter(kv, slots, swa, 512, self.capacity)
+        return swa
+
     def attention(self, x, layer, coordinates, reset):
         rows, capacity = self.rows, self.capacity
         prefix = f"layers.{layer}.attn"
@@ -545,19 +632,20 @@ class Builder:
         cosine = coordinates["long_cos" if compressed else "base_cos"]
         sine = coordinates["long_sin" if compressed else "base_sin"]
         quant, scales = self.quant(x, 5120)
+        if self.strategy.parallel:
+            self.steps.append({"op": "fork"})
+            swa = self.attention_kv(quant, scales, layer, cosine, sine, coordinates["slots"])
+            self.steps.append({"op": "switch"})
         qa = self.w8(quant, scales, prefix + ".wq_a", 1280, 5120, "q.a")
         q8, qs = self.norm_quant(
             qa, self.matrix(prefix + ".q_norm.weight", "f32", 1280, 1), 1280, "q.norm.quant"
         )
         query = self.w8(q8, qs, prefix + ".wq_b", 4096, 1280, "q.b", first=self.rank * 4096)
         query = self.rope(query, 8, 512, cosine, sine, "q.rope")
-        kv = self.w8(quant, scales, prefix + ".wkv", 512, 5120, "kv")
-        kv, _ = self.norm(
-            kv, self.matrix(prefix + ".kv_norm.weight", "f32", 512, 1), 512, "kv.normalized"
-        )
-        kv = self.rope(kv, 1, 512, cosine, sine, "kv.rope")
-        swa = self.buffer(f"cache.swa.{layer}", (capacity, 512), "bf16")
-        self.scatter(kv, coordinates["slots"], swa, 512, capacity)
+        if self.strategy.parallel:
+            self.steps.append({"op": "join"})
+        else:
+            swa = self.attention_kv(quant, scales, layer, cosine, sine, coordinates["slots"])
         source = max((s for s in (2, 8, 14, 20) if s <= layer), default=2)
         ratio = 2 if source < 20 else 1
         compressed_capacity = capacity // ratio
@@ -697,18 +785,56 @@ class Builder:
         )
         attended = self.temp("attention.output", (rows, 8, 512))
         sink = self.matrix(prefix + ".attn_sink", "f32", 8, 1, first_row=self.rank * 8)
-        self.kernel(
-            attention,
-            "sparse_attention",
-            {"rows": rows, "heads": 8, "selected": count},
-            [
-                ("query", query, "bf16", (rows, 8, 512), "read"),
-                ("gathered_kv", gathered, "bf16", (rows, count, 512), "read"),
-                ("indices", mask, "i32", (rows, count), "read"),
-                ("sink", sink, "f32", (8,), "read"),
-                ("out", attended, "bf16", (rows, 8, 512), "write"),
-            ],
-        )
+        if self.strategy.cube_attention and rows == 1:
+            score = self.temp(f"attention.cube.score.{count}", (rows, 16, count), "f32")
+            prob = self.temp(f"attention.cube.prob.{count}", (rows, 16, count))
+            scratch = self.temp("attention.cube.workspace", (rows, 16, 512), "f32")
+            parameters = {"rows": rows, "heads": 8, "selected": count}
+            self.kernel(
+                attention_cube,
+                "qk",
+                parameters,
+                [
+                    ("query", query, "bf16", (rows, 8, 512), "read"),
+                    ("kv", gathered, "bf16", (rows, count, 512), "read"),
+                    ("scores", score, "f32", (rows, 16, count), "write"),
+                ],
+            )
+            self.kernel(
+                attention_cube,
+                "softmax",
+                parameters,
+                [
+                    ("scores", score, "f32", (rows, 16, count), "read"),
+                    ("indices", mask, "i32", (rows, count), "read"),
+                    ("sink", sink, "f32", (8,), "read"),
+                    ("probabilities", prob, "bf16", (rows, 16, count), "write"),
+                ],
+            )
+            self.kernel(
+                attention_cube,
+                "pv",
+                parameters,
+                [
+                    ("probabilities", prob, "bf16", (rows, 16, count), "read"),
+                    ("kv", gathered, "bf16", (rows, count, 512), "read"),
+                    ("output", attended, "bf16", (rows, 8, 512), "write"),
+                    ("workspace", scratch, "f32", (rows, 16, 512), "scratch"),
+                ],
+            )
+        else:
+            self.kernel(
+                attention,
+                "sparse_attention",
+                {"rows": rows, "heads": 8, "selected": count},
+                [
+                    ("query", query, "bf16", (rows, 8, 512), "read"),
+                    ("gathered_kv", gathered, "bf16", (rows, count, 512), "read"),
+                    ("indices", mask, "i32", (rows, count), "read"),
+                    ("sink", sink, "f32", (8,), "read"),
+                    ("out", attended, "bf16", (rows, 8, 512), "write"),
+                ],
+            )
         attended = self.rope(attended, 8, 512, cosine, sine, "attention.inverse_rope", inverse=True)
         oa = self.projection(
             attended,
@@ -736,6 +862,37 @@ class Builder:
         )
         return reduced
 
+    def shared_expert(self, quant, scale, layer):
+        prefix = f"layers.{layer}.ffn.shared_experts"
+        if not self.strategy.shared_tp:
+            gate = self.w8(quant, scale, prefix + ".w1", 2304, 5120, "shared.gate")
+            up = self.w8(quant, scale, prefix + ".w3", 2304, 5120, "shared.up")
+            act8, act_scale = self.swiglu_quant(gate, up, 2304, "shared.act.quant")
+            return self.w8(act8, act_scale, prefix + ".w2", 5120, 2304, "shared.output")
+
+        def bank(plane, shape, dtype):
+            return self.buffer(
+                f"w.shared.{layer}.{self.rank}.{plane}",
+                shape,
+                dtype,
+                weight={"kind": "shared", "prefix": prefix, "rank": self.rank, "plane": plane},
+            )
+
+        packed = self.projection(
+            quant,
+            bank("up", (576, 5120), "i8"),
+            576,
+            5120,
+            "shared.packed",
+            True,
+            scale,
+            bank("scale", (576,), "f32"),
+        )
+        act8, act_scale = self.swiglu_packed_quant(packed, 288, "shared.act.quant")
+        down = bank("down", (5120, 288), "i8")
+        down_scale = self.matrix(prefix + ".w2.weight_scale", "f32", 5120, 1)
+        return self.projection(act8, down, 5120, 288, "shared.output", True, act_scale, down_scale)
+
     def ffn(self, x, precise, layer):
         rows = self.rows
         prefix = f"layers.{layer}.ffn"
@@ -762,12 +919,11 @@ class Builder:
             ],
         )
         quant, scale = self.quant(x, 5120)
-        gate = self.w8(quant, scale, prefix + ".shared_experts.w1", 2304, 5120, "shared.gate")
-        up = self.w8(quant, scale, prefix + ".shared_experts.w3", 2304, 5120, "shared.up")
-        act8, act_scale = self.swiglu_quant(gate, up, 2304, "shared.act.quant")
-        shared = self.w8(
-            act8, act_scale, prefix + ".shared_experts.w2", 5120, 2304, "shared.output"
-        )
+        if self.strategy.parallel:
+            self.steps.append({"op": "fork"})
+        shared = self.shared_expert(quant, scale, layer)
+        if self.strategy.parallel:
+            self.steps.append({"op": "switch"})
         expert_rows = rows * 6
         gather = self.temp("expert.gather", (expert_rows,), "i32")
         restore = self.temp("expert.restore", (rows, 8), "i32")
@@ -796,10 +952,28 @@ class Builder:
         gathered = self.temp("expert.input", (expert_rows, 5120), "i8")
         gathered_scale = self.temp("expert.input.scale", (expert_rows,), "f32")
         error = self.temp("expert.gather.errors", (expert_rows,), "i32")
-        for source, destination, width, dtype in [
-            (quant, gathered, 5120, "i8"),
-            (scale, gathered_scale, 1, "f32"),
-        ]:
+        if self.strategy.fusion:
+            self.kernel(
+                memory,
+                "gather_quantized_rows",
+                {"rows": expert_rows, "table_rows": rows, "width": 5120},
+                [
+                    ("table", quant, "i8", (rows, 5120), "read"),
+                    ("scales", scale, "f32", (rows,), "read"),
+                    ("indices", gather, "i32", (expert_rows,), "read"),
+                    ("out", gathered, "i8", (expert_rows, 5120), "write"),
+                    ("out_scales", gathered_scale, "f32", (expert_rows,), "write"),
+                    ("errors", error, "i32", (expert_rows,), "write"),
+                ],
+            )
+        for source, destination, width, dtype in (
+            []
+            if self.strategy.fusion
+            else [
+                (quant, gathered, 5120, "i8"),
+                (scale, gathered_scale, 1, "f32"),
+            ]
+        ):
             self.kernel(
                 memory,
                 "gather_rows",
@@ -879,8 +1053,10 @@ class Builder:
                 "groups": counts,
             }
         )
+        if self.strategy.parallel:
+            self.steps.append({"op": "join"})
         routed = self.temp("expert.local", (rows, 5120), "f32")
-        zeros = self.temp("zero.shared", (rows, 5120))
+        zeros = shared if self.strategy.shared_tp else self.temp("zero.shared", (rows, 5120))
         errors = self.temp("expert.errors", (rows,), "i32")
         self.kernel(
             moe,
@@ -906,20 +1082,37 @@ class Builder:
             }
         )
         output = self.temp("ffn.output", (rows, 5120))
-        self.kernel(
-            model_ops,
-            "add_shared",
-            {"rows": rows, "width": 5120},
-            [
-                ("routed", reduced, "f32", (rows, 5120), "read"),
-                ("shared", shared, "bf16", (rows, 5120), "read"),
-                ("out", output, "bf16", (rows, 5120), "write"),
-            ],
-        )
+        if self.strategy.shared_tp:
+            self.kernel(
+                model_ops,
+                "convert",
+                {
+                    "rows": rows,
+                    "width": 5120,
+                    "source_dtype": "float32",
+                    "destination_dtype": "bfloat16",
+                },
+                [
+                    ("x", reduced, "f32", (rows, 5120), "read"),
+                    ("out", output, "bf16", (rows, 5120), "write"),
+                ],
+            )
+        else:
+            self.kernel(
+                model_ops,
+                "add_shared",
+                {"rows": rows, "width": 5120},
+                [
+                    ("routed", reduced, "f32", (rows, 5120), "read"),
+                    ("shared", shared, "bf16", (rows, 5120), "read"),
+                    ("out", output, "bf16", (rows, 5120), "write"),
+                ],
+            )
         return output
 
     def packet(self, rows):
         self.rows, self.prefix, self.steps = rows, f"m{rows}.", []
+        self.ready_collapsed = None
         coordinates = {}
         for name in ("base_cos", "base_sin", "long_cos", "long_sin", "source_cos", "source_sin"):
             coordinates[name] = self.temp(name, (rows, 32), "f32")
@@ -951,6 +1144,7 @@ class Builder:
         for layer in range(40):
             if layer in (1, 14):
                 current = self.engram(current, layer)
+                self.ready_collapsed = None
             for sublayer in ("attn", "ffn"):
                 x, next_mix, post, combination = self.hc(current, incoming, layer, sublayer)
                 x, precise = self.norm(
@@ -964,21 +1158,31 @@ class Builder:
                     if sublayer == "attn"
                     else self.ffn(x, precise, layer)
                 )
-                current = self.hc_post(output, current, post, combination)
+                if self.strategy.parallel:
+                    self.steps.append({"op": "join"})
+                collapse_next = self.strategy.fusion and not (
+                    sublayer == "ffn" and layer + 1 in (1, 14)
+                )
+                current = self.hc_post(
+                    output, current, post, combination, next_mix if collapse_next else None
+                )
                 incoming = next_mix
             self.steps.append({"op": "snapshot", "name": f"layer{layer:02}", "buffer": current})
         body, self.steps = self.steps, []
-        collapsed = self.temp("final.collapsed", (rows, 5120))
-        self.kernel(
-            vector,
-            "mhc_pre_apply",
-            {"rows": rows, "width": 5120},
-            [
-                ("residual", current, "bf16", (rows, 4, 5120), "read"),
-                ("mix", incoming, "f32", (rows, 8), "read"),
-                ("out", collapsed, "bf16", (rows, 5120), "write"),
-            ],
-        )
+        if self.ready_collapsed == (current, incoming):
+            collapsed = self.temp("collapsed", (rows, 5120))
+        else:
+            collapsed = self.temp("final.collapsed", (rows, 5120))
+            self.kernel(
+                vector,
+                "mhc_pre_apply",
+                {"rows": rows, "width": 5120},
+                [
+                    ("residual", current, "bf16", (rows, 4, 5120), "read"),
+                    ("mix", incoming, "f32", (rows, 8), "read"),
+                    ("out", collapsed, "bf16", (rows, 5120), "write"),
+                ],
+            )
         normalized, _ = self.norm(
             collapsed, self.matrix("norm.weight", "f32", 5120, 1), 5120, "final.norm"
         )
@@ -1061,6 +1265,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--capacity", type=int, default=8448)
     parser.add_argument("--compile-workers", type=int, default=4)
+    parser.add_argument("--strategy", choices=("baseline", "optimized"), default="baseline")
     args = parser.parse_args()
     if not 128 <= args.capacity <= 16384 or args.capacity % 32:
         parser.error("capacity must be divisible by 32, within 128..16384")
@@ -1095,7 +1300,13 @@ def main():
         raise ValueError("Expected repeated block32 Engram rotation")
     kernels, ranks = {}, []
     for rank in range(8):
-        builder = Builder(args.output, rank, args.capacity, kernels)
+        builder = Builder(
+            args.output,
+            rank,
+            args.capacity,
+            kernels,
+            OPTIMIZED if args.strategy == "optimized" else Strategy(),
+        )
         builder.asset("rotation", block.numpy().astype("<f4"), "f32")
         packets = [builder.packet(rows) for rows in (1, 16)]
         ranks.append({"rank": rank, "buffers": builder.buffers, "packets": packets})

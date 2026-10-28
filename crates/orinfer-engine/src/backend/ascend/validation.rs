@@ -6,7 +6,7 @@ use super::{
 };
 use crate::artifact::Result;
 use serde::Serialize;
-use std::time::Instant;
+use std::{rc::Rc, time::Instant};
 
 #[derive(Serialize)]
 pub struct Report {
@@ -17,6 +17,7 @@ pub struct Report {
     transfer_roundtrip_verified: bool,
     changed_input_reuse_verified: bool,
     changed_input_graph_verified: bool,
+    changed_input_branch_graph_verified: bool,
     cases: Vec<Case>,
     scope: &'static str,
 }
@@ -56,6 +57,7 @@ pub fn run(device: u32) -> Result<Report> {
         return Err("Ascend async transfer roundtrip failed".into());
     }
     drop((upload, buffer));
+    branch_graph(&session)?;
     let mut workspace = None;
     let cases = vec![
         matmul(&session, 1, &[1], &mut workspace)?,
@@ -89,9 +91,68 @@ pub fn run(device: u32) -> Result<Report> {
         transfer_roundtrip_verified: true,
         changed_input_reuse_verified: true,
         changed_input_graph_verified: true,
+        changed_input_branch_graph_verified: true,
         cases,
         scope: "Bounded native ACL transfers, grouped W4A8 and changed-input Graph replay; no model or distributed inference",
     })
+}
+
+fn branch_graph(session: &Session) -> Result<()> {
+    let buffers = (0..6)
+        .map(|_| session.allocate(1024))
+        .collect::<Result<Vec<_>>>()?;
+    let retained = buffers.clone();
+    let branches = super::graph::Branches::new(session, &[0, 1], Box::new(retained))?;
+    let replay_branches = Rc::clone(&branches);
+    let b = buffers.clone();
+    let api = session.context.api;
+    // SAFETY: All six buffers, both streams and each event are owned by this
+    // context. The joins order cross-stream reads; Graph retains every owner.
+    let graph = unsafe {
+        super::graph::Graph::capture(
+            session,
+            Box::new((buffers.clone(), branches)),
+            move |main| {
+                let copy = |source: usize, destination: usize, stream| {
+                    super::check(
+                        (api.memcpy)(
+                            b[destination].pointer(),
+                            1024,
+                            b[source].pointer(),
+                            1024,
+                            3,
+                            stream,
+                        ),
+                        "branched ACL Graph D2D copy",
+                    )
+                };
+                let side = replay_branches.fork(0, main)?;
+                let nested = replay_branches.fork(1, side)?;
+                copy(0, 2, nested)?;
+                replay_branches.switch(1)?;
+                copy(0, 1, side)?;
+                replay_branches.join(1, side)?;
+                copy(2, 3, side)?;
+                replay_branches.switch(0)?;
+                copy(0, 4, main)?;
+                replay_branches.join(0, main)?;
+                copy(3, 5, main)
+            },
+        )?
+    };
+    for pass in 0..4 {
+        let source = (0..1024)
+            .map(|i| ((i * 13 + pass * 47) % 251) as u8)
+            .collect::<Vec<_>>();
+        session.upload(&buffers[0], 0, &source)?.wait()?;
+        graph.enqueue(session)?.wait()?;
+        for buffer in &buffers[1..] {
+            if session.download(buffer, 0, 1024)? != source {
+                return Err("Nested ACL Graph fork/join failed after changed input".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn matmul(

@@ -425,6 +425,63 @@ def mhc_post(rows, width):
     return main
 
 
+def mhc_post_pre(rows, width):
+    """Keep the post BF16 boundary, then collapse using the next pre-mix."""
+    block = math.gcd(width, 256)
+    blocks = width // block
+
+    @T.prim_func
+    def main(
+        layer: T.Tensor((rows, width), "bfloat16"),
+        residual: T.Tensor((rows, 4, width), "bfloat16"),
+        post: T.Tensor((rows, 8), "float32"),
+        combination: T.Tensor((rows, 16), "float32"),
+        out: T.Tensor((rows, 4, width), "bfloat16"),
+        mix: T.Tensor((rows, 8), "float32"),
+        collapsed: T.Tensor((rows, width), "bfloat16"),
+    ):
+        with T.Kernel(T.ceildiv(rows, 2) * blocks, is_npu=True) as (cid, vid):
+            xb = T.alloc_ub((4, block), "bfloat16")
+            lb = T.alloc_ub((block,), "bfloat16")
+            x = T.alloc_ub((4, block), "float32")
+            l = T.alloc_ub((block,), "float32")
+            p = T.alloc_ub((8,), "float32")
+            c = T.alloc_ub((16,), "float32")
+            temporary = T.alloc_ub((block,), "float32")
+            a = T.alloc_ub((block,), "float32")
+            term = T.alloc_ub((block,), "float32")
+            y = T.alloc_ub((block,), "bfloat16")
+            weights = T.alloc_ub((8,), "float32")
+            weighted = T.alloc_ub((4, block), "float32")
+            row, column = cid // blocks * 2 + vid, cid % blocks * block
+            if row < rows:
+                T.copy(residual[row, :, column : column + block], xb)
+                T.copy(layer[row, column : column + block], lb)
+                T.copy(post[row, :], p)
+                T.copy(mix[row, :], weights)
+                T.copy(combination[row, :], c)
+                T.tile.cast(x, xb, "CAST_NONE", 4 * block)
+                T.tile.cast(l, lb, "CAST_NONE", block)
+                for path in T.serial(4):
+                    T.tile.mul(a, x[0, :], c[path])
+                    for source in T.serial(1, 4):
+                        T.tile.mul(temporary, x[source, :], c[source * 4 + path])
+                        T.tile.add(a, a, temporary)
+                    T.tile.mul(term, l, p[path])
+                    T.tile.add(a, term, a)
+                    T.tile.cast(y, a, "CAST_RINT", block)
+                    T.copy(y, out[row, path, column : column + block])
+                    T.tile.cast(weighted[path, :], y, "CAST_NONE", block)
+                    T.tile.mul(weighted[path, :], weighted[path, :], weights[path])
+                T.tile.add(a, weighted[0, :], weighted[1, :])
+                T.tile.add(a, a, weighted[2, :])
+                T.tile.add(a, a, weighted[3, :])
+                T.tile.cast(y, a, "CAST_RINT", block)
+                T.copy(y, collapsed[row, column : column + block])
+
+    return main
+
+
 def mhc_prenorm_partials(rows, width, splits=8, lanes=32):
     """FP32 fn arithmetic, split over K; no BF16 approximation of HC weights.
 

@@ -285,6 +285,13 @@ impl Kernel {
     pub fn spec(&self) -> &Spec {
         &self.bound.template.spec
     }
+    pub(super) fn accesses(&self) -> impl Iterator<Item = (&Buffer, bool)> {
+        self.bound
+            .buffers
+            .iter()
+            .zip(&self.bound.template.spec.operands)
+            .map(|(buffer, operand)| (buffer, operand.access.writes()))
+    }
     pub fn template(&self) -> &Rc<Template> {
         &self.bound.template
     }

@@ -4,9 +4,9 @@
 #include <string.h>
 
 typedef struct { void *dst; const void *src; size_t n; int value, kind; void *stream; void *event; } Job;
-typedef struct { void *stream; int ready; } Event;
+typedef struct { void *stream; int ready, capture_supported; } Event;
 static Job jobs[1024];
-static int count, counters[9], failure, stream_creates;
+static int count, counters[9], failure, stream_creates, capturing;
 static void *current;
 static char aot_contract[4096];
 void test_kernel_contract(const char *text) {
@@ -52,11 +52,18 @@ int aclrtDestroyStream(void *p) { free(p);counters[3]--;return 0; }
 int aclrtSynchronizeStreamWithTimeout(void *s,int timeout) { (void)timeout;return flush(s); }
 int aclrtCreateEventWithFlag(void **p,uint32_t flag) {
     if(flag!=1)return 7;
+    if(failure==13 && counters[2]>0)return 7;
     *p=calloc(1,sizeof(Event));counters[2]++;return 0;
 }
 int aclrtDestroyEvent(void *p) { free(p);counters[2]--;return 0; }
+int aclrtCreateEventExWithFlag(void **p,uint32_t flag) {
+    int status=aclrtCreateEventWithFlag(p,flag);
+    if(!status)((Event*)*p)->capture_supported=1;
+    return status;
+}
 int aclrtRecordEvent(void *p,void *s) {
     if(failure==4)return 7;
+    if(capturing && !((Event*)p)->capture_supported)return 207000;
     ((Event*)p)->stream=s;
     jobs[count++]=(Job){.kind=3,.stream=s,.event=p};return 0;
 }
@@ -80,8 +87,8 @@ int aclrtMemsetAsync(void *dst,size_t max,int value,size_t n,void *stream) {
     jobs[count++]=(Job){.dst=dst,.n=n,.value=value,.kind=2,.stream=stream};return 0;
 }
 int aclrtGetMemInfo(int kind,size_t *free,size_t *total) { (void)kind;*free=1<<28;*total=1<<29;return 0; }
-int aclmdlRICaptureBegin(void *stream,int mode) { (void)stream;(void)mode;return failure==6?7:0; }
-int aclmdlRICaptureEnd(void *stream,void **model) { (void)stream;*model=malloc(1);counters[7]++;return 0; }
+int aclmdlRICaptureBegin(void *stream,int mode) { (void)stream;(void)mode;if(failure==6)return 7;capturing=1;return 0; }
+int aclmdlRICaptureEnd(void *stream,void **model) { (void)stream;capturing=0;*model=malloc(1);counters[7]++;return 0; }
 int aclmdlRIExecuteAsync(void *model,void *stream) { (void)model;(void)stream;return 0; }
 int aclmdlRIDestroy(void *model) { free(model);counters[7]--;return 0; }
 int HcclGetRootInfo(void *p) {if(!current)return 15;memset(p,0,4108);*(uint8_t*)p=*(uint8_t*)current;return 0;}
@@ -94,6 +101,10 @@ int HcclGetCommAsyncError(void *comm,int *status) {(void)comm;*status=0;return 0
 int HcclAllReduce(void *source,void *destination,uint64_t n,int type,int op,void *comm,void *stream) {
     (void)op;(void)comm;size_t bytes=n*(type==0?1:type==5?8:4);
     return aclrtMemcpyAsync(destination,bytes,source,bytes,3,stream);
+}
+int HcclAllGather(void *source,void *destination,uint64_t n,int type,void *comm,void *stream) {
+    (void)comm;size_t bytes=n*(type==0?4:type==6?2:1);
+    jobs[count++]=(Job){.dst=destination,.src=source,.n=bytes,.kind=1,.stream=stream};return 0;
 }
 int HcclAlltoAllV(const void *source,const void *counts,const void *offsets,int type,const void *destination,
                  const void *receive,const void *displacements,int receive_type,void *comm,void *stream) {

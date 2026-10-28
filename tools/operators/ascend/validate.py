@@ -23,6 +23,9 @@ from tools.operators.ascend import (
 from tools.operators.ascend import topk as select
 
 EXACT_OPS = {
+    "mhc_post_pre",
+    "gather_quantized_rows",
+    "gather_columns",
     "mhc_expand",
     "gather_rows",
     "scatter_rows",
@@ -37,6 +40,22 @@ EXACT_OPS = {
 
 
 def reference(kind, inputs, parameters):
+    if kind == "mhc_post_pre":
+        layer, residual, post, combination, mix = inputs
+        updated = reference("mhc_post", [layer, residual, post, combination], parameters)[0]
+        collapsed = reference("mhc_pre_apply", [updated, mix], parameters)[0]
+        return [updated, collapsed]
+    if kind == "gather_columns":
+        return [
+            inputs[0].permute(1, 0, 2).reshape(parameters["rows"], parameters["width"]).contiguous()
+        ]
+    if kind == "gather_quantized_rows":
+        table, scales, indices = inputs
+        valid = (indices >= 0) & (indices < table.shape[0])
+        out = torch.zeros(indices.numel(), table.shape[1], dtype=table.dtype)
+        out_scale = torch.zeros(indices.numel(), dtype=scales.dtype)
+        out[valid], out_scale[valid] = table[indices[valid]], scales[indices[valid]]
+        return [out, out_scale, ((indices < -1) | (indices >= table.shape[0])).int()]
     if kind == "rms_norm":
         x, w = inputs
         a = x.float()
@@ -809,6 +828,61 @@ def cases(rows, width, index_length=8192, attention_selected=32, select_k=512):
         ],
     )
 
+    yield (
+        "mhc_post_pre",
+        vector.mhc_post_pre(rows, width),
+        {"rows": rows, "width": width},
+        [
+            operand("layer", "bf16", (rows, width)),
+            operand("residual", "bf16", (rows, 4, width)),
+            operand("post", "f32", (rows, 8)),
+            operand("combination", "f32", (rows, 16)),
+            operand("out", "bf16", (rows, 4, width), "write"),
+            operand("mix", "f32", (rows, 8)),
+            operand("collapsed", "bf16", (rows, width), "write"),
+        ],
+        [
+            torch.randn(rows, width).bfloat16(),
+            torch.randn(rows, 4, width).bfloat16(),
+            torch.randn(rows, 8),
+            torch.randn(rows, 16),
+            torch.randn(rows, 8),
+        ],
+    )
+    table_rows = max(1, rows - 1)
+    indices = torch.arange(rows, dtype=torch.int32) % table_rows
+    indices[0] = -1
+    if rows > 1:
+        indices[-1] = table_rows
+    yield (
+        "gather_quantized_rows",
+        memory.gather_quantized_rows(rows, table_rows, width),
+        {"rows": rows, "table_rows": table_rows, "width": width},
+        [
+            operand("table", "i8", (table_rows, width)),
+            operand("scales", "f32", (table_rows,)),
+            operand("indices", "i32", (rows,)),
+            operand("out", "i8", (rows, width), "write"),
+            operand("out_scales", "f32", (rows,), "write"),
+            operand("errors", "i32", (rows,), "write"),
+        ],
+        [
+            torch.randint(-127, 128, (table_rows, width), dtype=torch.int8),
+            torch.rand(table_rows),
+            indices,
+        ],
+    )
+    yield (
+        "gather_columns",
+        memory.gather_columns(rows, width),
+        {"rows": rows, "width": width},
+        [
+            operand("gathered", "bf16", (8, rows, width // 8)),
+            operand("out", "bf16", (rows, width), "write"),
+        ],
+        [torch.randn(8, rows, width // 8).bfloat16()],
+    )
+
 
 def write_tensor(path, tensor):
     path.write_bytes(tensor.contiguous().view(torch.uint8).numpy().tobytes())
@@ -836,6 +910,9 @@ def main():
         nargs="+",
         choices=(
             "rms_norm",
+            "mhc_post_pre",
+            "gather_quantized_rows",
+            "gather_columns",
             "quantize",
             "swiglu",
             "mhc_split_sinkhorn",
@@ -966,6 +1043,13 @@ def main():
                 if kind in ("select_merge", "select_finalize"):
                     inputs[0] = initial[0].clone()
                     inputs[0][..., 0::2] *= 0.5 if p == 2 else 2.0
+                if kind == "gather_quantized_rows":
+                    inputs[2] = (
+                        torch.arange(params["rows"] - 1, -1, -1, dtype=torch.int32)
+                        % params["table_rows"]
+                        if p == 2
+                        else torch.full_like(inputs[2], -2)
+                    )
             expected = reference(kind, inputs, params)
             for dst, src in zip(device_inputs, inputs):
                 dst.copy_(src)

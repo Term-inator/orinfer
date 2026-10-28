@@ -5,13 +5,13 @@ use super::{
 use libloading::Library;
 use std::{path::Path, sync::Arc};
 
-struct Fixture {
+pub(super) struct Fixture {
     _dir: tempfile::TempDir,
     library: Library,
     driver: Option<Arc<DriverLease>>,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("libacl-fixture.so");
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ascend_runtime.c");
@@ -37,7 +37,7 @@ impl Fixture {
             driver: Some(driver),
         }
     }
-    fn session(&self) -> Session {
+    pub(super) fn session(&self) -> Session {
         Session::with_driver(
             Arc::clone(self.driver.as_ref().unwrap()),
             0,
@@ -45,7 +45,7 @@ impl Fixture {
         )
         .unwrap()
     }
-    fn aot(&self) -> (std::path::PathBuf, super::kernels::Spec) {
+    pub(super) fn aot(&self) -> (std::path::PathBuf, super::kernels::Spec) {
         use super::kernels::{Access, Operand, Spec};
         use crate::artifact::{Dtype, FileIdentity};
         let library = self._dir.path().join("libacl-fixture.so");
@@ -93,7 +93,7 @@ impl Fixture {
         std::fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
         (path, spec)
     }
-    fn counter(&self, index: i32) -> i32 {
+    pub(super) fn counter(&self, index: i32) -> i32 {
         // SAFETY: Fixture declares this function with the exact C signature.
         unsafe {
             self.library
@@ -101,7 +101,7 @@ impl Fixture {
                 .unwrap()(index)
         }
     }
-    fn failure(&self, index: i32) {
+    pub(super) fn failure(&self, index: i32) {
         // SAFETY: Fixture declares this function with the exact C signature.
         unsafe {
             self.library
@@ -109,7 +109,7 @@ impl Fixture {
                 .unwrap()(index);
         }
     }
-    fn assert_clean(&mut self) {
+    pub(super) fn assert_clean(&mut self) {
         self.driver.take();
         for index in 0..5 {
             assert_eq!(self.counter(index), 0, "resource counter {index}");
@@ -671,7 +671,27 @@ fn collective_completion_retains_communicator_and_validates_byte_units() {
     .wait()
     .unwrap();
     assert_eq!(session.download(&b, 0, 16).unwrap(), [7; 16]);
-    drop((comm, ticket, a, b, root, session));
+    assert!(
+        comm.all_gather(&session, &a, &a, 4, Element::Float32)
+            .is_err()
+    );
+    assert!(
+        comm.all_gather(&session, &a, &b, 5, Element::Float32)
+            .is_err()
+    );
+    assert!(
+        comm.all_gather(&session, &a, &b, u64::MAX, Element::Float32)
+            .is_err()
+    );
+    let gathered = comm
+        .all_gather(&session, &a, &b, 4, Element::Float32)
+        .unwrap();
+    drop(comm);
+    assert_eq!(fixture.counter(8), 1);
+    gathered.wait().unwrap();
+    assert_eq!(fixture.counter(8), 0);
+    assert_eq!(session.download(&b, 0, 16).unwrap(), [7; 16]);
+    drop((gathered, ticket, a, b, root, session));
     fixture.assert_clean();
 }
 

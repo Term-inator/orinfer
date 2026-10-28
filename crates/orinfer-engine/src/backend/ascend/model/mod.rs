@@ -1,5 +1,6 @@
 //! Original-checkpoint single-sequence A2 execution and latency measurements.
 mod benchmark;
+mod branches;
 mod packet;
 mod weights;
 
@@ -76,6 +77,15 @@ struct Packet {
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Instruction {
+    Fork,
+    Switch,
+    Join,
+    Gather {
+        source: String,
+        destination: String,
+        elements: u64,
+        fp32: bool,
+    },
     Kernel {
         manifest: String,
         buffers: Vec<String>,
@@ -143,6 +153,15 @@ enum Step {
 /// repeatable ACLNN grouped matmuls replay together inside one ACL Graph.
 #[derive(Clone)]
 enum SegmentOp {
+    Fork(usize),
+    Switch(usize),
+    Join(usize),
+    Gather {
+        source: Buffer,
+        destination: Buffer,
+        elements: u64,
+        element: Element,
+    },
     Kernel(Kernel),
     Reduce {
         source: Buffer,
@@ -151,6 +170,57 @@ enum SegmentOp {
         element: Element,
     },
     W4(Rc<GroupedW4A8>),
+}
+
+fn enqueue_segment(
+    ops: &[SegmentOp],
+    comm: &Communicator,
+    parallel: Option<&super::graph::Branches>,
+    main: super::api::Handle,
+) -> Result<()> {
+    let mut stream = main;
+    let mut parents = Vec::new();
+    for op in ops {
+        match op {
+            SegmentOp::Fork(index) => {
+                parents.push(stream);
+                stream = parallel
+                    .ok_or("ACL branch resources missing")?
+                    .fork(*index, stream)?;
+            }
+            SegmentOp::Switch(index) => {
+                parallel
+                    .ok_or("ACL branch resources missing")?
+                    .switch(*index)?;
+                stream = *parents.last().ok_or("ACL branch parent missing")?;
+            }
+            SegmentOp::Join(index) => {
+                parallel
+                    .ok_or("ACL branch resources missing")?
+                    .join(*index, stream)?;
+                stream = parents.pop().ok_or("ACL branch parent missing")?;
+            }
+            SegmentOp::Kernel(kernel) => kernel.launch_on_stream(stream)?,
+            SegmentOp::Gather {
+                source,
+                destination,
+                elements,
+                element,
+            } => {
+                comm.gather_on_stream(stream, source, destination, *elements, *element)?;
+            }
+            SegmentOp::Reduce {
+                source,
+                destination,
+                elements,
+                element,
+            } => {
+                comm.reduce_on_stream(stream, source, destination, *elements, *element)?;
+            }
+            SegmentOp::W4(plan) => plan.execute_on_stream(stream)?,
+        }
+    }
+    Ok(())
 }
 struct Execution {
     packet: Packet,
@@ -524,14 +594,39 @@ impl Worker {
         base: &Path,
         snapshots: bool,
     ) -> Result<Vec<Step>> {
+        branches::validate_instructions(instructions)?;
         let mut steps = vec![];
         let mut pending: Vec<SegmentOp> = vec![];
+        let mut fork_count = 0;
+        let mut fork_stack = Vec::new();
         for instruction in instructions {
+            match instruction {
+                Instruction::Fork => {
+                    pending.push(SegmentOp::Fork(fork_count));
+                    fork_stack.push(fork_count);
+                    fork_count += 1;
+                    continue;
+                }
+                Instruction::Switch => {
+                    pending.push(SegmentOp::Switch(
+                        *fork_stack.last().ok_or("ACL switch has no fork")?,
+                    ));
+                    continue;
+                }
+                Instruction::Join => {
+                    pending.push(SegmentOp::Join(
+                        fork_stack.pop().ok_or("ACL join has no fork")?,
+                    ));
+                    continue;
+                }
+                _ => {}
+            }
             if let Instruction::Snapshot { name, buffer } = instruction {
                 // Snapshots only observe device state for tracing; without
                 // tracing the step is inert and kernels merge across it.
                 if snapshots {
                     self.capture_pending(&mut pending, &mut steps)?;
+                    fork_count = 0;
                     steps.push(Step::Snapshot {
                         name: name.clone(),
                         buffer: get(&self.buffers, buffer)?,
@@ -582,6 +677,41 @@ impl Worker {
                 };
                 self.check_reduce(&source, &destination, *elements, element)?;
                 pending.push(SegmentOp::Reduce {
+                    source,
+                    destination,
+                    elements: *elements,
+                    element,
+                });
+                continue;
+            }
+            if let Instruction::Gather {
+                source,
+                destination,
+                elements,
+                fp32,
+            } = instruction
+            {
+                let source = get(&self.buffers, source)?;
+                let destination = get(&self.buffers, destination)?;
+                let element = if *fp32 {
+                    Element::Float32
+                } else {
+                    Element::Bfloat16
+                };
+                self.session.require(&source)?;
+                self.session.require(&destination)?;
+                let bytes = elements
+                    .checked_mul(element.bytes())
+                    .ok_or("Model gather extent overflow")?;
+                let output = bytes.checked_mul(8).ok_or("Model gather output overflow")?;
+                if source.overlaps(&destination)
+                    || *elements == 0
+                    || bytes > source.bytes() as u64
+                    || output > destination.bytes() as u64
+                {
+                    return Err("Model AllGather spans differ from TP8 geometry".into());
+                }
+                pending.push(SegmentOp::Gather {
                     source,
                     destination,
                     elements: *elements,
@@ -645,12 +775,14 @@ impl Worker {
                     pending.push(SegmentOp::W4(plan));
                 } else {
                     self.capture_pending(&mut pending, &mut steps)?;
+                    fork_count = 0;
                     steps.push(Step::W4(plan));
                 }
                 continue;
             }
             if !pending.is_empty() {
                 self.capture_pending(&mut pending, &mut steps)?;
+                fork_count = 0;
             }
             steps.push(match instruction {
                 Instruction::Route {
@@ -679,6 +811,10 @@ impl Worker {
                     mask: get(&self.buffers, mask)?,
                 },
                 Instruction::Snapshot { .. }
+                | Instruction::Fork
+                | Instruction::Switch
+                | Instruction::Join
+                | Instruction::Gather { .. }
                 | Instruction::Kernel { .. }
                 | Instruction::Reduce { .. }
                 | Instruction::W4 { .. } => unreachable!(),
@@ -721,17 +857,25 @@ impl Worker {
         pending: &mut Vec<SegmentOp>,
         steps: &mut Vec<Step>,
     ) -> Result<()> {
+        let depths = branches::validate(pending)?;
+        let ops = Rc::new(pending.clone());
+        let comm = self.comm.clone();
+        let parallel = if depths.is_empty() {
+            None
+        } else {
+            Some(super::graph::Branches::new(
+                &self.session,
+                &depths,
+                Box::new((Rc::clone(&ops), comm.clone())),
+            )?)
+        };
         let stream = self.session.compute_stream();
         let _current = self.session.context.enter()?;
         let t = Instant::now();
-        for op in pending.iter() {
-            self.submit_segment_op(op, stream)?;
-        }
+        enqueue_segment(&ops, &comm, parallel.as_deref(), stream)?;
         self.session.synchronize()?;
         self.phases.warmups.0 += 1;
         self.phases.warmups.1 += t.elapsed().as_secs_f64();
-        let comm = self.comm.clone();
-        let ops = pending.clone();
         let t = Instant::now();
         // SAFETY: The keepalive segment retains every bound kernel, buffer,
         // communicator and ACLNN plan used by the replayed launches; all
@@ -739,28 +883,8 @@ impl Worker {
         let graph = unsafe {
             super::graph::Graph::capture(
                 &self.session,
-                Box::new((ops.clone(), comm.clone())),
-                move |stream| {
-                    for op in ops.iter() {
-                        match op {
-                            SegmentOp::Kernel(kernel) => kernel.launch_on_stream(stream)?,
-                            SegmentOp::Reduce {
-                                source,
-                                destination,
-                                elements,
-                                element,
-                            } => comm.reduce_on_stream(
-                                stream,
-                                source,
-                                destination,
-                                *elements,
-                                *element,
-                            )?,
-                            SegmentOp::W4(plan) => plan.execute_on_stream(stream)?,
-                        }
-                    }
-                    Ok(())
-                },
+                Box::new((Rc::clone(&ops), comm.clone(), parallel.clone())),
+                move |stream| enqueue_segment(&ops, &comm, parallel.as_deref(), stream),
             )?
         };
         self.phases.captures.0 += 1;
@@ -768,20 +892,6 @@ impl Worker {
         steps.push(Step::Graph(graph));
         pending.clear();
         Ok(())
-    }
-    fn submit_segment_op(&self, op: &SegmentOp, stream: super::api::Handle) -> Result<()> {
-        match op {
-            SegmentOp::Kernel(kernel) => kernel.launch_on_stream(stream),
-            SegmentOp::Reduce {
-                source,
-                destination,
-                elements,
-                element,
-            } => self
-                .comm
-                .reduce_on_stream(stream, source, destination, *elements, *element),
-            SegmentOp::W4(plan) => plan.execute_on_stream(stream),
-        }
     }
     fn reset(&self) -> Result<()> {
         for execution in self.packets.values() {
@@ -866,6 +976,8 @@ fn preflight(model: &Model, base: &Path) -> Result<()> {
             return Err("Expected single-row decode and 16-row prefill packets".into());
         }
         for packet in &rank.packets {
+            branches::validate_instructions(&packet.body)?;
+            branches::validate_instructions(&packet.head)?;
             if ![1, 16].contains(&packet.rows) {
                 return Err("Unsupported packet row count".into());
             }

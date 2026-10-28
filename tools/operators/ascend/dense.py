@@ -6,15 +6,17 @@ import tilelang.language as T
 
 
 def projection(rows, output, reduction, integer=False, block_k=128, tile_n=64):
-    if rows < 1 or output % 32 or reduction % 128:
-        raise ValueError("A2 projection requires positive rows, N%32=0 and K%128=0")
+    alignment = 32 if integer else 128
+    if rows < 1 or output % 32 or reduction % alignment:
+        raise ValueError("A2 projection requires positive rows and aligned N/K")
     if tile_n not in (32, 64, 128, 256):
         raise ValueError("A2 projection N tile must be 32, 64, 128 or 256")
     block_m, block_n = 16, math.gcd(output, tile_n)
     if block_n * 128 * (1 if integer else 2) > 32768:
         raise ValueError("A2 projection B tile exceeds the L0B ping-pong slot")
-    if block_k not in (128, 256, 512) or reduction % block_k:
-        raise ValueError("A2 projection K tile must divide K and be 128, 256 or 512")
+    legal_k = 0 < block_k <= 512 and block_k % alignment == 0
+    if not legal_k or reduction % block_k:
+        raise ValueError("A2 projection K tile must be aligned, divide K and be <=512")
     m_blocks = (rows + block_m - 1) // block_m
     n_blocks = output // block_n
     input_dtype = "int8" if integer else "bfloat16"

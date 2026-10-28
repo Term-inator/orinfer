@@ -60,6 +60,9 @@ impl Context {
     pub(super) fn compute_stream(&self) -> Handle {
         self.compute
     }
+    pub(super) fn timeout_ms(&self) -> i32 {
+        self.limits.timeout_ms
+    }
     pub fn enter(&self) -> Result<Current<'_>> {
         let previous = self.api.current()?;
         // SAFETY: Retained ACL library, live writable output and owned context.

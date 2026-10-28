@@ -506,8 +506,13 @@ impl Worker {
                 self.session.upload_inputs(&inputs)?;
             }
             Step::Snapshot { name, buffer } => {
-                if let Some(base) = trace.filter(|_| self.rank == 0) {
-                    fs::create_dir_all(base).map_err(|e| e.to_string())?;
+                if let Some(base) = trace {
+                    let base = if self.rank == 0 {
+                        base.to_owned()
+                    } else {
+                        base.join(format!("rank{}", self.rank))
+                    };
+                    fs::create_dir_all(&base).map_err(|e| e.to_string())?;
                     let data = self.session.download(buffer, 0, buffer.bytes())?;
                     fs::write(base.join(format!("p{position}-{name}.bin")), data)
                         .map_err(|e| e.to_string())?;

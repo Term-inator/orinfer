@@ -13,10 +13,63 @@ import numpy as np
 from safetensors.numpy import save_file
 
 from tools.build.files import file_hash
-from tools.model.deepseek_v41.prepare import Checkpoint, Transpose, convert, prepare, tensor_names
+from tools.model.deepseek_v41.prepare import (
+    Checkpoint,
+    Transpose,
+    convert,
+    convert_shared,
+    prepare,
+    tensor_names,
+)
 
 
 class PrepareTests(unittest.TestCase):
+    def test_shared_tp8_reassembles_original_banks_without_padding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prefix = "layers.0.ffn.shared_experts"
+            random = np.random.default_rng(20261002)
+            tensors = {}
+            for part in ("w1", "w3"):
+                tensors[f"{prefix}.{part}.weight"] = random.integers(
+                    -128, 128, (24, 32), dtype=np.int8
+                )
+                tensors[f"{prefix}.{part}.weight_scale"] = random.random((24, 1), dtype=np.float32)
+            tensors[f"{prefix}.w2.weight"] = random.integers(-128, 128, (32, 24), dtype=np.int8)
+            save_file(tensors, root / "checkpoint.safetensors")
+            (root / "index.json").write_text(
+                json.dumps({"weight_map": dict.fromkeys(tensors, "checkpoint.safetensors")})
+            )
+            checkpoint = Checkpoint(root, "index.json", tensors)
+            try:
+                for plane in ("up", "scale", "down"):
+                    banks = [
+                        convert_shared({"prefix": prefix, "rank": rank, "plane": plane}, checkpoint)
+                        for rank in range(8)
+                    ]
+                    if plane == "down":
+                        actual = np.concatenate(banks, axis=1)
+                        expected = tensors[f"{prefix}.w2.weight"].view(np.uint8)
+                    else:
+                        suffix = "weight_scale" if plane == "scale" else "weight"
+                        actual = np.concatenate(
+                            [
+                                np.concatenate([b[:3] for b in banks]),
+                                np.concatenate([b[3:] for b in banks]),
+                            ]
+                        )
+                        expected = np.concatenate(
+                            [tensors[f"{prefix}.{part}.{suffix}"] for part in ("w1", "w3")]
+                        )
+                        expected = (
+                            expected.reshape(-1) if plane == "scale" else expected.view(np.uint8)
+                        )
+                    np.testing.assert_array_equal(actual, expected)
+                with self.assertRaises(ValueError):
+                    convert_shared({"prefix": prefix, "rank": 8, "plane": "up"}, checkpoint)
+            finally:
+                checkpoint.close()
+
     @classmethod
     def setUpClass(cls):
         cls.compiler = tempfile.TemporaryDirectory()

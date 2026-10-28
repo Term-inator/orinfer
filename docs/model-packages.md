@@ -178,9 +178,25 @@ HCCL_OP_EXPANSION_MODE=AIV HCCL_NPU_SOCKET_PORT_RANGE=auto \
 
 八卡 910B3 的单流验收使用进程环境变量 `HCCL_OP_EXPANSION_MODE=AIV` 选择通信展开方式；先运行 `HCCL_OP_EXPANSION_MODE=AIV orinfer validate-hccl --devices 0,1,2,3,4,5,6,7` 验证目标设备，再以相同环境启动模型测量。
 
+构建参数 `--strategy optimized` 启用单流优化计划：decode 使用 Cube QK/PV 与 FP32 masked softmax；共享专家按 TP8 离线分片，down 投影保留实际 K288；Engram WKV 投影按输出列分片并 AllGather；HC 参数、Q/KV 与共享／路由专家通过嵌套 Graph 分支重叠；mHC post／下一次 pre 和量化行／scale gather 分别融合。`prepare` 同时生成共享专家 bank，在线直接读取物理文件。`--strategy baseline` 保留串行参考计划。优化计划的 attention 概率使用 BF16，共享专家使用分片激活 scale 和跨卡归约，需要独立质量验收。
+
+Graph 分支在捕获前校验实际 buffer 字节范围的读写依赖，禁止并行分支写入重叠视图，HCCL 保持在主分支。每个 fork／join 使用独立的捕获事件，Graph 持有辅助 stream、事件、通信组和所有算子资源；改变输入后的重放属于原生验收。
+
+官方混合精度参考使用原始 FP4 专家和 FP8 主干 checkpoint。`tools.model.deepseek_v41.reference` 复用该目录的 `inference/model.py`，有界解码原始权重，保留官方激活和 KV 量化、RoPE、mHC 及 attention 的概率舍入边界。该离线工具使用软件解码后的矩阵计算；输出身份明确记录其数值路径，性能验收仍使用原生 Rust 执行器。
+
+```bash
+bash tools/operators/ascend/run.sh python3 -m tools.model.deepseek_v41.reference \
+  --model-dir /data/models/DeepSeek-V4.1-Flash-1017 \
+  --inputs artifacts/ascend-inputs.json --teacher artifacts/ascend-result.json \
+  --case p1024 --positions 129 --device npu:0 \
+  --output artifacts/ascend-official-reference
+```
+
+`--teacher` 接受 `bench-ascend` 的结果 JSON，以同一 token 历史逐位置保存官方 logits、target NLL 和 argmax；`--inspect-only` 只检查官方参数映射。大 Engram 表按选中行读取，矩阵缓存由 `--cache-gib` 控制。
+
 固定版本的 TileLang-Ascend 编译器会为纯 Vector 程序生成混合任务。离线构建器识别仅使用 UB、没有跨核同步且网格固定的独立程序，移除未使用的 Cube 分配，生成 AIV-only 任务；物理网格扩大一倍并保留原有逻辑块和双 Vector 索引。含 Cube 计算、跨核同步、未知网格或仍使用 Cube 工作区的程序保留原调度。转换规则及源码计入编译缓存身份，改变输入的数值和 Graph replay 在离线验收中检查。
 
-测量排除权重加载和预热，输出固定输入的 token hash、全部生成 token ID、TTFT、decode 速度及端到端时延。TTFT 包含末位置输出头；由输入长度除以 TTFT 得到的值是 prefill 吞吐代理。Rust 计时包含 CPU 查找、提交、等待与 HCCL；`tools/bench/ascend_single.py` 对 vLLM 的测量还包含本机 HTTP 和调度开销。两端使用同一组原始 completion token，固定输出长度，关闭跨请求 prefix 复用和推测解码。输入 `cases` 可分别指定 `output_tokens`、`repeats` 和 `trace`，省略时沿用命令行设置。`--trace DIR` 下载每层输出用于排错；正式测量使用 `trace: false` 或省略 `--trace`。
+测量排除权重加载和预热，输出固定输入的 token hash、全部生成 token ID、TTFT、decode 速度及端到端时延。TTFT 包含末位置输出头；由输入长度除以 TTFT 得到的值是 prefill 吞吐代理。Rust 计时包含 CPU 查找、提交、等待与 HCCL；`tools/bench/ascend_single.py` 对 vLLM 的测量还包含本机 HTTP 和调度开销。两端使用同一组原始 completion token，固定输出长度，关闭跨请求 prefix 复用和推测解码。输入 `cases` 可分别指定 `output_tokens`、`repeats` 和 `trace`，省略时沿用命令行设置。`--trace DIR` 下载各 rank 的快照用于排错，rank 0 写在根目录，其余写入 `rankN/`；正式测量使用 `trace: false` 或省略 `--trace`。
 
 ### 源码入口
 
