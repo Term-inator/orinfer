@@ -11,6 +11,36 @@ from tools.model.projection_tuning import measurement_rows, profile_rows
 
 
 class BuildTests(unittest.TestCase):
+    def test_hc_fusion_requires_adjacent_decode_operations(self):
+        from types import SimpleNamespace
+        from tools.model.flash_next.hc_fusion import decode_pairs
+
+        combine = dict(name="combine", args=[None] * 4)
+        norm = dict(name="norm", args=[None] * 3)
+        roles = {
+            "combine": dict.fromkeys(("Block", "Inject", "Output", "Residual")),
+            "norm": dict.fromkeys(("Normed", "Residual", "Weight")),
+        }
+        compiler = SimpleNamespace(pointers=lambda kernel: roles[kernel["name"]])
+        package = dict(kernels=[combine, norm])
+        operations = [dict(kind="kernel", name=name) for name in ("combine", "norm")]
+        self.assertEqual(
+            decode_pairs(dict(programs=dict(decode=operations)), package, compiler),
+            [("combine", "norm")],
+        )
+        barrier = dict(kind="copy", source="Output", destination="Residual", bytes=4)
+        self.assertEqual(
+            decode_pairs(
+                dict(programs=dict(decode=[operations[0], barrier, operations[1]])),
+                package,
+                compiler,
+            ),
+            [],
+        )
+        self.assertEqual(
+            decode_pairs(dict(programs=dict(prefill=operations)), package, compiler), []
+        )
+
     def test_dynamic_selection_measurements_keep_declared_non_aot_intervals(self):
         from tools.model.flash_next.construction import bounded_measurements
 

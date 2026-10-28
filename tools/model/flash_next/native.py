@@ -82,15 +82,7 @@ class Model:
     H, F, E, K, C, R, V = 2560, 640, 512, 10, 4, 320, 248320
 
     def __init__(
-        self,
-        source,
-        capacity,
-        output,
-        *,
-        use_graph=True,
-        target=None,
-        decode_w8_optimized=True,
-        gdn_state_dtype="float32",
+        self, source, capacity, output, *, use_graph=True, target=None, decode_w8_optimized=True
     ):
         from tools.model.flash_next.config import validate
 
@@ -100,9 +92,6 @@ class Model:
         if type(decode_w8_optimized) is not bool:
             raise ValueError("Invalid decode W8 policy")
         self.decode_w8_optimized = decode_w8_optimized
-        if gdn_state_dtype not in ("float32", "float16"):
-            raise ValueError("Invalid GDN state storage dtype")
-        self.gdn_state_dtype = gdn_state_dtype
         self.draft_vocab = None
         self.is_mtp = source.config["quantization_config"].get("component") == "mtp"
         if self.is_mtp:
@@ -301,11 +290,7 @@ class Model:
                 self.states[f"{i}:conv"] = torch.zeros(
                     (1, 3, 10240), device="cuda", dtype=torch.float16
                 )
-                self.states[f"{i}:gdn"] = torch.zeros(
-                    (48, 128, 128),
-                    device="cuda",
-                    dtype=torch.float16 if self.gdn_state_dtype == "float16" else torch.float32,
-                )
+                self.states[f"{i}:gdn"] = torch.zeros((48, 128, 128), device="cuda")
             else:
                 for suffix in ("key", "value"):
                     self.states[f"{i}:{suffix}"] = torch.empty(
@@ -847,7 +832,6 @@ class Model:
                         in_place=not verify,
                         compact=compact,
                         prefetch_qk=m >= 256 and not verify,
-                        state_dtype=self.gdn_state_dtype,
                     ),
                     q[0],
                     keys[0],
@@ -1444,10 +1428,9 @@ class Model:
             for name, value in plan["prefix_states"].items():
                 self.states[name].copy_(value[inputs - 1].reshape(self.states[name].shape))
             for name, (k, g, update) in plan["prefix_updates"].items():
-                self.kernel(
-                    f"gdn-commit-{len(tokens)}",
-                    lambda: gdn_commit(len(tokens), state_dtype=self.gdn_state_dtype),
-                )(k, g, update, plan["accepted"], self.states[name])
+                self.kernel(f"gdn-commit-{len(tokens)}", lambda: gdn_commit(len(tokens)))(
+                    k, g, update, plan["accepted"], self.states[name]
+                )
 
         if self.use_graph:
             key = ("commit", inputs)
@@ -1591,12 +1574,6 @@ def main():
         "--mtp-adaptive", action="store_true", help="Opt in to measured 1/3/7 draft tiers"
     )
     p.add_argument("--cases", nargs="+", help="Run selected scene IDs")
-    p.add_argument(
-        "--gdn-state-dtype",
-        choices=("float32", "float16"),
-        default="float32",
-        help="Persistent GDN state storage; compute stays FP32 either way (default: float32)",
-    )
     a = p.parse_args()
     if a.max_new_tokens < 1:
         p.error("--max-new-tokens must be positive")
@@ -1629,9 +1606,7 @@ def main():
     baseline_map = {(row["case_id"], row["position"]): row for row in baseline}
     if len(baseline_map) != len(baseline):
         raise ValueError("Duplicate baseline scoring positions")
-    model = Model(
-        source, a.context, a.output, use_graph=a.graph == "on", gdn_state_dtype=a.gdn_state_dtype
-    )
+    model = Model(source, a.context, a.output, use_graph=a.graph == "on")
     session = None
     if a.mtp_checkpoint:
         from tools.model.flash_next.mtp import Session
@@ -1642,7 +1617,6 @@ def main():
             a.output / "mtp",
             use_graph=a.graph == "on",
             target=model,
-            gdn_state_dtype=a.gdn_state_dtype,
         )
         if a.mtp_vocab_size:
             from tools.model.flash_next.policy import code_vocabulary

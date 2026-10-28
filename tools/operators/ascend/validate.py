@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 
 import torch
-import torch_npu  # noqa: F401
 
 from tools.build.files import atomic_json, file_hash
 from tools.operators.ascend.build import compile_kernel, operand
@@ -879,6 +878,9 @@ def main():
         parser.error("attention selected length must be a positive multiple of 16")
     if args.quant_grid and (args.rows, args.width) != (128, 512):
         parser.error("quant grid requires rows=128 and width=512")
+    if not args.compile_only:
+        import torch_npu  # noqa: F401
+
     torch.set_num_threads(4)
     torch.manual_seed(20261002)
     if not args.compile_only:

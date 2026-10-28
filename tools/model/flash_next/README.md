@@ -16,7 +16,7 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-buil
 
 构建直接从绑定的权重形状、dtype 和 host ABI 读取 Q4、W8、融合 SwiGLU 的构造参数。相同矩阵几何共享编译结果，使用一组确定的真实权重与 scale 测量候选。固定行数保留 1/2/3/4/8/16/32 特化，其余使用动态行参数。decode 动态候选按几何分布测量多个实际行数；prefill 根据模型声明的程序识别，默认针对 512/2048/4096 行测量，可用 `--prefill-tuning-rows` 调整。所有动态实现仍检查短行、非对齐尾部与容量上限；输出必须精确保持整数点积、scale 与舍入边界，并通过修改输入后的 CUDA Graph replay。
 
-专家的路由、上投影和下投影共同使用输入中已验证的联合 tile 选择表。构建另外读取真实专家 bank，在完整 E/N/K 几何上验证两种合法行 tile、短尾与最大容量。整数投影重建保留 HC、QSA、视觉和因果状态实现的固定身份。
+专家的路由、上投影和下投影共同使用输入中已验证的联合 tile 选择表。构建另外读取真实专家 bank，在完整 E/N/K 几何上验证两种合法行 tile、2/4 级流水线、短尾与最大容量。整数投影重建保留 HC、QSA、视觉和因果状态实现的固定身份。
 
 缓存默认在 `artifacts/build-cache/flash-next`，可用 `--cache` 指定。键包含构造参数、真实权重身份、源码、编译器、CUDA 和设备；内容校验失败自动重建该项。单项完成后原子发布，整个模型在 Rust 计划检查通过后发布。失败可重跑同一条命令，只需在包装器上增加 `--resume`：
 
@@ -36,6 +36,8 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-w8-b
 ```
 
 W8 调优包含寄存器 scale 复用和按行 tile 遍历的候选；它们读取相同的原生 W8 权重，保持完整 INT32 点积、先权重 scale 后 token scale 的 FP32 乘法顺序，以及最终输出舍入。候选由真实权重和多个行数的测量选择，发布包只保留选中的实现，Rust 在线路径没有新增依赖。
+
+`--hc-combine-norm` 将单行 decode 中相邻的 HC combine 与 norm 合并，保留 combine 的 FP16 舍入和 norm 的 FP32 归约。Rust 适配器校验融合绑定并移除相邻的独立 norm；构建仍通过同一入口原子发布。GDN 持续状态统一使用 FP32。
 
 在 CPU 上清点构造契约：
 

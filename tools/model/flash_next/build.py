@@ -344,10 +344,10 @@ def rebuild(args):
             )
             print("BUILT", number, "/", len(groups), spec, "cache" if hit else "tuned", flush=True)
         if args.hc_combine_norm:
-            from tools.model.hc_fusion import publish as publish_hc_combine_norm
+            from tools.model.flash_next.hc_fusion import publish as publish_hc_combine_norm
 
             replacements.update(
-                publish_hc_combine_norm(data, package, manifest, compiler, args.output / "hc")
+                publish_hc_combine_norm(package, manifest, compiler, args.output / "hc")
             )
         package["kernels"] = [replacements.get(k["name"], k) for k in package["kernels"]]
         package["dynamic_batch_kernels"] = [

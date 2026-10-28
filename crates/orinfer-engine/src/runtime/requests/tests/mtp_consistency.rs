@@ -4,12 +4,29 @@ use super::*;
 fn target_state(model: &mut ModelRuntime, request: &mut RequestState) -> BTreeMap<String, Vec<u8>> {
     model
         .with_request(request, |m, r| {
+            let mut draft_state = std::collections::BTreeSet::new();
+            if let Some(spec) = &m.manifest.mtp {
+                if let Some(kv) = &m.manifest.kv_cache {
+                    for growth in kv.growth.values().filter(|g| g.position == spec.position) {
+                        draft_state.extend(growth.buffers.iter().cloned());
+                    }
+                }
+                if let Some(program) = &spec.draft_snapshot_program {
+                    for operation in &m.manifest.programs[program] {
+                        if let crate::model::Operation::Copy { source, .. } = operation {
+                            draft_state.insert(source.clone());
+                        }
+                    }
+                }
+            }
             m.prefix_ranges(r.input.len() + r.generated - 1)?
                 .into_iter()
                 // Draft state has a different cursor during lazy catch-up.
                 // Compare live target state and the hidden row needed by the next bridge.
                 .filter(|(name, _)| {
-                    (name.starts_with('L') && m.manifest.reset_buffers.contains(name))
+                    ((name.starts_with('L') || name.starts_with("State_"))
+                        && m.manifest.reset_buffers.contains(name)
+                        && !draft_state.contains(name))
                         || name == &m.manifest.position
                         || m.manifest.mtp.as_ref().and_then(|s| s.hidden_ring.as_ref())
                             == Some(name)

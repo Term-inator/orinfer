@@ -188,6 +188,18 @@ fn disable_mtp(manifest: &mut crate::model::Manifest) {
             dead.remove(name);
         }
     }
+    // The common operand table also serves ordinary decode. Its registration
+    // program may have belonged to the MTP program set, but its indirect
+    // bindings remain live when speculation is disabled.
+    if let Some(table) = manifest.packet_table() {
+        for name in table
+            .kernels
+            .values()
+            .chain(table.copies.iter().map(|copy| &copy.kernel))
+        {
+            dead.remove(name);
+        }
+    }
     if let Some(rows) = &mut manifest.row_execution {
         rows.programs
             .retain(|name| manifest.programs.contains_key(name));
@@ -239,6 +251,70 @@ pub use orinfer_model_sdk::execution::{BufferView, Invocation};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_packet_bindings_survive_disabling_mtp() {
+        use serde_json::json;
+        let mut manifest: crate::model::Manifest = serde_json::from_value(json!({
+            "schema_version":2,"target":"sm_87","model":"test","chunk_tokens":1,
+            "max_context":64,"vocab":32,"toolchain":{},"reset_buffers":[],
+            "input":"i","token":"t","status":"s","logits":"l","position":"p",
+            "weight_bytes":0,"weight_parameters":1,"weight_scope":"test",
+            "buffers":[
+                {"name":"State","dtype":"f32","shape":[1],"layout":"native_contiguous",
+                 "alignment":256,"access":"read_write","data":null},
+                {"name":"Pointers","dtype":"u64","shape":[128],"layout":"native_contiguous",
+                 "alignment":256,"access":"read_write","data":null}
+            ],
+            "programs":{
+                "decode":[{"kind":"kernel","name":"target"}],
+                "draft":[{"kind":"kernel","name":"draft"}],
+                "indirect":[{"kind":"kernel","name":"packet_target"}]
+            },
+            "packet_table":{"buffer":"Pointers","columns":["State"],
+                            "kernels":{"target":"packet_target"},"copies":[]},
+            "mtp":{
+                "position":"p","input":"i","token":"t","status":"s",
+                "verification_tokens":"v","verification_status":"vs",
+                "draft_logits":"d","verification_logits":"vl","accepted_inputs":"a",
+                "target_length":"tl","draft_program":"draft","default_verification_tokens":2,
+                "warm_plans":[],"capture_plans":[],"verification_plans":[],
+                "batch_programs":["indirect"]
+            }
+        }))
+        .unwrap();
+        for name in ["target", "draft", "packet_target"] {
+            manifest.kernels.push(
+                serde_json::from_value(json!({
+                    "name":name,"symbol":"test","args":[],
+                    "module":{"file":"kernel.cubin","sha256":"0".repeat(64)},
+                    "source":{"file":"kernel.cu","sha256":"0".repeat(64)},
+                    "host_abi":{"file":"host.txt","sha256":"0".repeat(64)}
+                }))
+                .unwrap(),
+            );
+        }
+        manifest
+            .packet_table()
+            .unwrap()
+            .validate(&manifest)
+            .unwrap();
+        LoadOptions {
+            mtp_drafts: Some(0),
+            ..Default::default()
+        }
+        .configure_mtp(&mut manifest)
+        .unwrap();
+        assert!(manifest.mtp.is_none());
+        assert!(!manifest.programs.contains_key("draft"));
+        assert!(!manifest.programs.contains_key("indirect"));
+        assert!(!manifest.kernels.iter().any(|k| k.name == "draft"));
+        manifest
+            .packet_table()
+            .unwrap()
+            .validate(&manifest)
+            .unwrap();
+    }
 
     #[test]
     fn modes_roundtrip_and_invalid_values_fail() {

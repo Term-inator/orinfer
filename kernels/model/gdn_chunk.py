@@ -99,9 +99,7 @@ def prepare(M, HK=16, HV=32, C=16, dynamic_rows=False):
     return main
 
 
-def recurrent(
-    M, HK=16, HV=32, C=16, BV=32, dynamic_rows=False, threads=None, state_dtype="float32"
-):
+def recurrent(M, HK=16, HV=32, C=16, BV=32, dynamic_rows=False, threads=None):
     if (
         not 1 <= M <= 4096
         or min(HK, HV) <= 0
@@ -114,11 +112,6 @@ def recurrent(
         threads = 64 if BV == 16 and C == 16 else 128
     if threads not in (64, 128, 256, 512) or threads // 32 > (C // 16) * (BV // 8):
         raise ValueError("Invalid chunkwise GDN warp geometry")
-    if state_dtype not in ("float32", "float16"):
-        raise ValueError("Invalid GDN state storage dtype")
-    if state_dtype != "float32":
-        raise ValueError("Chunkwise GDN state requires the per-token rounding contract")
-    storage = T.float32 if state_dtype == "float32" else T.float16
     m = row_count(M, dynamic_rows)
     nc = T.ceildiv(m, C)
 
@@ -130,7 +123,7 @@ def recurrent(
         U: T.Tensor((HV, nc, C, 128), T.float16),
         D: T.Tensor((HV, nc, C, C), T.float16),
         GP: T.Tensor((HV, nc, C, 2), T.float32),
-        State: T.Tensor((HV, 128, 128), storage),
+        State: T.Tensor((HV, 128, 128), T.float32),
         Out: T.Tensor((m, HV * 128), T.float16),
     ):
         with T.Kernel(128 // BV, HV, threads=threads) as (bv, h):
@@ -147,11 +140,7 @@ def recurrent(
             update = T.alloc_fragment((128, BV), T.float32)
             g = T.alloc_shared((C, 2), T.float32)
             for i, j in T.Parallel(128, BV):
-                state[i, j] = (
-                    State[h, i, bv * BV + j]
-                    if state_dtype == "float32"
-                    else T.cast(State[h, i, bv * BV + j], T.float32)
-                )
+                state[i, j] = State[h, i, bv * BV + j]
             for chunk in T.serial(nc):
                 for i, j in T.Parallel(128, BV):
                     sh[i, j] = state[i, j]
@@ -184,8 +173,6 @@ def recurrent(
                 for i, j in T.Parallel(128, BV):
                     state[i, j] = state[i, j] * g[C - 1, 0] + update[i, j]
             for i, j in T.Parallel(128, BV):
-                State[h, i, bv * BV + j] = (
-                    state[i, j] if state_dtype == "float32" else T.cast(state[i, j], T.float16)
-                )
+                State[h, i, bv * BV + j] = state[i, j]
 
     return main

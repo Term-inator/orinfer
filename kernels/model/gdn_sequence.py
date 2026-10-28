@@ -29,7 +29,6 @@ def _gdn_sequence(
     value_heads: int = 48,
     shared_state: bool = False,
     initial_state=None,
-    state_dtype: str = "float32",
 ):
     HK, HV = key_heads, value_heads
     if min(HK, HV) <= 0 or HV % HK:
@@ -37,10 +36,6 @@ def _gdn_sequence(
     assert 1 <= tokens <= (4096 if in_place else 16) and q_scale > 0
     assert value_tile in (16, 32, 64, 128) and threads in (32, 64, 128, 256)
     assert not (compact and in_place)
-    if state_dtype not in ("float32", "float16"):
-        raise ValueError("Invalid GDN state storage dtype")
-    if state_dtype != "float32" and initial_state is not None:
-        raise ValueError("Narrow state storage requires the plain initial-state path")
     if type(shared_state) is not bool or (shared_state and not in_place):
         raise ValueError("State staging requires an in-place GDN recurrence")
     if type(token_unroll) is not int or token_unroll not in (1, 2, 4, 8):
@@ -56,7 +51,6 @@ def _gdn_sequence(
         and (not in_place or compact or threads != 32 or value_tile != 16)
     ):
         raise ValueError("Q/K prefetch requires a warp-owned in-place GDN tile")
-    storage = T.float32 if state_dtype == "float32" else T.float16
 
     @T.prim_func
     def main(
@@ -65,7 +59,7 @@ def _gdn_sequence(
         V: T.Tensor((HV, tokens, DV), T.float16),
         G: T.Tensor((tokens, HV), T.float32),
         Beta: T.Tensor((tokens, HV), T.float32),
-        State: T.Tensor((HV, DK, DV), storage),
+        State: T.Tensor((HV, DK, DV), T.float32),
         Prefix: T.Tensor(
             (tokens, HV, DV) if compact else (1 if in_place else tokens, HV, DK, DV), T.float32
         ),
@@ -93,19 +87,11 @@ def _gdn_sequence(
             if initial_state is not None:
                 initial_state(state, State, h, bv)
             elif shared_state:
-                if state_dtype == "float32":
-                    T.copy(State[h, 0:DK, bv * value_tile : (bv + 1) * value_tile], state_tile)
-                    T.copy(state_tile, state)
-                else:
-                    for i, j in T.Parallel(DK, value_tile):
-                        state[i, j] = T.cast(State[h, i, bv * value_tile + j], T.float32)
+                T.copy(State[h, 0:DK, bv * value_tile : (bv + 1) * value_tile], state_tile)
+                T.copy(state_tile, state)
             else:
                 for i, j in T.Parallel(DK, value_tile):
-                    state[i, j] = (
-                        State[h, i, bv * value_tile + j]
-                        if state_dtype == "float32"
-                        else T.cast(State[h, i, bv * value_tile + j], T.float32)
-                    )
+                    state[i, j] = State[h, i, bv * value_tile + j]
             if prefetch_qk:
                 T.ptx_cp_async(
                     T.access_ptr(qs[0, tid * 4], "w", 4),
@@ -198,33 +184,19 @@ def _gdn_sequence(
                             h,
                             bv,
                         )
-                        # Narrow storage rounds the trajectory once per token so
-                        # single-token, chunked and speculative advance paths
-                        # share one state history; compute stays FP32.
-                        if state_dtype != "float32":
-                            for i, j in T.Parallel(DK, value_tile):
-                                state[i, j] = T.cast(T.cast(state[i, j], T.float16), T.float32)
                         for i, j in T.Parallel(DK, value_tile):
                             if in_place:
                                 if t == count - 1:
                                     if shared_state:
                                         state_tile[i, j] = state[i, j]
                                     else:
-                                        State[h, i, bv * value_tile + j] = (
-                                            state[i, j]
-                                            if state_dtype == "float32"
-                                            else T.cast(state[i, j], T.float16)
-                                        )
+                                        State[h, i, bv * value_tile + j] = state[i, j]
                             elif not compact:
                                 Prefix[t, h, i, bv * value_tile + j] = state[i, j]
                         for j in T.Parallel(value_tile):
                             Out[t, h * DV + bv * value_tile + j] = result[j]
             if shared_state:
-                if state_dtype == "float32":
-                    T.copy(state_tile, State[h, 0:DK, bv * value_tile : (bv + 1) * value_tile])
-                else:
-                    for i, j in T.Parallel(DK, value_tile):
-                        State[h, i, bv * value_tile + j] = T.cast(state_tile[i, j], T.float16)
+                T.copy(state_tile, State[h, 0:DK, bv * value_tile : (bv + 1) * value_tile])
 
     return main
 
@@ -251,14 +223,11 @@ def gdn_sequence(
     token_unroll: int = 1,
     key_heads: int = 16,
     value_heads: int = 48,
-    state_dtype: str = "float32",
 ):
     """Preserve the recurrence and reductions while overlapping input reads.
 
     The optional prefill path has one warp per CTA and two private shared
     slots. Its explicit wait and warp barrier protect every slot reuse.
-    state_dtype selects persistent-state storage; compute stays FP32 either
-    way, and float16 rounds the stored state once per launch.
     """
     compiler = _compile_prefetch if prefetch_qk else _compile_sequence
     return compiler(
@@ -273,7 +242,6 @@ def gdn_sequence(
         token_unroll,
         key_heads,
         value_heads,
-        state_dtype=state_dtype,
     )
 
 
@@ -284,16 +252,12 @@ def gdn_commit(
     dynamic_rows: bool = False,
     key_heads: int = 16,
     value_heads: int = 48,
-    state_dtype: str = "float32",
 ):
     """Replay saved FP32 rank-one updates in their original rounding order."""
     HK, HV = key_heads, value_heads
     if min(HK, HV) <= 0 or HV % HK:
         raise ValueError("Invalid GDN head geometry")
     assert 1 <= tokens <= 8 and value_tile in (16, 32, 64, 128)
-    if state_dtype not in ("float32", "float16"):
-        raise ValueError("Invalid GDN state storage dtype")
-    storage = T.float32 if state_dtype == "float32" else T.float16
 
     replay = rank_one(value_tile)
     tokens = row_count(tokens, dynamic_rows)
@@ -304,34 +268,23 @@ def gdn_commit(
         G: T.Tensor((tokens, HV), T.float32),
         Update: T.Tensor((tokens, HV, DV), T.float32),
         Accepted: T.Tensor((1,), T.int32),
-        State: T.Tensor((HV, DK, DV), storage),
+        State: T.Tensor((HV, DK, DV), T.float32),
     ):
         with T.Kernel(DV // value_tile, HV, threads=128) as (bv, h):
             state = T.alloc_fragment((DK, value_tile), T.float32)
             for i, j in T.Parallel(DK, value_tile):
-                state[i, j] = (
-                    State[h, i, bv * value_tile + j]
-                    if state_dtype == "float32"
-                    else T.cast(State[h, i, bv * value_tile + j], T.float32)
-                )
+                state[i, j] = State[h, i, bv * value_tile + j]
             for t in T.serial(tokens):
                 if t < Accepted[0]:
                     replay(state, K, Update, T.exp(G[t, h]), h // (HV // HK), t, h, bv)
-                    if state_dtype != "float32":
-                        for i, j in T.Parallel(DK, value_tile):
-                            state[i, j] = T.cast(T.cast(state[i, j], T.float16), T.float32)
             for i, j in T.Parallel(DK, value_tile):
-                State[h, i, bv * value_tile + j] = (
-                    state[i, j] if state_dtype == "float32" else T.cast(state[i, j], T.float16)
-                )
+                State[h, i, bv * value_tile + j] = state[i, j]
 
     return main
 
 
 @orin_jit
-def gdn_commit_controlled(
-    tokens=8, value_tile=16, key_heads=16, value_heads=48, state_dtype: str = "float32"
-):
+def gdn_commit_controlled(tokens=8, value_tile=16, key_heads=16, value_heads=48):
     """Same FP32 commit with a device-owned compact key stride per request.
 
     The fixed tensor extent is allocation capacity. Length supplies the actual
@@ -341,9 +294,6 @@ def gdn_commit_controlled(
     HK, HV = key_heads, value_heads
     if not 1 <= tokens <= 8 or HK <= 0 or HV % HK:
         raise ValueError("Invalid controlled GDN commit geometry")
-    if state_dtype not in ("float32", "float16"):
-        raise ValueError("Invalid GDN state storage dtype")
-    storage = T.float32 if state_dtype == "float32" else T.float16
     replay = rank_one(value_tile, staged=True)
 
     @T.prim_func
@@ -353,7 +303,7 @@ def gdn_commit_controlled(
         Update: T.Tensor((tokens, HV, DV), T.float32),
         Accepted: T.Tensor((1,), T.int32),
         Length: T.Tensor((1,), T.int32),
-        State: T.Tensor((HV, DK, DV), storage),
+        State: T.Tensor((HV, DK, DV), T.float32),
     ):
         with T.Kernel(DV // value_tile, HV, threads=128) as (bv, h):
             keys = T.alloc_shared((tokens, DK), T.float16)
@@ -364,22 +314,13 @@ def gdn_commit_controlled(
             state = T.alloc_fragment((DK, value_tile), T.float32)
             delta = T.alloc_fragment((value_tile,), T.float32)
             for i, j in T.Parallel(DK, value_tile):
-                state[i, j] = (
-                    State[h, i, bv * value_tile + j]
-                    if state_dtype == "float32"
-                    else T.cast(State[h, i, bv * value_tile + j], T.float32)
-                )
+                state[i, j] = State[h, i, bv * value_tile + j]
             for t in T.serial(tokens):
                 if t < Accepted[0]:
                     for j in T.Parallel(value_tile):
                         delta[j] = Update[t, h, bv * value_tile + j]
                     replay(state, keys, delta, T.exp(G[t, h]), 0, t, h, bv)
-                    if state_dtype != "float32":
-                        for i, j in T.Parallel(DK, value_tile):
-                            state[i, j] = T.cast(T.cast(state[i, j], T.float16), T.float32)
             for i, j in T.Parallel(DK, value_tile):
-                State[h, i, bv * value_tile + j] = (
-                    state[i, j] if state_dtype == "float32" else T.cast(state[i, j], T.float16)
-                )
+                State[h, i, bv * value_tile + j] = state[i, j]
 
     return main
