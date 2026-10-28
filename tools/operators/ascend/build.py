@@ -15,9 +15,14 @@ import tilelang
 from tilelang.jit.adapter.libgen import LibraryGenerator
 
 from tools.build.files import atomic_json, file_hash, source_hash
+from tools.operators.ascend.vector_launch import lower_independent_vector
 
 ROOT = Path(__file__).resolve().parents[3]
-SOURCES = [p for p in Path(__file__).parent.glob("*.py") if p.name != "validate.py"]
+SOURCES = [
+    p
+    for p in Path(__file__).parent.glob("*.py")
+    if p.name != "validate.py" and not p.name.startswith("test_")
+]
 LOWER_LOCK = threading.RLock()
 
 
@@ -43,13 +48,19 @@ def compile_kernel(function, name, operands, parameters, cache):
         "bisheng": subprocess.check_output(["bisheng", "--version"], text=True).splitlines()[0],
         "cann_home": os.environ["ASCEND_HOME_PATH"],
         "storage_rewrite": "explicit-npu-v1",
+        "vector_launch": "paired-aiv-v1",
     }
     module = Path(__file__).with_name(name.split(".")[0] + ".py")
     # Production names identify the source module. Include its inlined math
     # and the shared compiler/file helpers; unrelated operators have independent
     # cache identities. Legacy validation names retain the conservative closure.
     sources = (
-        [module, Path(__file__), Path(__file__).with_name("vector_math.py")]
+        [
+            module,
+            Path(__file__),
+            Path(__file__).with_name("vector_math.py"),
+            Path(__file__).with_name("vector_launch.py"),
+        ]
         if "." in name and module in SOURCES
         else SOURCES
     )
@@ -83,7 +94,7 @@ def compile_kernel(function, name, operands, parameters, cache):
         tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
     }
     artifact = lower_a2(function, configs)
-    source = artifact.kernel_source
+    source = lower_independent_vector(artifact.kernel_source)
     prototype = re.search(r'extern "C" void call\(([^)]*)\)', source)
     if prototype is None:
         raise ValueError("TileLang did not emit an AOT call wrapper")

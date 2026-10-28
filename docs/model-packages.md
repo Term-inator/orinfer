@@ -167,13 +167,18 @@ python -m tools.model.deepseek_v41.prepare \
 bash tools/operators/ascend/run.sh python3 -m tools.bench.ascend_single \
   --prepare artifacts/ascend-inputs.json \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend
-HCCL_NPU_SOCKET_PORT_RANGE=auto flock -w 5 artifacts/gpu-experiment.lock \
+HCCL_OP_EXPANSION_MODE=AIV HCCL_NPU_SOCKET_PORT_RANGE=auto \
+  flock -w 5 artifacts/gpu-experiment.lock \
   orinfer bench-ascend --plan artifacts/ascend-model/model-prepared.json \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017-w4a8-Ascend \
   --inputs artifacts/ascend-inputs.json --output-tokens 128 --repeats 3
 ```
 
 构建器引用原 checkpoint。离线 `prepare` 使用 NumPy、系统 C 编译器与 ARM NEON 8×8 转置，将 W4 bank、ND per-channel scale 和辅助 bias 写入物理布局文件。数值与尾部检查放在独立 CPU 测试，批量转换只执行 NEON 转置和顺序写盘。通过顺序 `pread` 读取单个专家，以有界 bank 缓冲写盘，避免对 ZFS 映射做逐字节转置。此转换保持原始 INT4 nibble，准备产物保留 W4，每卡在线仍只加载一份 W4；原 checkpoint 保留用于参考和其余张量。断点续转核对原文件的大小/mtime/inode、转换器身份、产物长度与完成标记；权重准备和在线加载均不扫描 payload 计算哈希。全部 bank 完成后原子发布准备计划，现有 AOT 与资产共享同一目录。加载前核对配置、tokenizer、Engram、AOT 库和绑定身份；设备分配使用大页优先策略及独立会话预算。
+
+八卡 910B3 的单流验收使用进程环境变量 `HCCL_OP_EXPANSION_MODE=AIV` 选择通信展开方式；先运行 `HCCL_OP_EXPANSION_MODE=AIV orinfer validate-hccl --devices 0,1,2,3,4,5,6,7` 验证目标设备，再以相同环境启动模型测量。
+
+固定版本的 TileLang-Ascend 编译器会为纯 Vector 程序生成混合任务。离线构建器识别仅使用 UB、没有跨核同步且网格固定的独立程序，移除未使用的 Cube 分配，生成 AIV-only 任务；物理网格扩大一倍并保留原有逻辑块和双 Vector 索引。含 Cube 计算、跨核同步、未知网格或仍使用 Cube 工作区的程序保留原调度。转换规则及源码计入编译缓存身份，改变输入的数值和 Graph replay 在离线验收中检查。
 
 测量排除权重加载和预热，输出固定输入的 token hash、全部生成 token ID、TTFT、decode 速度及端到端时延。TTFT 包含末位置输出头；由输入长度除以 TTFT 得到的值是 prefill 吞吐代理。Rust 计时包含 CPU 查找、提交、等待与 HCCL；`tools/bench/ascend_single.py` 对 vLLM 的测量还包含本机 HTTP 和调度开销。两端使用同一组原始 completion token，固定输出长度，关闭跨请求 prefix 复用和推测解码。输入 `cases` 可分别指定 `output_tokens`、`repeats` 和 `trace`，省略时沿用命令行设置。`--trace DIR` 下载每层输出用于排错；正式测量使用 `trace: false` 或省略 `--trace`。
 

@@ -32,6 +32,16 @@ DTYPE = {
     "u64": ("uint64", 8),
 }
 
+# Single-row choices measured with distinct weight banks and complete requests.
+# Keys are (integer, output, reduction); prefill keeps the common 64-column tile.
+DECODE_COLUMN_TILES = {
+    (True, 4096, 1280): 256,
+    (True, 2304, 5120): 128,
+    (True, 5120, 2304): 256,
+    (False, 5120, 1024): 128,
+    (False, 25600, 6144): 128,
+}
+
 
 class Builder:
     def __init__(self, output, rank, capacity, kernels):
@@ -230,6 +240,7 @@ class Builder:
                 "reduction": k,
                 "integer": integer,
                 "block_k": math.gcd(k, 512) if rows == 1 else 128,
+                "tile_n": DECODE_COLUMN_TILES.get((integer, n, k), 64) if rows == 1 else 64,
             },
             [
                 ("activation", x, "i8" if integer else "bf16", (rows, k), "read"),
