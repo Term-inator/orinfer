@@ -20,6 +20,8 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-init
 
 `--vision-checkpoint /path/to/original-vision` 从同一固定来源的原始 BF16 视觉目录构建 FP16 ViT。目录包含 `model.safetensors`、只列出视觉张量的标准索引、`config.json` 和记录 `repo`、`revision`、`sha256` 的 `source.json`。构建器校验来源和完整 payload，复用公共 ViT，生成动态 patch、图像特征覆盖和请求私有 MRoPE 绑定；图片数量和特征数继续受上下文及内存预算限制。与 MTP 联合构建时，草稿使用移位特征索引及同一 owner 的旋转坐标。
 
+视觉编码按串行生命周期复用中间存储，采用相同的 FP16 算术和舍入边界。默认 4K 上下文构建节省 288 MiB 视觉工作区，保留 16384 patch 容量。
+
 最终目录通过 Rust 原生计划校验后原子发布。生成成功、质量及完整请求 TPS 另行验收；构建完成仅表示原生包通过构造校验。有限专家模式使用 `--resident-experts N --cuda-graph off` 试跑。 Flash 专家通过逐矩阵地址表读取紧凑的预分配槽位，保持原始压缩 bank、scale 和整数运算；有限模式继续按真实路由选择完整专家。
 
 首次以单请求启动文本包，可显式限制常驻专家，并关闭 MTP 与前缀缓存：

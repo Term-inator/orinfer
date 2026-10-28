@@ -13,6 +13,18 @@ from tools.vision.source import fetch_processor
 
 PATCHES = 32768
 
+# The encoder is a serial stream. Pixels die after patch projection; QKV dies
+# after RoPE; attention dies after projection; FFN dies after its second linear.
+# K dies before projection, and residual hidden dies before merger output.
+STORAGE = {
+    "VQ": "VPixels",
+    "VK": "VNorm",
+    "VProjection": "VNorm",
+    "VQKV": "VFFN",
+    "VAttention": "VFFN",
+    "VMerged": "VHidden",
+}
+
 
 def overlay(b, name, embedding, rows, *, mtp=False):
     from kernels.vision.features import overlay as feature_overlay
@@ -81,23 +93,33 @@ def build(b):
     validate_vision(v, b.planner.H)
     patches = min(PATCHES, features * 4)
     h, f, out = v["hidden_size"], v["intermediate_size"], v["out_hidden_size"]
-    for name, shape, dtype in [
-        ("VPixels", [patches, 1536], "f16"),
-        ("VGrid", [2], "i32"),
-        ("VLength", [1], "i32"),
-        ("VHidden", [patches, h], "f16"),
-        ("VNorm", [patches, h], "f16"),
-        ("VQKV", [patches, 3 * h], "f16"),
-        ("VQ", [patches, h], "f16"),
-        ("VK", [patches, h], "f16"),
-        ("VV", [patches, h], "f16"),
-        ("VAttention", [patches, h], "f16"),
-        ("VProjection", [patches, h], "f16"),
-        ("VFFN", [patches, f], "f16"),
-        ("VMerged", [patches // 4, 4 * h], "f16"),
-        ("VOutput", [patches // 4, out], "f16"),
-    ]:
-        b.fixed(name, dtype, shape)
+    layouts = {
+        name: (shape, dtype)
+        for name, shape, dtype in [
+            ("VPixels", [patches, 1536], "f16"),
+            ("VGrid", [2], "i32"),
+            ("VLength", [1], "i32"),
+            ("VHidden", [patches, h], "f16"),
+            ("VNorm", [patches, h], "f16"),
+            ("VQKV", [patches, 3 * h], "f16"),
+            ("VQ", [patches, h], "f16"),
+            ("VK", [patches, h], "f16"),
+            ("VV", [patches, h], "f16"),
+            ("VAttention", [patches, h], "f16"),
+            ("VProjection", [patches, h], "f16"),
+            ("VFFN", [patches, f], "f16"),
+            ("VMerged", [patches // 4, 4 * h], "f16"),
+            ("VOutput", [patches // 4, out], "f16"),
+        ]
+    }
+    for name, target in STORAGE.items():
+        shape, dtype = layouts[name]
+        other, physical = layouts[target]
+        if dtype != physical or math.prod(shape) > math.prod(other):
+            raise ValueError(f"Vision storage does not cover its serial view: {name}")
+    for name, (shape, dtype) in layouts.items():
+        if name not in STORAGE:
+            b.fixed(name, dtype, shape)
 
     def weight(name, shape=None):
         physical = b.weights.visual["model.visual." + name]
@@ -111,7 +133,7 @@ def build(b):
         b.emit(
             name,
             fn,
-            {k: dict(kind="buffer", name=n) for k, n in args.items()},
+            {k: dict(kind="buffer", name=STORAGE.get(n, n)) for k, n in args.items()},
             patches // divisor,
             key="vision-" + key,
             row_divisor=divisor,
