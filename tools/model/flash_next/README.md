@@ -42,7 +42,7 @@ W8 调优包含寄存器 scale 复用和按行 tile 遍历的候选；它们读�
 在 CPU 上清点构造契约：
 
 ```bash
-PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.build \
+uv run --locked --project tools/environments/cuda python -m tools.model.flash_next.build \
   --model /path/to/native-model --model-output artifacts/models/flash-ready \
   --output artifacts/flash-plan --plan-only
 ```
@@ -71,7 +71,7 @@ MTP 包支持 1–7 个草稿；`0` 关闭，`auto` 沿用包默认。随机采�
 
 ## 原始权重与参考工具
 
-CPU 依赖由 `make python-env` 创建的 uv 环境管理。GPU 工具统一使用固定编译镜像和共享 GPU 锁；原始 BF16 固定 revision，按矩阵或专家分块读取和释放：
+CPU 依赖由 `make python-env` 创建的 uv 环境管理。GPU 工具使用 CUDA uv 环境、物理机工具链和共享 GPU 锁；原始 BF16 固定 revision，按矩阵或专家分块读取和释放：
 
 ```bash
 bash tools/quantization/run_flash_next.sh \
@@ -79,7 +79,7 @@ bash tools/quantization/run_flash_next.sh \
   --revision SOURCE_COMMIT_SHA --stage all \
   --output artifacts/quantization/flash-next/converted
 
-PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.weights \
+uv run --locked --project tools/environments/cuda python -m tools.model.flash_next.weights \
   --converted artifacts/quantization/flash-next/converted \
   --index /path/to/original/model.safetensors.index.json \
   --config /path/to/original/config.json --frontend /path/to/original \

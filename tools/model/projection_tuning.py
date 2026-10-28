@@ -275,6 +275,7 @@ class ProjectionTuner:
         ]
         sources.extend((root / "kernels").rglob("*.py"))
         sources.extend((root / "tools/build").glob("*.py"))
+        sources.append(root / "tools/environments/cuda/uv.lock")
         identity = dict(
             spec=spec,
             configs=configs,

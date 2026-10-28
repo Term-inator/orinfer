@@ -58,11 +58,17 @@ def inventory(data, package, manifest, compiler):
 def source_identity():
     # This pins both code generation and Rust's reconstruction of the input
     # architecture contract. Paths and mtimes never determine cache validity.
-    paths = [ROOT / "Cargo.lock", ROOT / "Cargo.toml", ROOT / "rust-toolchain.toml"]
+    paths = [
+        ROOT / "Cargo.lock",
+        ROOT / "Cargo.toml",
+        ROOT / "rust-toolchain.toml",
+        ROOT / "tools/environments/cuda/uv.lock",
+    ]
     paths.extend((ROOT / "crates").rglob("Cargo.toml"))
     paths.extend((ROOT / "configs").glob("*.json"))
     for directory, suffix in (
         ("kernels/model", "*.py"),
+        ("kernels/operators", "*.py"),
         ("tools/model", "*.py"),
         ("tools/operators", "*.py"),
         ("tools/build", "*.py"),

@@ -19,7 +19,7 @@ class Aot:
         self.kernels, self.dynamic = [], []
         self.objects = {}
         self.recipes = {}
-        sources = []
+        sources = [ROOT / "tools/environments/cuda/uv.lock"]
         for directory in [
             ROOT / "kernels",
             ROOT / "tools/model/qwen35",

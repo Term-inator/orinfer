@@ -222,7 +222,7 @@ cargo build --release --locked --offline -p orinfer-models
 在保留权重和 cubin 的情况下，重建原生库和目录：
 
 ```bash
-PYTHONPATH=. .venv/bin/python -m tools.model.catalog \
+uv run --locked python -m tools.model.catalog \
   --model /path/to/prepared-model --output /path/to/rebuilt-model
 ```
 
@@ -265,7 +265,7 @@ orinfer validate-model /path/to/prepared-model
 模型构建者使用 Python 工具生成 `.tar.xz` 执行包，供部署时安装：
 
 ```bash
-PYTHONPATH=. .venv/bin/python tools/model/package.py archive /path/to/package /path/to/package.tar.xz
+uv run --locked python -m tools.model.package archive /path/to/package /path/to/package.tar.xz
 ```
 
 ## 合并发布布局
@@ -273,7 +273,7 @@ PYTHONPATH=. .venv/bin/python tools/model/package.py archive /path/to/package /p
 离线调优结束后，将 GPU 权重合并成约 2 GiB 的标准 safetensors 分片，CPU 查表按连续编码段合并。张量名称、物理布局、量化位模式及 CPU 行序保持不变；更新索引、CPU 文件偏移与身份 hash。模型目录只包含模型数据，匹配的执行包独立写入指定缓存：
 
 ```bash
-PYTHONPATH=. .venv/bin/python tools/model/compact.py \
+uv run --locked python -m tools.model.compact \
   --model /path/to/prepared-model --output /path/to/compact-model \
   --package-cache ~/.cache/orinfer/packages
 orinfer validate-model /path/to/compact-model
@@ -282,7 +282,7 @@ orinfer validate-model /path/to/compact-model
 Flash Next 的正式权重发布采用稳定的组件和层组名称：主模型专家每三层一片，其余原权重每八层一片，Q4 投影、输出头、HC 无损压缩表示、MTP 和视觉各自独立；CPU 表复用已合并的连续行分片。单片上限默认为 2 GiB，超限会返回发布错误。重打包直接复用每个张量的量化字节、布局、身份和已编译 kernel：
 
 ```bash
-PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.repack \
+uv run --locked python -m tools.model.flash_next.repack \
   --model /path/to/optimized-model --output /path/to/published-model
 orinfer validate-model /path/to/published-model
 ```

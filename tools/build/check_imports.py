@@ -1,17 +1,27 @@
-"""Check offline module references inside the compiler image without using a GPU."""
+"""Check offline module references in the CUDA uv environment without using a GPU."""
 
 import importlib
 from pathlib import Path
 
 
+def source_modules(root):
+    modules = []
+    for directory in ("kernels", "tools"):
+        for current, directories, files in (root / directory).walk():
+            directories[:] = [
+                name for name in directories if not name.startswith(".") and name != "__pycache__"
+            ]
+            modules.extend(
+                current / name
+                for name in files
+                if name.endswith(".py") and not name.startswith("test_") and name != "__init__.py"
+            )
+    return sorted(modules)
+
+
 def main():
     root = Path(__file__).resolve().parents[2]
-    modules = sorted(
-        path
-        for directory in ("kernels", "tools")
-        for path in (root / directory).rglob("*.py")
-        if not path.name.startswith("test_") and path.name != "__init__.py"
-    )
+    modules = source_modules(root)
     failures = []
     for path in modules:
         name = ".".join(path.relative_to(root).with_suffix("").parts)

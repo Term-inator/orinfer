@@ -94,6 +94,7 @@ def rebuild(args):
                 "tools/model/host_compiler.py",
                 "tools/model/qwen35/parallel.py",
                 "tools/model/qwen35/rebuild_attention.py",
+                "tools/environments/cuda/uv.lock",
             )
         ],
     )

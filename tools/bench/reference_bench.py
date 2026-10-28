@@ -4,15 +4,13 @@ import argparse
 import json
 import statistics
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "eval"))
-from scoring_common import execution_identity
+from tools.eval.scoring_common import execution_identity
 
 SEED = 20261002
 

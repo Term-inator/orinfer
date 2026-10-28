@@ -60,7 +60,7 @@
 - 先用 rg 检查调用者和依赖；保持修改小而完整。subagent 仅在用户或适用指令明确要求时启动。
 - 模型 packet 通过公共 Rows、视图及地址表绑定组件计算行布局；模型声明 owner 角色候选、计算顺序与状态边界。普通、混合、验证和 draft 复用这些组件。
 - 离线编译复用 compile/private_rows，调优复用 tuning 的候选、缓存及 Graph 测量；文件身份、原子元数据和共享 GPU 锁位于 tools/build。共享组件源码计入消费者缓存身份。
-- CPU Python 依赖用 uv 管理项目 `.venv`，通过 `make python-env` 在独立虚拟环境中同步固定版本。`make check` 执行 Rust 格式/编译/clippy/测试及 CPU 评测检查；GPU 验证用 `bash tools/operators/run.sh` 的固定编译镜像。
+- CPU Python 依赖由根目录 `pyproject.toml`/`uv.lock` 管理，CUDA 离线依赖由 `tools/environments/cuda` 中的独立 uv 项目管理；分别用 `make python-env` 和 `make cuda-env` 同步，工具通过 `uv run --locked` 执行。`make check` 执行 Rust 格式/编译/clippy/测试及 CPU 评测检查；CUDA GPU 验证用 `bash tools/operators/run.sh`，直接使用当前物理机的 CUDA 工具链和独立 uv 环境。
 - GPU 工作通过 `artifacts/gpu-experiment.lock` 串行，保留其他服务，并保持全局频率、功耗和缓存设置。
 - GPU 单测使用本轮构建输出的测试可执行文件，核对测试确实执行，并从本轮构建结果解析实际可执行文件路径。
 - 当前原生 Flash Next 的整数算子重建使用 `tools/model/flash_next/build.py`：从权重几何和 host ABI 读取构造契约，真实权重调优，编译对象按内容校验并原子缓存，最终模型经 Rust 计划检查后原子发布。其输入为模型固定的执行契约；HC/QSA/状态及专家联合选择表保留输入已验证实现，专家真实几何另行验证。正式重建统一使用该入口。

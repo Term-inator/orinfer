@@ -1,10 +1,18 @@
-.PHONY: check fmt lint build info python-env compiler-image check-offline check-gpu
+.PHONY: check check-locks fmt lint build info python-env cuda-env check-offline check-gpu
 
-PYTHON ?= .venv/bin/python
+UV ?= uv
+PYTHON = $(UV) run --locked python
+CUDA_PYTHON = $(UV) run --locked --project tools/environments/cuda python
 
 python-env:
-	uv venv --allow-existing --python python3.12 .venv
-	uv pip sync --python $(PYTHON) tools/build/cpu-requirements.txt
+	$(UV) sync --locked
+
+cuda-env:
+	$(UV) sync --locked --project tools/environments/cuda
+
+check-locks:
+	$(UV) lock --check --offline
+	$(UV) lock --check --offline --project tools/environments/cuda
 
 build:
 	cargo build --release --locked --offline
@@ -19,17 +27,17 @@ lint:
 	$(PYTHON) -m ruff check tools kernels
 	cargo clippy --workspace --all-targets --locked --offline -- -D warnings
 
-check: lint
+check: check-locks lint
 	cargo check --workspace --locked --offline
 	cargo test --workspace --locked --offline
-	$(PYTHON) -m unittest tools.build.test_files tools.build.test_jetson_wheels tools.model.test_tuning -v
+	$(PYTHON) -m unittest tools.build.test_files tools.build.test_imports tools.model.test_tuning -v
 	$(PYTHON) -m unittest discover -s tools/api -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/eval -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/bench -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/operators -p 'test_abi.py' -v
 	$(PYTHON) -m unittest discover -s tools/vision -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/quantization -p 'test_*.py' -v
-	$(PYTHON) -m unittest tools.model.test_safetensors_source -v
+	$(PYTHON) -m unittest tools.model.test_safetensors_source tools.model.test_frontend -v
 	$(PYTHON) -m unittest tools.model.qwen35.test_build tools.model.qwen35.test_parallel tools.model.qwen35.test_attention tools.model.qwen35.test_rebuild_attention tools.model.qwen35.test_rebuild_mtp -v
 	$(PYTHON) -m unittest tools.model.nemotron_embed.test_config tools.model.qwen_reranker.test_config -v
 	$(PYTHON) -m unittest tools.model.test_compact -v
@@ -44,12 +52,9 @@ check: lint
 info:
 	cargo run --offline -p orinfer-cli -- info
 
-compiler-image:
-	docker build $(DOCKER_BUILD_ARGS) -t orinfer-compiler:0.1.3 -f tools/build/compiler.Dockerfile .
-
 check-offline:
-	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR):$(CURDIR)/tools/operators" --entrypoint /opt/venv/bin/python orinfer-compiler:0.1.3 -m tools.build.check_imports
-	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR)" --entrypoint /opt/venv/bin/python orinfer-compiler:0.1.3 -m unittest tools.model.test_frontend tools.model.qwen35.test_reference tools.model.flash_next.tests.test_scenes tools.model.flash_next.tests.test_reference_math tools.model.flash_next.tests.test_teacher tools.model.flash_next.tests.test_qsa_reference tools.model.flash_next.tests.test_native_contract tools.model.flash_next.tests.test_dynamic_batch -v
+	$(CUDA_PYTHON) -m tools.build.check_imports
+	$(CUDA_PYTHON) -m unittest tools.model.qwen35.test_reference tools.model.flash_next.tests.test_scenes tools.model.flash_next.tests.test_reference_math tools.model.flash_next.tests.test_teacher tools.model.flash_next.tests.test_qsa_reference tools.model.flash_next.tests.test_native_contract tools.model.flash_next.tests.test_dynamic_batch -v
 
 check-gpu:
 	$(PYTHON) tools/bench/check_gpu.py --model "$(MODEL)" --output "$(OUTPUT)"

@@ -1,0 +1,27 @@
+[project]
+name = "orinfer-cuda-tools"
+version = "0.2.2"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "orinfer-tools",
+    "cuda-python>=12.6.2.post1,<13",
+    "nvidia-nccl-cu12>=2.27.7",
+    "tilelang>=0.1.15",
+    "torch==2.14.1+orinfer1",
+    "torchvision==0.29.1+orinfer1",
+    "transformers[chat-template,vision]>=5.21.0",
+]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux' and platform_machine == 'aarch64'"]
+
+[tool.uv.sources]
+orinfer-tools = { path = "../../.." }
+torch = { url = "https://github.com/iMMIQ/pytorch/releases/download/jetson-v2.14.1-orinfer1-cu126-cp312-sm87/torch-2.14.1%2Borinfer1-cp312-cp312-linux_aarch64.whl" }
+torchvision = { url = "https://github.com/iMMIQ/pytorch/releases/download/jetson-v2.14.1-orinfer1-cu126-cp312-sm87/torchvision-0.29.1%2Borinfer1-cp312-cp312-linux_aarch64.whl" }
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true

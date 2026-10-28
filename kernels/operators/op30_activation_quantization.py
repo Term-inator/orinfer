@@ -42,7 +42,7 @@ def _compile(K: int, group: int, masked: bool, fused: bool, threads: int):
                 if j < group and col < K:
                     if fused:
                         # Do not quantize FP32 SwiGLU directly: this FP16 cast
-                        # is the exact materialization boundary used by op04.
+                        # matches the materialized FP16 SwiGLU boundary.
                         value[j] = T.cast(swiglu_fp16(X[row, col], X[row, K + col]), T.float32)
                     else:
                         value[j] = T.cast(X[row, col], T.float32)
@@ -77,17 +77,6 @@ def activation_quantization(
     scale=half(max(amax/127,2**-24)), code=clamp(rint(x/float(scale)),-127,127).
     """
     return _build(K, group_size, masked, False, threads)
-
-
-def swiglu_activation_quantization(
-    K: int = 17408, group_size: int | None = None, *, masked: bool = False, threads: int = 256
-):
-    """Build the same ABI with split-layout X[M,2*K]=[gate|up].
-
-    The imported op04 macro returns FP16 before the FP32 amax/code arithmetic.
-    This path must match op04 split -> activation_quantization bit for bit.
-    """
-    return _build(K, group_size, masked, True, threads)
 
 
 def _build(K, group_size, masked, fused, threads):

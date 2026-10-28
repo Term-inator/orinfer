@@ -7,69 +7,39 @@ if [[ $# -lt 2 ]]; then
     echo "usage: run.sh [--resume] runner.py output-directory [runner args]" >&2
     exit 2
 fi
-runner="$1"
+cd "$repo_dir"
+runner="$(realpath --relative-to="$repo_dir" -- "$1")"
 output_arg="$2"
 shift 2
-cd "$repo_dir"
+if [[ "$runner" == ../* || "$runner" != *.py || ! -f "$runner" ]]; then
+    echo 'Runner must be a Python module within the repository.' >&2
+    exit 2
+fi
+module="${runner%.py}"
+module="${module//\//.}"
 if [[ "$output_arg" = /* ]]; then output_dir="$output_arg"; else output_dir="$repo_dir/$output_arg"; fi
 if [[ -e "$output_dir" && "$resume" != true ]]; then echo "Refusing existing output: $output_dir (use --resume to reuse an offline build)" >&2; exit 2; fi
-mkdir -p "$output_dir"
+uv sync --locked --project "$repo_dir"
+uv sync --locked --project "$repo_dir/tools/environments/cuda"
+cpu=(uv run --locked --no-sync --project "$repo_dir" python)
+cuda=(uv run --locked --no-sync --project "$repo_dir/tools/environments/cuda")
 mkdir -p "$output_dir/measurement-source"
-cp --parents "$runner" tools/operators/common.py tools/operators/run.sh "$output_dir/measurement-source/"
+cp --parents "$runner" tools/operators/common.py tools/operators/run.sh \
+    pyproject.toml uv.lock tools/environments/cuda/pyproject.toml tools/environments/cuda/uv.lock \
+    "$output_dir/measurement-source/"
 kernel_file="kernels/operators/$(basename -- "$runner")"
 if [[ -f "$kernel_file" ]]; then cp --parents "$kernel_file" "$output_dir/measurement-source/"; fi
 exec 9>"$repo_dir/artifacts/gpu-experiment.lock"
 flock 9
-"${PYTHON:-$repo_dir/.venv/bin/python}" tools/bench/sample_machine.py --output "$output_dir/machine-before.json"
+"${cpu[@]}" -m tools.bench.sample_machine --output "$output_dir/machine-before.json"
 printf '%s\n' "compile-and-test" > "$output_dir/phase.txt"
-sampler_pid=""
-container_name="orinfer-operator-$$"
-extra_mounts=()
-group_args=()
-for group_id in $(id -G); do group_args+=(--group-add "$group_id"); done
-reference_env=()
-# Native binding finalization uses the same pinned host Rust toolchain and
-# cached dependencies. Only compiler/registry assets are mounted, no credentials.
-native_cargo_binary="$(rustup which cargo)"
-native_toolchain="$(dirname -- "$(dirname -- "$native_cargo_binary")")"
-native_registry="${CARGO_HOME:-$HOME/.cargo}/registry"
-native_cargo_cache="$repo_dir/artifacts/compiler-cargo"
-mkdir -p "$native_cargo_cache/registry"
-native_cargo_config="${CARGO_HOME:-$HOME/.cargo}/config.toml"
-if [[ -f "$native_cargo_config" ]]; then
-    # Preserve registry replacement identities for offline lookup, excluding
-    # unrelated HTTP, credential-provider and user configuration sections.
-    awk '/^\[/{source_section=($0 ~ /^\[source\./)} source_section {print}' \
-        "$native_cargo_config" > "$native_cargo_cache/config.toml"
-fi
-extra_mounts+=(-v "$native_toolchain:$native_toolchain:ro"
-    -v "$native_registry:$native_cargo_cache/registry:ro")
-reference_env+=(-e "CARGO_HOME=$native_cargo_cache"
-    -e "RUSTC=$native_toolchain/bin/rustc"
-    -e "RUSTDOC=$native_toolchain/bin/rustdoc"
-    -e "PATH=$native_toolchain/bin:/opt/venv/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-declare -A mounted_inputs=()
-for variable in ORINFER_CHECKPOINT_DIR ORINFER_REFERENCE_CHECKPOINT ORINFER_REFERENCE_SOURCE ORINFER_REFERENCE_ACTIVATIONS ORINFER_EXECUTION_CACHE; do
-    if [[ -n "${!variable:-}" ]]; then
-        input_path="$(realpath -- "${!variable}")"
-        if [[ -z "${mounted_inputs[$input_path]+present}" ]]; then
-            extra_mounts+=(-v "$input_path:$input_path:ro")
-            mounted_inputs["$input_path"]=1
-        fi
-        reference_env+=(-e "$variable=$input_path")
-    fi
-done
-entrypoint="${ORINFER_COMPILER_PYTHON:-/opt/venv/bin/python}"
-command_args=("$runner")
+command_args=(python -m "$module")
 if [[ -n "${ORINFER_OPERATOR_SANITIZER:-}" ]]; then
-    entrypoint="/usr/local/cuda/bin/compute-sanitizer"
-    command_args=(--tool "$ORINFER_OPERATOR_SANITIZER" --error-exitcode 99)
+    command_args=(compute-sanitizer --tool "$ORINFER_OPERATOR_SANITIZER" --error-exitcode 99)
     if [[ -n "${ORINFER_OPERATOR_SANITIZER_KERNEL_NAME:-}" ]]; then
-        # Compute Sanitizer accepts an explicit kernel filter as one argument;
-        # never interpret it as shell flags. Preserve the inspection scope.
         command_args+=(--kernel-name "$ORINFER_OPERATOR_SANITIZER_KERNEL_NAME")
     fi
-    command_args+=(/opt/venv/bin/python "$runner")
+    command_args+=(python -m "$module")
     printf '%q ' "${command_args[@]}" > "$output_dir/sanitizer-command.txt"
     printf '\n' >> "$output_dir/sanitizer-command.txt"
 fi
@@ -78,12 +48,9 @@ if [[ -n "${ORINFER_OPERATOR_NCU:-}" ]]; then
         echo 'Cannot combine Nsight Compute and Compute Sanitizer' >&2
         exit 2
     fi
-    entrypoint="/usr/local/cuda/bin/ncu"
-    # Keep clocks and caches untouched. Explicit candidate symbols prevent
-    # accidentally profiling a same-run reference instead of the candidate.
-    command_args=(--clock-control none --cache-control none --set detailed
+    command_args=(ncu --clock-control none --cache-control none --set detailed
         --kernel-name-base function --kernel-name "${ORINFER_OPERATOR_NCU_KERNEL_NAME:-regex:^kernel_kernel$}"
-        --launch-count 1 --export "$output_dir/ncu" /opt/venv/bin/python "$runner")
+        --launch-count 1 --export "$output_dir/ncu" python -m "$module")
     printf '%q ' "${command_args[@]}" > "$output_dir/ncu-command.txt"
     printf '\n' >> "$output_dir/ncu-command.txt"
 fi
@@ -92,41 +59,51 @@ if [[ -n "${ORINFER_OPERATOR_NSYS:-}" ]]; then
         echo 'Cannot combine Nsight Systems with another GPU profiler' >&2
         exit 2
     fi
-    entrypoint="$(realpath -- "$(command -v nsys)")"
-    nsys_directory="$(dirname -- "$(dirname -- "$entrypoint")")"
-    if [[ ! -x "$nsys_directory/host-linux-armv8/QdstrmImporter" ]]; then
-        echo 'Jetson Nsight Systems installation must include QdstrmImporter' >&2
-        exit 2
-    fi
-    extra_mounts+=(-v "$nsys_directory:$nsys_directory:ro")
-    command_args=(profile --trace cuda,nvtx --sample none --cpuctxsw none
+    command_args=(nsys profile --trace cuda,nvtx --sample none --cpuctxsw none
         --capture-range cudaProfilerApi --capture-range-end stop
-        --cuda-graph-trace node --output "$output_dir/nsys" /opt/venv/bin/python "$runner")
+        --cuda-graph-trace node --output "$output_dir/nsys" python -m "$module")
     printf '%q ' "${command_args[@]}" > "$output_dir/nsys-command.txt"
     printf '\n' >> "$output_dir/nsys-command.txt"
 fi
+sampler_pid=""
+worker_pid=""
+log_pid=""
 cleanup() {
-    docker rm -f "$container_name" >/dev/null 2>&1 || true
+    if [[ -n "$worker_pid" ]]; then
+        kill -TERM -- "-$worker_pid" 2>/dev/null || true
+        for _attempt in {1..20}; do
+            if ! kill -0 -- "-$worker_pid" 2>/dev/null; then break; fi
+            sleep 0.1
+        done
+        kill -KILL -- "-$worker_pid" 2>/dev/null || true
+        wait "$worker_pid" 2>/dev/null || true
+    fi
     touch "$output_dir/sampler.stop"
     if [[ -n "$sampler_pid" ]]; then wait "$sampler_pid" || true; fi
-    "${PYTHON:-$repo_dir/.venv/bin/python}" tools/bench/sample_machine.py --output "$output_dir/machine-after.json" || true
+    if [[ -n "$log_pid" ]]; then wait "$log_pid" || true; fi
+    "${cpu[@]}" -m tools.bench.sample_machine --output "$output_dir/machine-after.json" || true
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 rm -f "$output_dir/sampler.stop"
-"${PYTHON:-$repo_dir/.venv/bin/python}" tools/bench/sample_continuous.py --output "$output_dir/machine.jsonl" \
+"${cpu[@]}" -m tools.bench.sample_continuous --output "$output_dir/machine.jsonl" \
     --phase "$output_dir/phase.txt" --stop "$output_dir/sampler.stop" &
 sampler_pid=$!
-docker run --rm --name "$container_name" --runtime nvidia --network none \
-    --user "$(id -u):$(id -g)" "${group_args[@]}" \
-    --entrypoint "$entrypoint" --shm-size 2g -v "$repo_dir:$repo_dir" -v "$output_dir:$output_dir" \
-    "${extra_mounts[@]}" "${reference_env[@]}" -w "$repo_dir" -e OMP_NUM_THREADS=2 -e OPENBLAS_NUM_THREADS=2 \
-    -e PYTHONPATH="$repo_dir:$repo_dir/tools/operators${ORINFER_COMPILER_SITE_PACKAGES:+:$ORINFER_COMPILER_SITE_PACKAGES}" \
-    -e TORCH_EXTENSIONS_DIR="$output_dir/cache/torch" -e XDG_CACHE_HOME="$output_dir/cache" \
-    -e PYTHONDONTWRITEBYTECODE=1 \
-    -e ORINFER_OPERATOR_OUTPUT="$output_dir" -e TILELANG_CACHE_DIR="${ORINFER_TILELANG_CACHE_DIR:-$output_dir/cache}" \
-    -e LD_PRELOAD=/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1 \
-    "${ORINFER_OPERATOR_IMAGE:-orinfer-compiler:0.1.3}" "${command_args[@]}" \
-    --output "$output_dir" "$@" 2>&1 | tee "$output_dir/run.log"
+export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 PYTHONDONTWRITEBYTECODE=1
+export TORCH_EXTENSIONS_DIR="$output_dir/cache/torch" XDG_CACHE_HOME="$output_dir/cache"
+export ORINFER_OPERATOR_OUTPUT="$output_dir"
+export TILELANG_CACHE_DIR="${ORINFER_TILELANG_CACHE_DIR:-$output_dir/cache}"
+exec {log_fd}> >(tee "$output_dir/run.log")
+log_pid=$!
+setsid "${cuda[@]}" "${command_args[@]}" --output "$output_dir" "$@" >&"$log_fd" 2>&1 &
+worker_pid=$!
+exec {log_fd}>&-
+status=0
+wait "$worker_pid" || status=$?
+wait "$log_pid" || true
+log_pid=""
+if [[ $status != 0 ]]; then exit "$status"; fi
 if [[ -n "${ORINFER_OPERATOR_NSYS:-}" && ! -f "$output_dir/nsys.nsys-rep" ]]; then
     echo 'Nsight Systems did not export a report; any raw stream remains in the output directory' >&2
     exit 1

@@ -9,8 +9,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from quick_quality import analyze
-from scoring_common import (
+from tools.eval.quick_quality import analyze
+from tools.eval.scoring_common import (
     SEED,
     execution_identity,
     pair_probes,

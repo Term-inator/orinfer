@@ -6,7 +6,7 @@
 
 ## 算子与参考
 
-GPU 验证使用固定编译镜像及共享 GPU 锁，使用新输出目录：
+GPU 验证使用 CUDA uv 环境、物理机工具链及共享 GPU 锁，使用新输出目录：
 
 ```bash
 bash tools/operators/run.sh tools/vision/validate_kernels.py artifacts/vision/kernels-check
