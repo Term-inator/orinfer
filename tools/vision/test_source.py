@@ -1,18 +1,20 @@
 """Pinned vision-only downloads retain BF16 tensors and reject corrupted reuse."""
 
 import contextlib
+import io
 import json
 from pathlib import Path
 import struct
 import tempfile
 import unittest
+import urllib.parse
 from unittest.mock import patch
 
 from tools.vision.source import fetch_vision, fetch_processor
 
 
 class VisionSourceTests(unittest.TestCase):
-    def test_cached_processor_overrides_cannot_change_rust_preprocessing(self):
+    def test_pinned_processor_download_and_cached_overrides(self):
         valid = dict(
             patch_size=16,
             temporal_patch_size=2,
@@ -24,7 +26,18 @@ class VisionSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             destination = Path(root)
             file = destination / "preprocessor_config.json"
-            file.write_text(json.dumps(valid))
+            with patch(
+                "urllib.request.urlopen",
+                return_value=contextlib.closing(io.BytesIO(json.dumps(valid).encode())),
+            ) as request:
+                self.assertEqual(
+                    fetch_processor("modelscope:org/model", "a" * 40, destination), file
+                )
+                url = urllib.parse.urlparse(request.call_args.args[0])
+                self.assertEqual(url.netloc, "modelscope.cn")
+                query = urllib.parse.parse_qs(url.query)
+                self.assertEqual(query["Revision"], ["a" * 40])
+                self.assertEqual(query["FilePath"], ["preprocessor_config.json"])
             self.assertEqual(fetch_processor("org/model", "a" * 40, destination), file)
             valid["resample"] = 1
             file.write_text(json.dumps(valid))
@@ -84,6 +97,10 @@ class VisionSourceTests(unittest.TestCase):
                 data, payloads["first"][:8] + payloads["first"][16:] + payloads["second"]
             )
             self.assertEqual(header["model.visual.c"]["data_offsets"], [16, 24])
+            published_index = json.loads((Path(root) / "model.safetensors.index.json").read_text())
+            self.assertEqual(
+                published_index["weight_map"], {name: "model.safetensors" for name in entries}
+            )
             self.assertEqual(fetch_vision(config, Path(root)), path)
             other = json.loads(json.dumps(config))
             other["quantization_config"]["source_revision"] = "b" * 40

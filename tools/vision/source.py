@@ -7,7 +7,7 @@ import tempfile
 import urllib.request
 
 from tools.build.files import file_hash, write_json
-from tools.model.safetensors_source import Source
+from tools.model.safetensors_source import Source, local_header, remote_url
 
 
 def fetch_processor(repo, revision, destination):
@@ -16,7 +16,7 @@ def fetch_processor(repo, revision, destination):
         raw = output.read_bytes()
     else:
         with urllib.request.urlopen(
-            f"https://huggingface.co/{repo}/resolve/{revision}/preprocessor_config.json", timeout=60
+            remote_url(repo, revision, "preprocessor_config.json"), timeout=60
         ) as response:
             raw = response.read(65537)
     if len(raw) > 65536:
@@ -61,11 +61,16 @@ def fetch_vision(config, destination):
             file_hash(output),
         ):
             raise ValueError("Cached vision weights differ from the pinned source")
+        _, header = local_header(output)
+        expected_index = {n: "model.safetensors" for n in header if n != "__metadata__"}
+        cached_index = json.loads((destination / "model.safetensors.index.json").read_text())
+        if cached_index["weight_map"] != expected_index:
+            raise ValueError("Cached vision index differs from the published encoder")
         fetch_processor(repo, revision, destination)
         return output
     # Source validates the repository, pinned revision and every tensor extent.
     with urllib.request.urlopen(
-        f"https://huggingface.co/{repo}/resolve/{revision}/model.safetensors.index.json", timeout=60
+        remote_url(repo, revision, "model.safetensors.index.json"), timeout=60
     ) as response:
         index = response.read(16 * 1024 * 1024 + 1)
     if len(index) > 16 * 1024 * 1024:
@@ -113,6 +118,13 @@ def fetch_vision(config, destination):
         temporary.replace(output)
         write_json(
             identity, dict(repo=repo, revision=revision, sha256=digest, parameters=offset // 2)
+        )
+        write_json(
+            index_path,
+            dict(
+                metadata=dict(total_size=offset),
+                weight_map={name: "model.safetensors" for name in header},
+            ),
         )
         (destination / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     finally:

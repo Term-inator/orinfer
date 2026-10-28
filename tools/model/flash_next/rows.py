@@ -287,7 +287,12 @@ class Rows:
         stride = 48 * len(columns)
         self.b.emit(
             "flash_decode/packet/inputs",
-            lambda: decode_packet.inputs(stride, self.p.capacity, 0, False),
+            lambda: decode_packet.inputs(
+                stride,
+                self.p.capacity,
+                self.p.capacity if self.p.has_vision else 0,
+                self.p.has_vision,
+            ),
             {
                 "Pointers": pointer(TABLE),
                 "Embedding": pointer("FlashDecode_M1_Embedding"),

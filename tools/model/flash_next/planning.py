@@ -22,18 +22,21 @@ class Recipe:
 
 
 class Planner(Model):
-    def __init__(self, assembly, context, output, *, target=None):
+    def __init__(self, assembly, context, output, *, target=None, vision=False):
         if type(context) is not int or not 4096 <= context <= 262144:
             raise ValueError("Native Flash construction needs context in 4096..262144")
         self.config = assembly["config"]
         validate(self.config, context)
         self.is_mtp = self.config["quantization_config"].get("component") == "mtp"
+        if type(vision) is not bool:
+            raise ValueError("Invalid visual planning policy")
         if self.is_mtp:
             if target is None or target.is_mtp or target.capacity != context:
                 raise ValueError("MTP planning requires a matching target planner")
             validate_pair(self.config, target.config, context)
         elif target is not None:
             raise ValueError("Only MTP planning shares a target")
+        self.has_vision = target.has_vision if self.is_mtp else vision
         self.capacity, self.output = context, output
         self.draft_vocab, self.decode_w8_optimized = None, True
         self.layer_ids = (48,) if self.is_mtp else tuple(range(48))
@@ -108,6 +111,15 @@ class Planner(Model):
             self.position_gpu = tensor(prefix + "Position", (1,), "i32")
             self.lengths = tensor(prefix + "Length", (1,), "i32")
             self.position_out = tensor(prefix + "PositionOut", (1,), "i32")
+            if self.has_vision:
+                if self.is_mtp:
+                    self.mrope_positions = target.mrope_positions
+                    self.tensors["MRopePositions"] = self.mrope_positions
+                    self.storage_names[self.mrope_positions.untyped_storage()._cdata] = (
+                        "MRopePositions"
+                    )
+                else:
+                    self.mrope_positions = tensor("MRopePositions", (context, 3), "i32")
 
     def kernel(self, key, build):
         if key not in self.kernels:

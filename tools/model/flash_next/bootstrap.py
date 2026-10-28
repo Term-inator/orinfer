@@ -62,6 +62,15 @@ def build(args):
             if draft_checkpoint
             else None
         ),
+        vision=(
+            dict(
+                source=file_hash(args.vision_checkpoint / "source.json"),
+                index=file_hash(args.vision_checkpoint / "model.safetensors.index.json"),
+                config=file_hash(args.vision_checkpoint / "config.json"),
+            )
+            if args.vision_checkpoint
+            else None
+        ),
     )
     args.output.mkdir(parents=True, exist_ok=True)
     write_json(
@@ -113,6 +122,10 @@ def build(args):
         weights.buffers = dict(weights.buffers)
         weights.scopes = dict(weights.scopes)
         weights.attach_mtp(draft_weights)
+    if args.vision_checkpoint:
+        from tools.model.flash_next.vision import assemble as assemble_vision
+
+        write_json(root / "vision-asset.json", assemble_vision(weights, args.vision_checkpoint))
     source = Source(
         args.source_index,
         repo=configuration["source"],
@@ -127,8 +140,15 @@ def build(args):
     prepare_chat_template(args.checkpoint, root / "chat_template.jinja")
     prepare_generation_config(args.checkpoint, root / "generation_config.json")
     write_json(root / "inputs-asset.json", publish_inputs(checkpoint, root))
-    planner = Planner(assembly, args.context, args.output)
+    planner = Planner(
+        assembly, args.context, args.output, vision=args.vision_checkpoint is not None
+    )
     bindings = Bindings(planner, weights, args.output, args.cache)
+    vision = None
+    if args.vision_checkpoint:
+        from tools.model.flash_next.vision import build as build_vision
+
+        vision = build_vision(bindings)
     for rows in (4096, 1):
         bindings.trace(rows)
     row_programs = Rows(bindings, mtp=draft_checkpoint is not None)
@@ -156,6 +176,7 @@ def build(args):
             batch_layout=row_programs.layout(),
             precision=precision,
             mtp=mtp,
+            vision=vision,
         ),
     )
     data = publish(
@@ -165,6 +186,7 @@ def build(args):
         args.output,
         Path(__file__).resolve().parents[3] / "target/release/orinfer",
         mtp=mtp,
+        vision=vision,
     )
     write_json(
         args.output / "results.json",

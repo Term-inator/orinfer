@@ -63,6 +63,7 @@ class Weights:
     def __init__(self, checkpoint, root):
         self.source, self.root = checkpoint, Path(root)
         self.sources = [checkpoint]
+        self.visual, self.visual_parameters = {}, 0
         self.prefix = (
             "Mtp_" if checkpoint.config["quantization_config"].get("component") == "mtp" else ""
         )

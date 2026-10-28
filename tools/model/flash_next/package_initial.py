@@ -11,7 +11,7 @@ from tools.model.package import execution_identity, model_library
 from tools.model.publication import atomic_model
 
 
-def publish(bindings, layout, destination, output, engine, *, mtp=None):
+def publish(bindings, layout, destination, output, engine, *, mtp=None, vision=None):
     from tools.model.flash_next.build import toolchain
     from tools.model.sampling import append as append_sampling
 
@@ -108,8 +108,10 @@ def publish(bindings, layout, destination, output, engine, *, mtp=None):
             for source in b.weights.sources
             for n in source.parts
             if ".ple_embedding." not in n
-        ),
-        weight_scope="E8P Q2 experts, signed-block128 Q4 selected projections, W8 sensitive projections, BF16 HC; CPU embedding/PLE separate",
+        )
+        + b.weights.visual_parameters,
+        weight_scope="E8P Q2 experts, signed-block128 Q4 selected projections, W8 sensitive projections, BF16 HC; CPU embedding/PLE separate"
+        + ("; FP16 vision" if vision else ""),
         input_assets=json.loads((root / "inputs-asset.json").read_text()),
         kv_cache=dict(
             direct_prefill=True,
@@ -125,6 +127,10 @@ def publish(bindings, layout, destination, output, engine, *, mtp=None):
     )
     if mtp:
         metadata["mtp"] = mtp
+    if vision:
+        metadata["vision"] = vision
+        configuration = dict(configuration, language_model_only=False)
+        write_json(root / "config.json", configuration)
     package = dict(
         schema_version=1,
         runtime_abi=1,
@@ -158,9 +164,18 @@ def publish(bindings, layout, destination, output, engine, *, mtp=None):
         },
         metadata=metadata,
     )
+    if vision:
+        package["config_signature"].update(
+            vision=configuration["vision_config"],
+            image_tokens=[
+                configuration[n]
+                for n in ["image_token_id", "vision_start_token_id", "vision_end_token_id"]
+            ],
+        )
     append_sampling(data, package, root / "cache", output / "sampling")
     digest = compact_package(root / "cache", package, root / "cache/packages")
     data["execution_package"] = digest
+    write_json(root / "cache/model.json", data)
     write_json(output / "publication.json", dict(execution_package=digest, weight_bytes=total))
     with atomic_model(destination, engine) as staging:
         staging.mkdir()
@@ -169,6 +184,7 @@ def publish(bindings, layout, destination, output, engine, *, mtp=None):
                 "assembly.json",
                 "draft-assembly.json",
                 "inputs-asset.json",
+                "vision-asset.json",
             ):
                 shutil.copyfile(path, staging / path.name)
         compact_cpu(root, staging, data, 2 * 1024**3)

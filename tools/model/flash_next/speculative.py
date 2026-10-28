@@ -30,6 +30,11 @@ def controls(b):
         ("AcceptedInputs", "i32", [1]),
     ]:
         b.fixed(name, dtype, shape, "sequence")
+    if b.planner.has_vision:
+        from tools.model.flash_next.vision import overlay
+
+        overlay(b, "causal_rows/warm/overlay", "DraftM512_Embedding", 512, mtp=True)
+        overlay(b, "mtp_verify/begin/k0", "M8_Embedding", 8)
     for name, build, pointers, rows in [
         (
             "gather",
@@ -135,7 +140,7 @@ def controls(b):
         verification_status="VerificationStatus",
         draft_logits="DraftLogits",
         verification_logits="VerificationLogits",
-        feature_index=None,
+        feature_index="MtpFeatureIndex" if b.planner.has_vision else None,
         accepted_inputs="AcceptedInputs",
         target_length="PositionOut",
         draft_program="mtp_draft",

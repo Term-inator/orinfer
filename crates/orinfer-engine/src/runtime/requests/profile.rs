@@ -1474,6 +1474,10 @@ fn capture_prefill_partitions() {
             cuda_graph: crate::execution::CudaGraphMode::Off,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
+            resident_experts: spec["resident_experts"]
+                .as_u64()
+                .map(|n| crate::execution::ResidentExperts::Count(n as usize))
+                .unwrap_or_default(),
             ..Default::default()
         },
     )

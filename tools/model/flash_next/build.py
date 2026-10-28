@@ -411,6 +411,11 @@ def main():
         type=Path,
         help="Assemble the matching shared-head MTP checkpoint with an initial text model",
     )
+    p.add_argument(
+        "--vision-checkpoint",
+        type=Path,
+        help="Include the matching original BF16 vision checkpoint in initial construction",
+    )
     p.add_argument("--context", type=int, default=4096)
     for name in ("model-output", "output"):
         p.add_argument("--" + name, required=True, type=Path)
@@ -469,6 +474,8 @@ def main():
     args = p.parse_args()
     if args.mtp_checkpoint and not args.checkpoint:
         p.error("mtp-checkpoint requires initial construction with --checkpoint")
+    if args.vision_checkpoint and not args.checkpoint:
+        p.error("vision-checkpoint requires initial construction with --checkpoint")
     if args.workspace_only:
         if (
             args.model is None

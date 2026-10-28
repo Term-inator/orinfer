@@ -90,6 +90,7 @@ class Model:
             raise ValueError("Invalid decode W8 policy")
         self.decode_w8_optimized = decode_w8_optimized
         self.batch_body = False
+        self.has_vision = False
         self.draft_vocab = None
         self.is_mtp = source.config["quantization_config"].get("component") == "mtp"
         if self.is_mtp:
@@ -867,7 +868,9 @@ class Model:
                 projection("qsa-value", mixed, prefix + "attn_v.weight", qsa_v, a8=attn_a8)
                 call(
                     f"qsa-prepare-{m}",
-                    lambda: fn.qsa_prepare(m, self.capacity, is_neox_style=True, staged=True),
+                    lambda: fn.qsa_prepare(
+                        m, self.capacity, is_neox_style=True, staged=True, mrope=self.has_vision
+                    ),
                     qgate.view(m, 24, 2, 256),
                     qsa_k.view(m, 2, 256),
                     qsa_v.view(m, 2, 256),
@@ -877,6 +880,7 @@ class Model:
                     qsa_query,
                     staged_key,
                     staged_value,
+                    *((self.mrope_positions,) if self.has_vision else ()),
                     qsa_gate,
                 )
                 call(
@@ -893,20 +897,22 @@ class Model:
                 projection("index-qk", mixed, prefix + "index_qk.weight", index_qk, a8=attn_a8)
                 call(
                     f"index-query-{m}",
-                    lambda: qsa.index_query(m),
+                    lambda: qsa.index_query(m, self.capacity if self.has_vision else 0),
                     index_qk.view(m, 5, 128),
                     self.weights[prefix + "index_q_norm.weight"],
                     self.position_gpu,
                     index_q,
+                    *((self.mrope_positions,) if self.has_vision else ()),
                 )
                 call(
                     f"index-compress-{m}",
-                    lambda: qsa.index_compress(m, self.capacity),
+                    lambda: qsa.index_compress(m, self.capacity, mrope=self.has_vision),
                     index_qk.view(m, 5, 128),
                     self.states[f"{i}:pending"],
                     self.weights[prefix + "index_k_norm.weight"],
                     self.position_gpu,
                     self.states[f"{i}:index"],
+                    *((self.mrope_positions,) if self.has_vision else ()),
                 )
                 if verify:
                     saved = empty((m, 4, 128))

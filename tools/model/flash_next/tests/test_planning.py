@@ -93,6 +93,41 @@ class PlanningTests(unittest.TestCase):
 
             self.stack.enter_context(patch("torch." + name, cpu))
 
+    def test_visual_draft_shares_owner_coordinates_in_all_qsa_rotations(self):
+        target = Planner(assembly("text"), 4096, None, vision=True)
+        draft = Planner(assembly("mtp"), 4096, None, target=target)
+        other = Planner(assembly("text"), 4096, None, vision=True)
+        self.assertTrue(draft.has_vision)
+        self.assertIs(draft.mrope_positions, target.mrope_positions)
+        self.assertNotEqual(
+            target.mrope_positions.untyped_storage()._cdata,
+            other.mrope_positions.untyped_storage()._cdata,
+        )
+        # Exercise the target's QSA branch with the same shape-only fixture.
+        # Layer 3 has target-owned KV/index state and the draft's QSA geometry.
+        target.weights.update(
+            {name.replace("blk.48.", "blk.3."): value for name, value in draft.weights.items()}
+        )
+        target.layer_ids = (3,)
+        checked = set()
+        for planner in (target, draft):
+            plan = planner.trace(7)
+            for (recipe, args), label in zip(plan["ops"], plan["labels"]):
+                if label.startswith(("qsa-prepare-", "index-query-", "index-compress-")):
+                    function, _ = construct(recipe.build, dynamic=True)
+                    buffers = [
+                        function.buffer_map[p] for p in function.params if p in function.buffer_map
+                    ]
+                    coordinates = next(b for b in buffers if b.name == "Coordinates")
+                    self.assertIs(args[buffers.index(coordinates)], target.mrope_positions)
+                    self.assertEqual(tuple(map(int, coordinates.shape)), (4096, 3))
+                    for buffer, operand in zip(buffers, args):
+                        self.assertEqual(
+                            str(buffer.dtype), str(operand.dtype).removeprefix("torch.")
+                        )
+                    checked.add(label.split("-7")[0])
+        self.assertEqual(checked, {"qsa-prepare", "index-query", "index-compress"})
+
     def test_real_draft_plans_share_head_but_not_target_or_other_owner_state(self):
         target = Planner(assembly("text"), 4096, None)
         first = Planner(assembly("mtp"), 4096, None, target=target)

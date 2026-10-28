@@ -37,6 +37,27 @@ def relative_name(name):
     return name
 
 
+def remote_url(repo, revision, filename, *, range_id=None):
+    """Address one file at an immutable HF or ModelScope revision."""
+    relative_name(filename)
+    repository = repo.removeprefix("modelscope:")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) or not re.fullmatch(
+        r"[0-9a-f]{40}", revision
+    ):
+        raise ValueError("Remote files require a repository and pinned commit")
+    if repo.startswith("modelscope:"):
+        query = dict(Revision=revision, FilePath=filename)
+        if range_id is not None:
+            query["orinfer_range"] = range_id
+        return (
+            f"https://modelscope.cn/api/v1/models/{repository}/repo?{urllib.parse.urlencode(query)}"
+        )
+    query = dict(download="true")
+    if range_id is not None:
+        query["orinfer_range"] = range_id
+    return f"https://huggingface.co/{repo}/resolve/{revision}/{urllib.parse.quote(filename, safe='/')}?{urllib.parse.urlencode(query)}"
+
+
 def validate_header(header):
     intervals = []
     for name, t in header.items():
@@ -102,13 +123,12 @@ class Source:
         self.weight_map = json.loads(Path(index).read_text())["weight_map"]
         self.directory = Path(directory) if directory else None
         self.repo, self.revision = repo, revision
-        self.modelscope = bool(repo and repo.startswith("modelscope:"))
-        self.repository = repo.removeprefix("modelscope:") if self.modelscope else repo
+        repository = repo.removeprefix("modelscope:") if repo else repo
         self.cache = Path(cache) if cache else None
         if self.directory is None:
             if (
                 not repo
-                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", self.repository)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
                 or not re.fullmatch(r"[0-9a-f]{40}", revision or "")
             ):
                 raise ValueError("Remote weights require repository and pinned commit")
@@ -127,19 +147,8 @@ class Source:
             if len(data) != count:
                 raise EOFError("Truncated local source")
             return data
-        encoded = urllib.parse.quote(filename, safe="/")
         # Distinct query prevents a CDN from reusing a different cached range.
-        if self.modelscope:
-            query = urllib.parse.urlencode(
-                {
-                    "Revision": self.revision,
-                    "FilePath": filename,
-                    "orinfer_range": f"{offset}-{count}",
-                }
-            )
-            url = f"https://modelscope.cn/api/v1/models/{self.repository}/repo?{query}"
-        else:
-            url = f"https://huggingface.co/{self.repo}/resolve/{self.revision}/{encoded}?download=true&orinfer_range={offset}-{count}"
+        url = remote_url(self.repo, self.revision, filename, range_id=f"{offset}-{count}")
         for attempt in range(5):
             try:
                 req = urllib.request.Request(

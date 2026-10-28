@@ -49,7 +49,9 @@ class Bindings:
             (shared.kernels, shared.dynamic, shared.groups) if shared is not None else ([], [], {})
         )
         self.cache = BuildCache(cache)
-        self.identity = dict(source=source_identity(), context=planner.capacity)
+        self.identity = dict(
+            source=source_identity(), context=planner.capacity, vision=planner.has_vision
+        )
         self.compiler = (
             shared.compiler
             if shared is not None
@@ -63,6 +65,11 @@ class Bindings:
                     list(tensor.shape),
                     "workspace" if name in ("PositionOut", "MtpPositionOut") else "sequence",
                 )
+        if planner.has_vision:
+            self.fixed("Features", "f16", [planner.capacity, planner.H], "sequence")
+            self.fixed("FeatureIndex", "i32", [planner.capacity], "sequence")
+            if planner.is_mtp:
+                self.fixed("MtpFeatureIndex", "i32", [planner.capacity], "sequence")
 
     def fixed(self, name, dtype, shape, scope="workspace"):
         if name in self.buffers:
@@ -81,7 +88,18 @@ class Bindings:
         self.scopes[name] = scope
         return name
 
-    def emit(self, name, build, pointers, rows, *, key, dynamic=True, construction_dynamic=None):
+    def emit(
+        self,
+        name,
+        build,
+        pointers,
+        rows,
+        *,
+        key,
+        dynamic=True,
+        construction_dynamic=None,
+        row_divisor=1,
+    ):
         """Publish a transformed primitive through the same cache and host ABI."""
         recipe = self.planner.kernel(key, build)
         artifact_key, (_, _, artifact) = self.artifact(
@@ -92,6 +110,11 @@ class Bindings:
         )
         self.kernels.append(kernel)
         if dynamic:
+            if row_divisor != 1:
+                from tools.model.row_convergence import divide_rows
+
+                launch = divide_rows(launch, row_divisor)
+                launch["capacity"] = rows * row_divisor
             self.dynamic.append(launch)
         return kernel
 
@@ -264,6 +287,13 @@ class Bindings:
         program = "decode" if rows == 1 else f"prefill_m{rows}"
         head = f"head_m{rows}"
         section = "begin"
+        if self.planner.has_vision:
+            from tools.model.flash_next.vision import overlay
+
+            overlay(self, f"{program}/begin/k0", f"M{rows}_Embedding", rows)
+            self.groups.setdefault(program, {}).setdefault("begin", []).append(
+                dict(kind="kernel", name=f"{program}/begin/k0")
+            )
         for index, ((_, args), label) in enumerate(zip(plan["ops"], plan["labels"])):
             if index == plan["body_count"]:
                 break

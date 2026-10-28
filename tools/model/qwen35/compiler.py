@@ -39,6 +39,7 @@ class Aot:
                 ROOT / "tools/build/target.py",
                 ROOT / "configs/deployment-target.json",
                 ROOT / "tools/model/encoder.py",
+                ROOT / "tools/model/vision_encoder.py",
                 ROOT / "tools/model/row_tuning.py",
                 ROOT / "tools/model/tuning.py",
                 ROOT / "tools/model/attention_reference.py",
