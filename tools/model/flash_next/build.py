@@ -406,6 +406,11 @@ def main():
         type=Path,
         help="Original safetensors index for bounded BF16 Q4 reads at the checkpoint's pinned source",
     )
+    p.add_argument(
+        "--mtp-checkpoint",
+        type=Path,
+        help="Assemble the matching shared-head MTP checkpoint with an initial text model",
+    )
     p.add_argument("--context", type=int, default=4096)
     for name in ("model-output", "output"):
         p.add_argument("--" + name, required=True, type=Path)
@@ -462,6 +467,8 @@ def main():
         help="Restrict rebuilds to these output/input dimensions; repeat for multiple geometries",
     )
     args = p.parse_args()
+    if args.mtp_checkpoint and not args.checkpoint:
+        p.error("mtp-checkpoint requires initial construction with --checkpoint")
     if args.workspace_only:
         if (
             args.model is None

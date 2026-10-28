@@ -44,6 +44,7 @@ class Bindings:
         self.keep = shared.keep if shared is not None else []
         self.keep.extend(planner.tensors.values())
         self.recipes = {}
+        self.hidden = shared.hidden if shared is not None else {}
         self.kernels, self.dynamic, self.groups = (
             (shared.kernels, shared.dynamic, shared.groups) if shared is not None else ([], [], {})
         )
@@ -274,6 +275,9 @@ class Bindings:
             if layers:
                 section = f"layer{min(layers)}"
             self.bind(program, section, label, args, rows, dynamic=rows > 1)
+        # Freeze these physical bindings before row construction replaces the
+        # planner's reused-storage aliases with the packet interface arena.
+        self.hidden[rows] = dict(self.buffer(plan["residual"]))
         key = f"advance-{rows}"
         self.planner.kernel(key, lambda: advance(rows))
         self.bind(program, "end", key, (self.planner.position_gpu,), rows, dynamic=rows > 1)

@@ -11,7 +11,7 @@ from tools.model.package import execution_identity, model_library
 from tools.model.publication import atomic_model
 
 
-def publish(bindings, layout, destination, output, engine):
+def publish(bindings, layout, destination, output, engine, *, mtp=None):
     from tools.model.flash_next.build import toolchain
     from tools.model.sampling import append as append_sampling
 
@@ -29,10 +29,12 @@ def publish(bindings, layout, destination, output, engine):
     reset = sorted(
         name
         for name in b.buffers
-        if name.startswith("State_") or name in ("Position", "Token", "Status")
+        if name.startswith("State_")
+        or name
+        in ("Position", "Token", "Status", *(["MtpPosition", "DraftM1_Condition"] if mtp else []))
     )
     kv, divisors = {}, {}
-    for layer in range(3, 48, 4):
+    for layer in [*range(3, 48, 4), *([48] if mtp else [])]:
         for suffix, stride in (
             ("key", 512),
             ("value", 512),
@@ -43,6 +45,8 @@ def publish(bindings, layout, destination, output, engine):
             kv[f"State_{layer}_{suffix}"] = stride
         divisors[f"State_{layer}_index"] = 4
     scores = {f"TargetIndexScoresM{rows}": rows for rows in (1, 16, 128, 4096)}
+    if mtp:
+        scores.update(DraftIndexScoresM512=512, VerifyIndexScoresM8=8)
     implicit = (
         set(reset)
         | set(scores)
@@ -64,6 +68,18 @@ def publish(bindings, layout, destination, output, engine):
         }
     )
     implicit.update(n for n in b.buffers if "_exps.weight_" in n)
+    if mtp:
+        implicit.update(
+            [
+                "MtpInput",
+                "DraftLogits",
+                "DraftPendingSaved",
+                "VerificationLogits",
+                "M8_Embedding",
+                "M8_Ple",
+                "DraftM1_Embedding",
+            ]
+        )
     used = implicit | {a["name"] for k in b.kernels for a in k["args"] if "name" in a}
     b.weights.buffers = b.buffers = {n: v for n, v in b.buffers.items() if n in used}
     b.weights.scopes = b.scopes = {n: v for n, v in b.scopes.items() if n in used}
@@ -88,8 +104,9 @@ def publish(bindings, layout, destination, output, engine):
         position="Position",
         weight_bytes=total,
         weight_parameters=sum(
-            math.prod(b.weights.source.shape(n))
-            for n in b.weights.source.parts
+            math.prod(source.shape(n))
+            for source in b.weights.sources
+            for n in source.parts
             if ".ple_embedding." not in n
         ),
         weight_scope="E8P Q2 experts, signed-block128 Q4 selected projections, W8 sensitive projections, BF16 HC; CPU embedding/PLE separate",
@@ -106,6 +123,8 @@ def publish(bindings, layout, destination, output, engine):
         batch_layout=layout,
         prefill_batch_profiles=[dict(tokens=1024, kind="flash_mixed_grouped")],
     )
+    if mtp:
+        metadata["mtp"] = mtp
     package = dict(
         schema_version=1,
         runtime_abi=1,
@@ -146,7 +165,11 @@ def publish(bindings, layout, destination, output, engine):
     with atomic_model(destination, engine) as staging:
         staging.mkdir()
         for path in root.iterdir():
-            if path.is_file() and path.name not in ("assembly.json", "inputs-asset.json"):
+            if path.is_file() and path.name not in (
+                "assembly.json",
+                "draft-assembly.json",
+                "inputs-asset.json",
+            ):
                 shutil.copyfile(path, staging / path.name)
         compact_cpu(root, staging, data, 2 * 1024**3)
         compact_weights(root, staging, data, 2 * 1024**3)

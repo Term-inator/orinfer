@@ -385,12 +385,8 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
         .map(|m| (score_role(m, "Target"), m))
         .collect();
     if manifest.mtp.is_some() {
-        scores.extend(
-            [1, 2, 3, 4, 5, 6, 7, 8, 16, 128, 512]
-                .into_iter()
-                .map(|m| (score_role(m, "Draft"), m)),
-        );
-        scores.extend((2..=8).map(|m| (score_role(m, "Verify"), m)));
+        scores.insert(score_role(512, "Draft"), 512);
+        scores.insert(score_role(8, "Verify"), 8);
     }
     if kv.prefill_workspace != scores
         || scores.iter().any(|(name, stride)| {

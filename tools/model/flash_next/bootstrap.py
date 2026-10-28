@@ -6,7 +6,7 @@ import shutil
 
 from tools.build.files import file_hash, write_json
 from tools.model.flash_next.checkpoint import Checkpoint
-from tools.model.flash_next.config import validate
+from tools.model.flash_next.config import validate, validate_pair
 from tools.model.flash_next.storage import Weights, payload_hash
 from tools.model.safetensors_source import Source, local_header
 
@@ -37,6 +37,10 @@ def build(args):
 
     checkpoint = Checkpoint(args.checkpoint, verify_hashes=not args.plan_only)
     validate(checkpoint.config, args.context)
+    draft_checkpoint = None
+    if args.mtp_checkpoint:
+        draft_checkpoint = Checkpoint(args.mtp_checkpoint, verify_hashes=not args.plan_only)
+        validate_pair(draft_checkpoint.config, checkpoint.config, args.context)
     if args.context % 4 or args.context < 4096:
         raise ValueError(
             "Initial native text construction requires a multiple-of-four context >=4096"
@@ -50,6 +54,14 @@ def build(args):
         context=args.context,
         original_index=file_hash(args.source_index),
         source=source_identity(),
+        mtp=(
+            dict(
+                checkpoint=file_hash(args.mtp_checkpoint / "model.safetensors.index.json"),
+                config=file_hash(args.mtp_checkpoint / "config.json"),
+            )
+            if draft_checkpoint
+            else None
+        ),
     )
     args.output.mkdir(parents=True, exist_ok=True)
     write_json(
@@ -87,6 +99,20 @@ def build(args):
     else:
         assembly = dict(weights.assemble(), contract=contract)
         write_json(receipt, assembly)
+    draft_assembly = None
+    if draft_checkpoint:
+        draft_weights = Weights(draft_checkpoint, root)
+        receipt = root / "draft-assembly.json"
+        draft_assembly = json.loads(receipt.read_text()) if receipt.exists() else None
+        if draft_assembly and draft_assembly.get("contract") == contract:
+            restore(draft_weights, draft_assembly)
+        else:
+            draft_assembly = dict(draft_weights.assemble(), contract=contract)
+            write_json(receipt, draft_assembly)
+        # Keep each immutable shape assembly separate from the joined arena.
+        weights.buffers = dict(weights.buffers)
+        weights.scopes = dict(weights.scopes)
+        weights.attach_mtp(draft_weights)
     source = Source(
         args.source_index,
         repo=configuration["source"],
@@ -105,10 +131,20 @@ def build(args):
     bindings = Bindings(planner, weights, args.output, args.cache)
     for rows in (4096, 1):
         bindings.trace(rows)
-    row_programs = Rows(bindings)
+    row_programs = Rows(bindings, mtp=draft_checkpoint is not None)
     for method in (row_programs.shared, row_programs.private, row_programs.causal):
         method()
         print("INITIAL ROWS", method.__name__, "COMPLETE", flush=True)
+    mtp = None
+    if draft_checkpoint:
+        from tools.model.flash_next.draft import DraftRows
+        from tools.model.flash_next.speculative import controls, verification
+
+        draft_planner = Planner(draft_assembly, args.context, args.output, target=planner)
+        draft_bindings = Bindings(draft_planner, weights, args.output, args.cache, shared=bindings)
+        DraftRows(draft_bindings).build()
+        mtp = controls(bindings)
+        verification(row_programs)
     precision = lower(bindings)
     write_json(
         args.output / "initial-bindings.json",
@@ -119,6 +155,7 @@ def build(args):
             dynamic=bindings.dynamic,
             batch_layout=row_programs.layout(),
             precision=precision,
+            mtp=mtp,
         ),
     )
     data = publish(
@@ -127,6 +164,7 @@ def build(args):
         args.model_output,
         args.output,
         Path(__file__).resolve().parents[3] / "target/release/orinfer",
+        mtp=mtp,
     )
     write_json(
         args.output / "results.json",

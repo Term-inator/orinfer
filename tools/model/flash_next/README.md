@@ -16,6 +16,8 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-init
 
 构建器逐块拼接已量化专家，不展开完整权重。选定 Q4 主干矩阵从 checkpoint 声明的同一 ModelScope/HF 提交读取原始 BF16 行，逐块释放；原始模型索引必须与该提交一致。首次构建允许下载这些字节范围，容器内存及内存加 swap 上限均为 6 GiB。编译使用形状张量，完整模型不载入 CUDA。输出目录保存可验证的权重转换和编译缓存。
 
+首次构建可增加 `--mtp-checkpoint /path/to/mtp-checkpoint`，组装同一来源、版本、量化基与文本配置的 MTP 权重。草稿共享 target 输出头，专家全量常驻；target 专家继续按运行时预算分页。构建器同时生成动态草稿、warm、验证、接受前缀恢复和隐藏环捕获绑定。原生包构造校验、完整请求正确性与性能验收分别执行。
+
 最终目录通过 Rust 原生计划校验后原子发布。生成成功、质量及完整请求 TPS 另行验收；构建完成仅表示原生包通过构造校验。有限专家模式使用 `--resident-experts N --cuda-graph off` 试跑。 Flash 专家通过逐矩阵地址表读取紧凑的预分配槽位，保持原始压缩 bank、scale 和整数运算；有限模式继续按真实路由选择完整专家。
 
 首次以单请求启动文本包，可显式限制常驻专家，并关闭 MTP 与前缀缓存：

@@ -62,6 +62,7 @@ def segments(parts, key):
 class Weights:
     def __init__(self, checkpoint, root):
         self.source, self.root = checkpoint, Path(root)
+        self.sources = [checkpoint]
         self.prefix = (
             "Mtp_" if checkpoint.config["quantization_config"].get("component") == "mtp" else ""
         )
@@ -136,6 +137,7 @@ class Weights:
         self.buffers.update(draft.buffers)
         self.scopes.update(draft.scopes)
         self.mapping.update(draft.mapping)
+        self.sources.extend(draft.sources)
         return self.finish()
 
     def expert(self, original, name):

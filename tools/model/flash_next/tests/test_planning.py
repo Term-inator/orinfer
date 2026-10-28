@@ -14,6 +14,7 @@ from tools.model.flash_next.planning import Planner
 from tools.model.flash_next.bindings import Bindings
 from tools.model.flash_next.draft import DraftRows
 from tools.model.flash_next.storage import Weights
+from tools.model.flash_next.speculative import controls
 from tools.model.compile import construct
 from tools.model.flash_next.tests.test_config import fixture
 
@@ -199,6 +200,27 @@ class PlanningTests(unittest.TestCase):
             self.assertEqual(child.scopes["State_48_pending"], "sequence")
             self.assertEqual(tuple(body["condition"].shape), (512, 4, 2560))
             self.assertFalse(any(n.startswith("Scratch") for n in child.buffers))
+            for n in [1, 4096]:
+                name = f"OriginalHidden{n}"
+                target_bindings.fixed(name, "f16", [n, 10240])
+                target_bindings.hidden[n] = dict(kind="buffer", name=name)
+            mtp = controls(target_bindings)
+            self.assertEqual(mtp["warm_plans"][0]["min_tokens"], 1)
+            self.assertEqual(mtp["warm_plans"][0]["tokens"], 512)
+            self.assertEqual(mtp["verification_plans"][0]["min_tokens"], 2)
+            self.assertEqual(mtp["verification_plans"][0]["tokens"], 8)
+            self.assertEqual(child.buffers["MtpHiddenRing"]["shape"], [4096, 10240])
+            self.assertEqual(child.scopes["MtpHiddenRing"], "sequence")
+            self.assertEqual(child.buffers["DraftLogits"]["shape"], [1, target.V])
+            self.assertEqual(child.buffers["VerificationLogits"]["shape"], [8, target.V])
+            for n in [1, 4096]:
+                self.assertEqual(
+                    emitted[f"mtp_capture_m{n}/body/k0"]["pointers"]["Hidden"]["name"],
+                    f"OriginalHidden{n}",
+                )
+            self.assertEqual(
+                emitted["causal_rows/warm/length"]["pointers"]["Length"]["name"], "MtpLength"
+            )
 
     def test_identity_or_context_errors_precede_fake_allocation(self):
         target = Planner(assembly("text"), 4096, None)

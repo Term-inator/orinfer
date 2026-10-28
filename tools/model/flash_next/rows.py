@@ -77,9 +77,10 @@ def sections(plan, names):
 
 
 class Rows:
-    def __init__(self, bindings):
+    def __init__(self, bindings, *, mtp=False):
         self.b = bindings
         self.p = bindings.planner
+        self.mtp = mtp
         self.roles, self.strides = {}, {}
         self.reference = self.p.trace(1)
         self.entries = list(sections(self.reference, self.b.names))
@@ -297,10 +298,10 @@ class Rows:
         )
         self.b.emit(
             "flash_decode/packet/end",
-            lambda: decode_packet.end(stride, 512, False),
+            lambda: decode_packet.end(stride, 4096 if self.mtp else 512, self.mtp),
             {"Pointers": pointer(TABLE), "Hidden": pointer("FlashDecode_Residual")},
             128,
-            key="packet-end",
+            key="packet-end-mtp" if self.mtp else "packet-end",
         )
         self.b.emit(
             "flash_decode/packet/outputs",

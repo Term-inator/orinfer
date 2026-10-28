@@ -143,7 +143,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                 .keys()
                 .filter(|n| n.starts_with("State_48_"))
                 .cloned()
-                .chain([super::plan::score_role(1, "Draft")])
+                .chain([super::plan::score_role(512, "Draft")])
                 .collect(),
         },
     );
