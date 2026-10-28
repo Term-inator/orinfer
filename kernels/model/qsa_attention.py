@@ -25,6 +25,211 @@ __device__ __forceinline__ unsigned int qsa_dequant_pair(unsigned int code, unsi
 
 
 @orin_jit
+def dense_attention(
+    m: int,
+    capacity: int,
+    q_tile: int = 64,
+    splits: int = 8,
+    packed: bool = False,
+    block_size: int = 32,
+    threads: int = 128,
+    split_size: int | None = 256,
+    dynamic_rows: bool = False,
+):
+    """Blocked causal attention for contexts where every key is selected.
+
+    Shares the sparse kernel's ABI, key-tile order, split boundaries and
+    per-tile arithmetic, so outputs are bit-identical whenever the selected
+    set is the identity; only the query dimension is blocked so each KV tile
+    is read once per sixty-four queries instead of once per query.
+    """
+    geometry(m, capacity)
+    m = row_count(m, dynamic_rows)
+    if q_tile not in (32, 64, 128) or splits not in (1, 2, 4, 8):
+        raise ValueError("Invalid dense attention geometry")
+    if split_size is None or split_size not in (0, 256, 512, 1024, 2048):
+        raise ValueError("Fixed dense partitions must cover all selected blocks")
+    if (
+        block_size not in (32, 64)
+        or threads not in (128, 256)
+        or block_size == 32
+        and threads == 256
+    ):
+        raise ValueError("Invalid dense attention tile/warp geometry")
+    if not packed:
+        raise ValueError("Dense attention requires packed INT8 KV")
+    block = block_size
+    kv_width = 64
+
+    @T.prim_func
+    def main(
+        Query: T.Tensor((m, 24, 256), T.float16),
+        K: T.Tensor((capacity, 2, kv_width), T.uint32),
+        V: T.Tensor((capacity, 2, kv_width), T.uint32),
+        KS: T.Tensor((capacity, 2, 4), T.float16),
+        VS: T.Tensor((capacity, 2, 4), T.float16),
+        Selected: T.Tensor((m, 2051), T.int32),
+        Position: T.Tensor((1,), T.int32),
+        Max: T.Tensor((m, 24, splits), T.float32),
+        Den: T.Tensor((m, 24, splits), T.float32),
+        Out: T.Tensor((m, 24, splits, 256), T.float32),
+    ):
+        with T.Kernel(T.ceildiv(m, q_tile), 24, splits, threads=threads) as (tile, head, split):
+            T.import_source(PACKED_SOURCE)
+            kh = head // 12
+            key_scales = T.alloc_shared((block, 4), T.float16)
+            value_scales = T.alloc_shared((block, 4), T.float16)
+            q = T.alloc_shared((q_tile, 256), T.float16)
+            k = T.alloc_shared((block, 256), T.float16)
+            raw_k = T.alloc_shared((block, 64), T.uint32)
+            raw_v = T.alloc_shared((block, 64), T.uint32)
+            p = T.alloc_shared((q_tile, block), T.float16)
+            scores = T.alloc_fragment((q_tile, block), T.float32)
+            acc = T.alloc_fragment((q_tile, 256), T.float32)
+            maximum = T.alloc_fragment((q_tile,), T.float32)
+            denom = T.alloc_fragment((q_tile,), T.float32)
+            previous = T.alloc_fragment((q_tile,), T.float32)
+            correction = T.alloc_fragment((q_tile,), T.float32)
+            rowsum = T.alloc_fragment((q_tile,), T.float32)
+            T.clear(acc)
+            T.clear(denom)
+            T.fill(maximum, -3.402823466e38)
+            for i, d in T.Parallel(q_tile, 256):
+                q[i, d] = 0
+                if tile * q_tile + i < m:
+                    q[i, d] = Query[tile * q_tile + i, head, d]
+            # Every query row in the tile shares the tile's final cursor; the
+            # sparse kernel's per-row causal tail stays enforced below through
+            # the same per-row length bound used to mask scores.
+            limit = T.min(Position[0] + tile * q_tile + q_tile, 2051)
+            count = (
+                T.ceildiv(limit, splits)
+                if split_size is None
+                else limit
+                if split_size == 0
+                else split_size
+            )
+            start = split * count
+            end = (
+                T.if_then_else(split == splits - 1, limit, T.min(start + count, limit))
+                if split_size
+                else T.min(start + count, limit)
+            )
+            for tile_key in T.serial(T.ceildiv(T.max(0, end - start), block)):
+                T.sync_threads()
+                for j, g in T.Parallel(block, 4):
+                    token = start + tile_key * block + j
+                    key_scales[j, g] = 0
+                    value_scales[j, g] = 0
+                    if token < end:
+                        key_scales[j, g] = KS[token, kh, g]
+                        value_scales[j, g] = VS[token, kh, g]
+                T.sync_threads()
+                for j, segment in T.Parallel(block, 16):
+                    token = start + tile_key * block + j
+                    T.ptx_cp_async(
+                        T.tvm_access_ptr(
+                            T.type_annotation(T.uint32), raw_k.data, j * 64 + segment * 4, 4, 2
+                        ),
+                        T.tvm_access_ptr(
+                            T.type_annotation(T.uint32),
+                            K.data,
+                            (token * 2 + kh) * 64 + segment * 4,
+                            4,
+                            1,
+                        ),
+                        4,
+                        predicate=token < end,
+                    )
+                    T.ptx_cp_async(
+                        T.tvm_access_ptr(
+                            T.type_annotation(T.uint32), raw_v.data, j * 64 + segment * 4, 4, 2
+                        ),
+                        T.tvm_access_ptr(
+                            T.type_annotation(T.uint32),
+                            V.data,
+                            (token * 2 + kh) * 64 + segment * 4,
+                            4,
+                            1,
+                        ),
+                        4,
+                        predicate=token < end,
+                    )
+                T.ptx_commit_group()
+                T.ptx_wait_group(0)
+                T.sync_threads()
+                for j, pair in T.Parallel(block, 128, coalesced_width=T.int32(1)):
+                    kw = T.call_pure_extern(
+                        "uint32",
+                        "qsa_dequant_pair",
+                        raw_k[j, pair // 2] >> ((pair % 2) * 16),
+                        T.reinterpret(T.uint16, key_scales[j, pair // 32]),
+                    )
+                    k[j, pair * 2] = T.reinterpret(T.float16, T.cast(kw & 65535, T.uint16))
+                    k[j, pair * 2 + 1] = T.reinterpret(T.float16, T.cast(kw >> 16, T.uint16))
+                T.gemm(q, k, scores, transpose_B=True, clear_accum=True)
+                for i in T.Parallel(q_tile):
+                    previous[i] = maximum[i]
+                for i, j in T.Parallel(q_tile, block):
+                    # Row i is causal up to Position[0] + tile*q_tile + i + 1;
+                    # keys beyond each row's own cursor stay masked exactly as
+                    # in the sparse kernel's per-row selected length.
+                    cursor = (
+                        T.min((Position[0] + tile * q_tile + i + 1) // 4, 512) * 4
+                        + (Position[0] + tile * q_tile + i + 1) % 4
+                    )
+                    if (
+                        tile * q_tile + i < m
+                        and start + tile_key * block + j < end
+                        and start + tile_key * block + j < cursor
+                    ):
+                        scores[i, j] *= 0.0625
+                    else:
+                        scores[i, j] = -3.402823466e38
+                T.reduce_max(scores, maximum, dim=1, clear=False)
+                for i, j in T.Parallel(q_tile, block):
+                    cursor = (
+                        T.min((Position[0] + tile * q_tile + i + 1) // 4, 512) * 4
+                        + (Position[0] + tile * q_tile + i + 1) % 4
+                    )
+                    if (
+                        tile * q_tile + i < m
+                        and start + tile_key * block + j < end
+                        and start + tile_key * block + j < cursor
+                    ):
+                        scores[i, j] = T.exp(scores[i, j] - maximum[i])
+                    else:
+                        scores[i, j] = 0
+                    p[i, j] = scores[i, j]
+                T.reduce_sum(scores, rowsum, dim=1)
+                for i in T.Parallel(q_tile):
+                    correction[i] = T.exp(previous[i] - maximum[i])
+                    denom[i] = denom[i] * correction[i] + rowsum[i]
+                for i, d in T.Parallel(q_tile, 256):
+                    acc[i, d] *= correction[i]
+                T.sync_threads()
+                for j, pair in T.Parallel(block, 128, coalesced_width=T.int32(1)):
+                    vw = T.call_pure_extern(
+                        "uint32",
+                        "qsa_dequant_pair",
+                        raw_v[j, pair // 2] >> ((pair % 2) * 16),
+                        T.reinterpret(T.uint16, value_scales[j, pair // 32]),
+                    )
+                    k[j, pair * 2] = T.reinterpret(T.float16, T.cast(vw & 65535, T.uint16))
+                    k[j, pair * 2 + 1] = T.reinterpret(T.float16, T.cast(vw >> 16, T.uint16))
+                T.gemm(p, k, acc)
+            for i, d in T.Parallel(q_tile, 256):
+                if tile * q_tile + i < m:
+                    Out[tile * q_tile + i, head, split, d] = acc[i, d]
+            for i in T.Parallel(q_tile):
+                if tile * q_tile + i < m:
+                    Max[tile * q_tile + i, head, split] = maximum[i]
+                    Den[tile * q_tile + i, head, split] = denom[i]
+
+    return main
+
+
+@orin_jit
 def sparse_attention(
     m: int,
     capacity: int,

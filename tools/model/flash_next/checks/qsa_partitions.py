@@ -7,7 +7,7 @@ import torch
 import tilelang
 
 from kernels.model.qsa import sparse_merge
-from kernels.model.qsa_attention import sparse_attention
+from kernels.model.qsa_attention import dense_attention, sparse_attention
 from kernels.model.rows import explicit_rows
 from tools.operators.common import benchmark, configure, export_kernel, write_json
 
@@ -116,6 +116,62 @@ def main():
             report["cases"].append(row)
             write_json(args.output / "results.json", report)
             print("QSA PARTITIONS", row, flush=True)
+
+    # Dense blocked attention covers every context whose selected set is the
+    # identity (at most 2051 keys). It shares the sparse tile order and
+    # arithmetic, so Out and Max are bit-identical while Den carries at most
+    # one unit in the last place: the wider fragment reduce sums each tile's
+    # probabilities in a different tree order.
+    for rows in args.lengths:
+        if rows > 2048:
+            continue
+        query = torch.randn((rows, 24, 256), device="cuda", dtype=torch.float16) * 0.02
+        position = torch.zeros(1, device="cuda", dtype=torch.int32)
+        selected = (
+            torch.arange(2051, device="cuda", dtype=torch.int32)[None, :]
+            .expand(rows, -1)
+            .contiguous()
+        )
+        parts = [
+            torch.empty((rows, 24, 8), device="cuda"),
+            torch.empty((rows, 24, 8), device="cuda"),
+            torch.empty((rows, 24, 8, 256), device="cuda"),
+        ]
+        dense_parts = [torch.full_like(part, float("nan")) for part in parts]
+        fixed = sparse_attention(rows, capacity, packed=True)
+        dense = dense_attention(rows, capacity, q_tile=64, splits=8, packed=True)
+
+        def dense_run():
+            launch(dense, query, key, value, ks, vs, selected, position, *dense_parts)
+
+        launch(fixed, query, key, value, ks, vs, selected, position, *parts)
+        before, _ = benchmark(
+            lambda: launch(fixed, query, key, value, ks, vs, selected, position, *parts),
+            repetitions=3,
+        )
+        after, graph = benchmark(dense_run, repetitions=3)
+        torch.cuda.synchronize()
+        assert torch.equal(parts[2], dense_parts[2]), (rows, "dense output")
+        assert torch.equal(parts[0], dense_parts[0]), (rows, "dense maximum")
+        assert torch.allclose(parts[1], dense_parts[1], rtol=2e-6, atol=2e-6), (
+            rows,
+            "dense denominator",
+            (parts[1] - dense_parts[1]).abs().max().item(),
+        )
+        dense_parts[2].fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(parts[2], dense_parts[2]), (rows, "dense graph")
+        row = dict(
+            rows=rows,
+            dense=True,
+            denominator_ulp_bound=True,
+            baseline_ms=before["median_ms"],
+            optimized_ms=after["median_ms"],
+        )
+        report["cases"].append(row)
+        write_json(args.output / "results.json", report)
+        print("QSA DENSE", row, flush=True)
     report["complete"] = True
     write_json(args.output / "results.json", report)
 
