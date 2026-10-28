@@ -1151,6 +1151,12 @@ fn profile_decode_chain() {
             cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
             prefix_cache_bytes: 0,
             mtp_drafts: Some(0),
+            resident_experts: fixture["resident_experts"]
+                .as_u64()
+                .map_or(Default::default(), |n| {
+                    crate::execution::ResidentExperts::Count(n as usize)
+                }),
+            host_weight_cache_bytes: 16usize << 30,
             ..LoadOptions::default()
         },
     )

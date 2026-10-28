@@ -1506,6 +1506,7 @@ fn validate_flash_prefix_cache() {
     ))
     .unwrap();
     assert!(!fixture.output.exists());
+    let drafts = fixture.mtp_drafts.unwrap_or(0);
     let mut model = ModelRuntime::load_with_options(
         &fixture.model,
         LoadOptions {
@@ -1515,12 +1516,13 @@ fn validate_flash_prefix_cache() {
                 .resident_experts
                 .map_or(Default::default(), crate::execution::ResidentExperts::Count),
             host_weight_cache_bytes: 16usize << 30,
-            mtp_drafts: Some(0),
+            mtp_drafts: Some(drafts),
 
             ..Default::default()
         },
     )
     .unwrap();
+    model.dynamic_speculation.fixed_width = fixture.verification_tokens;
     let options = scheduler::Options::default();
     let mut rows = vec![];
     for source in &fixture.cases {
@@ -1552,6 +1554,9 @@ fn validate_flash_prefix_cache() {
                 .unwrap()
         };
         let expected_state = committed(&mut model, &mut cold);
+        if drafts > 0 {
+            assert!(cold.mtp.rounds > 0, "Cold request did not execute MTP");
+        }
         model.finish_request(&mut cold, true).unwrap();
         let mut warm = model.start_request(input(source, 4), &|| false).unwrap();
         assert_eq!(
@@ -1573,6 +1578,9 @@ fn validate_flash_prefix_cache() {
                 actual.extend(step.tokens);
             }
         }
+        if drafts > 0 {
+            assert!(warm.mtp.rounds > 0, "Restored request did not execute MTP");
+        }
         assert_eq!(
             actual, expected,
             "Full prefix restore changed deterministic continuation"
@@ -1584,7 +1592,9 @@ fn validate_flash_prefix_cache() {
         );
         rows.push(json!({"prompt_tokens":source.input_tokens.len(),"images":source.images.len(),
             "cached_tokens":warm.prefix.statistics.cached_tokens,"restore_s":warm.prefix.statistics.restore_s,
-            "tokens_equal":true,"committed_state_equal":true}));
+            "tokens_equal":true,"committed_state_equal":true,"mtp_drafts":drafts,
+            "cold_mtp_rounds":cold.mtp.rounds,"warm_mtp_rounds":warm.mtp.rounds,
+            "compared_state_buffers":ranges.keys().collect::<Vec<_>>()}));
         model.finish_request(&mut warm, true).unwrap();
     }
     for snapshot in model.prefix_cache.clear() {
